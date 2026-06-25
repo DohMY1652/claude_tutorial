@@ -1,2 +1,0 @@
-Invoking command in '/home/dmyabb/claude_tutorial/build/qpoases_vendor': CMAKE_PREFIX_PATH=/opt/ros/foxy /usr/bin/cmake /home/dmyabb/claude_tutorial/src/qpoases_vendor -DCMAKE_INSTALL_PREFIX=/home/dmyabb/claude_tutorial/install/qpoases_vendor
-Invoked command in '/home/dmyabb/claude_tutorial/build/qpoases_vendor' returned '1': CMAKE_PREFIX_PATH=/opt/ros/foxy /usr/bin/cmake /home/dmyabb/claude_tutorial/src/qpoases_vendor -DCMAKE_INSTALL_PREFIX=/home/dmyabb/claude_tutorial/install/qpoases_vendor
