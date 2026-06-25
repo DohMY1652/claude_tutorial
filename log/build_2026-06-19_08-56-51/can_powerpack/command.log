@@ -1,0 +1,2 @@
+Invoking command in '/home/dmyabb/claude_tutorial/build/can_powerpack': CMAKE_PREFIX_PATH=/opt/ros/foxy /usr/bin/cmake /home/dmyabb/claude_tutorial/src/can_powerpack -DCMAKE_INSTALL_PREFIX=/home/dmyabb/claude_tutorial/install/can_powerpack
+Invoked command in '/home/dmyabb/claude_tutorial/build/can_powerpack' returned '1': CMAKE_PREFIX_PATH=/opt/ros/foxy /usr/bin/cmake /home/dmyabb/claude_tutorial/src/can_powerpack -DCMAKE_INSTALL_PREFIX=/home/dmyabb/claude_tutorial/install/can_powerpack

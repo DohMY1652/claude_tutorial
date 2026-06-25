@@ -1,0 +1,7 @@
+# Arduino Uno (VID 2341, PID 0043) — ModemManager에서 제외
+# 설치: sudo cp 99-arduino-no-modemmanager.rules /etc/udev/rules.d/
+#        sudo udevadm control --reload-rules
+#        sudo udevadm trigger
+ATTRS{idVendor}=="2341", ATTRS{idProduct}=="0043", ENV{ID_MM_DEVICE_IGNORE}="1"
+ATTRS{idVendor}=="2341", ATTRS{idProduct}=="0001", ENV{ID_MM_DEVICE_IGNORE}="1"
+ATTRS{idVendor}=="2341", ENV{ID_MM_DEVICE_IGNORE}="1"

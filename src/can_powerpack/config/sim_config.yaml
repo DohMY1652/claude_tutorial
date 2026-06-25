@@ -1,0 +1,64 @@
+# =========================================
+# PneumaticSim node parameters
+# Usage: pass alongside powerpack_config.yaml in sim.launch.py
+# =========================================
+/pack2/pneumatic_sim:
+  ros__parameters:
+    # ── Channel layout (must match pp_controller) ──────────────────
+    num_total_channels: 12
+    num_positive_channels: 6
+    channel_board_offset: 5
+
+    # ── Simulation integration ─────────────────────────────────────
+    sim_substeps: 10          # Euler sub-steps per 2ms tick (0.2ms each)
+
+    # ── Supply line pressures [kPa] (held constant in simulation) ──
+    # LinePID will see zero error → outputs zero PWM to line valves
+    P_line_pos_kpa:   400.0   # positive supply (board 1), matches LinePID.pos.ref
+    P_line_neg_kpa:    50.0   # suction line (board 2),    matches LinePID.neg.ref
+    P_line_macro_kpa: 400.0   # macro supply (board 3)
+    P_atm_kpa:        101.325 # atmospheric
+
+    # ── Initial actuator pressures [kPa] ───────────────────────────
+    initial_pressure_pos_kpa: 101.325
+    initial_pressure_neg_kpa: 101.325
+
+    # ── Sensor calibration (must mirror pp_controller calibration) ──
+    Sensor_calibration:
+      atm_offset: 101.325
+      boards:
+        "1":  { offset: 1107.0,  gain:  0.250   }   # P_line_pos  (Board 1)
+        "2":  { offset: 1020.0,  gain: -0.02525 }   # P_line_neg  (Board 2)
+        "3":  { offset: 1020.0,  gain:  0.250   }   # P_line_macro (Board 3)
+        "5":  { offset: 1064.0,  gain:  0.250   }   # gid 0  (Board 5)
+        "6":  { offset: 1077.0,  gain:  0.250   }   # gid 1  (Board 6)
+        "7":  { offset: 1089.0,  gain:  0.250   }   # gid 2  (Board 7)
+        "8":  { offset: 1065.0,  gain:  0.250   }   # gid 3  (Board 8)
+        "9":  { offset: 1072.0,  gain:  0.250   }   # gid 4  (Board 9)
+        "10": { offset: 1070.0,  gain:  0.250   }   # gid 5  (Board 10)
+        "11": { offset: 1020.0,  gain: -0.02525 }   # gid 6  (Board 11, 음압)
+        "12": { offset: 1020.0,  gain: -0.02525 }   # gid 7  (Board 12)
+        "13": { offset: 1012.0,  gain: -0.02525 }   # gid 8  (Board 13)
+        "14": { offset: 1032.0,  gain: -0.02525 }   # gid 9  (Board 14)
+        "15": { offset: 1010.0,  gain: -0.02525 }   # gid 10 (Board 15)
+        "16": { offset: 1030.0,  gain: -0.02525 }   # gid 11 (Board 16)
+
+    # ── Valve flow coefficients (must mirror pp_controller) ────────
+    default_volume_ml: 1.0
+
+    MacroNegLine:
+      pressure_kpa: 50.0   # negative macro valve outlet [kPa] (same line as P_line_neg)
+
+    channel_config:
+      ch0:  { k0: 0.00022, k1: 0.010, k2: 0.75 }
+      ch1:  { k0: 0.00022, k1: 0.010, k2: 0.75 }
+      ch2:  { k0: 0.00022, k1: 0.010, k2: 0.75 }
+      ch3:  { k0: 0.00022, k1: 0.010, k2: 0.75 }
+      ch4:  { k0: 0.00022, k1: 0.010, k2: 0.75 }
+      ch5:  { k0: 0.00022, k1: 0.010, k2: 0.75 }
+      ch6:  { k0: 0.00022, k1: 0.008, k2: 0.70 }
+      ch7:  { k0: 0.00022, k1: 0.008, k2: 0.70 }
+      ch8:  { k0: 0.00022, k1: 0.008, k2: 0.70 }
+      ch9:  { k0: 0.00022, k1: 0.008, k2: 0.70 }
+      ch10: { k0: 0.00022, k1: 0.008, k2: 0.70 }
+      ch11: { k0: 0.00022, k1: 0.008, k2: 0.70 }

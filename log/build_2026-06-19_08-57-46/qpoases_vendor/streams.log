@@ -1,0 +1,24 @@
+[0.004s] Invoking command in '/home/dmyabb/claude_tutorial/build/qpoases_vendor': CMAKE_PREFIX_PATH=/opt/ros/foxy /usr/bin/cmake /home/dmyabb/claude_tutorial/src/qpoases_vendor -DCMAKE_INSTALL_PREFIX=/home/dmyabb/claude_tutorial/install/qpoases_vendor
+[0.011s] -- Found ament_cmake: 0.9.12 (/opt/ros/foxy/share/ament_cmake/cmake)
+[0.020s] -- Using PYTHON_EXECUTABLE: /usr/bin/python3
+[0.102s] CMake Warning at /opt/ros/foxy/share/ament_cmake_export_include_directories/cmake/ament_export_include_directories.cmake:44 (message):
+[0.102s]   ament_export_include_directories() package 'qpoases_vendor' exports the
+[0.102s]   include directory
+[0.102s]   '/home/dmyabb/claude_tutorial/build/qpoases_vendor/qpOASES/install/include'
+[0.102s]   which doesn't exist
+[0.102s] Call Stack (most recent call first):
+[0.102s]   CMakeLists.txt:54 (ament_export_include_directories)
+[0.102s] 
+[0.102s] 
+[0.103s] CMake Error at /opt/ros/foxy/share/ament_cmake_export_libraries/cmake/ament_export_libraries.cmake:105 (message):
+[0.103s]   ament_export_libraries() package 'qpoases_vendor' exports the imported
+[0.103s]   library
+[0.103s]   '/home/dmyabb/claude_tutorial/build/qpoases_vendor/qpOASES/install/lib/libqpOASES.so'
+[0.103s]   which doesn't exist
+[0.103s] Call Stack (most recent call first):
+[0.103s]   CMakeLists.txt:55 (ament_export_libraries)
+[0.103s] 
+[0.103s] 
+[0.103s] -- Configuring incomplete, errors occurred!
+[0.103s] See also "/home/dmyabb/claude_tutorial/build/qpoases_vendor/CMakeFiles/CMakeOutput.log".
+[0.104s] Invoked command in '/home/dmyabb/claude_tutorial/build/qpoases_vendor' returned '1': CMAKE_PREFIX_PATH=/opt/ros/foxy /usr/bin/cmake /home/dmyabb/claude_tutorial/src/qpoases_vendor -DCMAKE_INSTALL_PREFIX=/home/dmyabb/claude_tutorial/install/qpoases_vendor

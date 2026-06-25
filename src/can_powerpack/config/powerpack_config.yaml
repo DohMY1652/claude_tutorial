@@ -1,0 +1,205 @@
+# ==========================================
+# Node 1: CAN Bridge (Hardware Interface)
+# ==========================================
+/pack2/can_bridge:
+  ros__parameters:
+    # Kvaser 하드웨어 채널 번호 (보통 0 또는 1)
+    # 장비가 인식된 채널에 맞춰 설정하세요.
+    can_channel: 0
+
+# ==========================================
+# Node 2: PP Controller (Control Algorithm)
+# ==========================================
+/pack2/pp_controller:
+  ros__parameters:
+    period_ms: 2
+    cpu_pins: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+
+    # ──────────────────────────────────────────
+    # 채널 수 설정 (여기만 바꾸면 됨)
+    # num_total_channels    : 전체 채널 수 (양압 + 음압)
+    # num_positive_channels : 앞쪽 N개를 양압으로 사용, 나머지는 음압
+    # active_mpc_channels   : 실제로 MPC를 돌릴 채널 목록
+    # ──────────────────────────────────────────
+    num_total_channels: 12
+    num_positive_channels: 7
+
+    active_mpc_channels: [0, 7]
+    sensor_filter_alpha: 1.0
+
+    # Board offset: board_id = gid + channel_board_offset
+    # Positive ch0~ch6 → gid 0~6  → Board 5~11
+    # Negative ch7~ch11 → gid 7~11 → Board 12~16
+    # Encoder (angle)  → Board 17~25 (no pressure calib, RX 2 bytes → angle [deg])
+    channel_board_offset: 5
+    line_pressure_boards:
+      pos: 1    # board 1 → P_line_pos sensor + pos line PID valve
+      neg: 2    # board 2 → P_line_neg sensor + neg line PID valve
+      macro: 3  # board 3 → P_line_macro sensor
+
+    # Board 4: MacroSwitch 전용 (PWM v1 on/off, 센서 미사용)
+    # Board 17~25: 엔코더 전용 (0~5V=360°, 사용범위 1.7~3.16V, board/analog 토픽 [deg] 발행)
+
+    # === per-board calibration (board_id 1-based, boards 19~25 제외) ===
+    Sensor_calibration:
+      atm_offset: 101.325
+      boards:
+        "1":  { offset: 1107.0,  gain: 0.250 }      # P_line_pos  (Board 1)
+        "2":  { offset: 1020.0,  gain: -0.02525 }   # P_line_neg  (Board 2)
+        "3":  { offset: 1020.0,  gain: 0.250 }      # P_line_macro (Board 3)
+        "5":  { offset: 1064.0,  gain: 0.250 }      # gid 0  (Board 5,  양압 ch0)
+        "6":  { offset: 1077.0,  gain: 0.250 }      # gid 1  (Board 6,  양압 ch1)
+        "7":  { offset: 1089.0,  gain: 0.250 }      # gid 2  (Board 7,  양압 ch2)
+        "8":  { offset: 1065.0,  gain: 0.250 }      # gid 3  (Board 8,  양압 ch3)
+        "9":  { offset: 1072.0,  gain: 0.250 }      # gid 4  (Board 9,  양압 ch4)
+        "10": { offset: 1070.0,  gain: 0.250 }      # gid 5  (Board 10, 양압 ch5)
+        "11": { offset: 1070.0,  gain: 0.250 }      # gid 6  (Board 11, 양압 ch6) ← 신규 양압
+        "12": { offset: 1020.0,  gain: -0.02525 }   # gid 7  (Board 12, 음압 ch7)
+        "13": { offset: 1012.0,  gain: -0.02525 }   # gid 8  (Board 13, 음압 ch8)
+        "14": { offset: 1032.0,  gain: -0.02525 }   # gid 9  (Board 14, 음압 ch9)
+        "15": { offset: 1010.0,  gain: -0.02525 }   # gid 10 (Board 15, 음압 ch10)
+        "16": { offset: 1030.0,  gain: -0.02525 }   # gid 11 (Board 16, 음압 ch11)
+        # Board 17~25: 엔코더 보드, pressure calibration 없음 (board/analog 토픽으로 각도 발행)
+
+    channel_config:
+      ch0:
+        pos_ki_micro: 0.0
+        pos_ki_macro: 0.0
+        pos_ki_atm: 0.0
+        k0: 0.00022
+        k1: 0.010
+        k2: 0.75
+      ch1:
+        pos_ki_micro: 0.0
+        pos_ki_macro: 0.0
+        pos_ki_atm: 0.0
+        k0: 0.00022
+        k1: 0.010
+        k2: 0.75
+      ch2:
+        pos_ki_micro: 0.0
+        pos_ki_macro: 0.0
+        pos_ki_atm: 0.0
+        k0: 0.00022
+        k1: 0.010
+        k2: 0.75
+      ch3:
+        pos_ki_micro: 0.0
+        pos_ki_macro: 0.0
+        pos_ki_atm: 0.0
+        k0: 0.00022
+        k1: 0.010
+        k2: 0.75
+      ch4:
+        pos_ki_micro: 0.0
+        pos_ki_macro: 0.0
+        pos_ki_atm: 0.0
+        k0: 0.00022
+        k1: 0.010
+        k2: 0.75
+      ch5:
+        pos_ki_micro: 0.0
+        pos_ki_macro: 0.0
+        pos_ki_atm: 0.0
+        k0: 0.00022
+        k1: 0.010
+        k2: 0.75
+      ch6:                         # 양압 ch6 (Board 11, gid 6) ← 신규 양압
+        pos_ki_micro: 0.0
+        pos_ki_macro: 0.0
+        pos_ki_atm: 0.0
+        k0: 0.00022
+        k1: 0.010
+        k2: 0.75
+      ch7:                         # 음압 ch7 (Board 12, gid 7)
+        neg_ki_micro: 0.0
+        neg_ki_macro: 0.0
+        neg_ki_atm: 0.0
+        k0: 0.00022
+        k1: 0.008
+        k2: 0.70
+      ch8:                         # 음압 ch8 (Board 13, gid 8)
+        neg_ki_micro: 0.0
+        neg_ki_macro: 0.0
+        neg_ki_atm: 0.0
+        k0: 0.00022
+        k1: 0.008
+        k2: 0.70
+      ch9:                         # 음압 ch9 (Board 14, gid 9)
+        neg_ki_micro: 0.0
+        neg_ki_macro: 0.0
+        neg_ki_atm: 0.0
+        k0: 0.00022
+        k1: 0.008
+        k2: 0.70
+      ch10:                        # 음압 ch10 (Board 15, gid 10)
+        neg_ki_micro: 0.0
+        neg_ki_macro: 0.0
+        neg_ki_atm: 0.0
+        k0: 0.00022
+        k1: 0.008
+        k2: 0.70
+      ch11:                        # 음압 ch11 (Board 16, gid 11)
+        neg_ki_micro: 0.0
+        neg_ki_macro: 0.0
+        neg_ki_atm: 0.0
+        k0: 0.00022
+        k1: 0.008
+        k2: 0.70
+
+    RefTcp:
+      enable: true
+      host: "169.254.46.254"
+      # host: '127.0.0.1'
+      port: 2292
+      expect_n: 12
+      pressure_scale: 0.003052
+
+    LinePID:
+      pos:
+        kp: 0.5
+        ki: 0.1
+        kd: 0.0
+        ref: 400.0
+        pwm_index: 0    # (board 1 - 1)*3 + 0 = 0
+
+      neg:
+        kp: 2.0
+        ki: 0.2
+        kd: 0.0
+        ref: 50.0
+        pwm_index: 3    # (board 2 - 1)*3 + 0 = 3
+
+      out_min: 0.0
+      out_max: 100.0
+
+    MPC_parameters:
+      NP: 10
+      n_x: 1
+      n_u: 3
+      Ts: 0.004
+      Q_values: 10.0
+      R_values: 10.0
+
+      ejector_k: 0.005
+      ejector_p_limit: 11.325
+
+      leakage_u_pos: 0.0
+      leakage_u_neg: 0.0
+
+      target_time_constant: 10.0
+
+      macro_threshold : 17.0
+      actuating_threshold : 2.0
+
+
+    default_volume_ml: 1.0
+
+    system_parameters:
+      valve_operate: true
+
+    MacroSwitch:
+      pwm_index: 9    # (board 4 - 1)*3 + 0 = 9
+
+    MacroNegLine:
+      pressure_kpa: 50.0   # 음압 macro 공급 라인 압력 [kPa] (센서 연결 전까지 고정값)

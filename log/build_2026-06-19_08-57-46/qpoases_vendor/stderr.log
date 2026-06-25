@@ -1,0 +1,18 @@
+CMake Warning at /opt/ros/foxy/share/ament_cmake_export_include_directories/cmake/ament_export_include_directories.cmake:44 (message):
+  ament_export_include_directories() package 'qpoases_vendor' exports the
+  include directory
+  '/home/dmyabb/claude_tutorial/build/qpoases_vendor/qpOASES/install/include'
+  which doesn't exist
+Call Stack (most recent call first):
+  CMakeLists.txt:54 (ament_export_include_directories)
+
+
+CMake Error at /opt/ros/foxy/share/ament_cmake_export_libraries/cmake/ament_export_libraries.cmake:105 (message):
+  ament_export_libraries() package 'qpoases_vendor' exports the imported
+  library
+  '/home/dmyabb/claude_tutorial/build/qpoases_vendor/qpOASES/install/lib/libqpOASES.so'
+  which doesn't exist
+Call Stack (most recent call first):
+  CMakeLists.txt:55 (ament_export_libraries)
+
+

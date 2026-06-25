@@ -1,0 +1,6 @@
+[0.000000] (-) TimerEvent: {}
+[0.000279] (-) JobUnselected: {'identifier': 'qpoases_vendor'}
+[0.000298] (can_powerpack) JobQueued: {'identifier': 'can_powerpack', 'dependencies': OrderedDict([('qpoases_vendor', '/home/dmyabb/claude_tutorial/install/qpoases_vendor')])}
+[0.000309] (can_powerpack) JobStarted: {'identifier': 'can_powerpack'}
+[0.007106] (can_powerpack) JobEnded: {'identifier': 'can_powerpack', 'rc': 1}
+[0.017235] (-) EventReactorShutdown: {}
