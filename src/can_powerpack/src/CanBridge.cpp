@@ -18,6 +18,10 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
 {
   channel_num_ = this->declare_parameter<int>("can_channel", 0);
 
+  int num_actuators = this->declare_parameter<int>("num_actuators", 1);
+  for (int i = 0; i < num_actuators; ++i)
+    active_encoder_boards_.insert(ANALOG_BOARD_START + i);
+
   targets_.resize(NUM_BOARDS + 1);
   sensors_snapshot_.assign(PWM_BOARDS + 1, 0);
   current_snapshot_.resize(PWM_BOARDS + 1, {0.0, 0.0, 0.0});
@@ -122,8 +126,8 @@ void CanBridge::rx_loop() {
       int bid = id - 0x120;
 
       if (bid >= ANALOG_BOARD_START) {
-        // Analog-only boards (19..25): 2-byte payload, single uint16_t
-        if (dlc >= 2) {
+        // Analog-only boards (17..25): 2-byte payload, single uint16_t
+        if (dlc >= 2 && (active_encoder_boards_.empty() || active_encoder_boards_.count(bid))) {
           uint16_t raw_a;
           memcpy(&raw_a, &data[0], 2);
           std::lock_guard<std::mutex> lk(sensor_mtx_);
@@ -196,8 +200,10 @@ void CanBridge::sensor_routine() {
   // Publish encoder angles [deg]: boards 17..25, index i = board (ANALOG_BOARD_START + i)
   // Circuit: 1~5V → 3.3V~0V (inverted). V_mv = 5000 - (raw * 4000/4095). angle = V_mv/5000*360.
   std_msgs::msg::Float64MultiArray msg_a;
-  msg_a.data.resize(a_raw.size());
+  msg_a.data.resize(a_raw.size(), 0.0);
   for (size_t i = 0; i < a_raw.size(); ++i) {
+    int board_id = ANALOG_BOARD_START + (int)i;
+    if (!active_encoder_boards_.empty() && !active_encoder_boards_.count(board_id)) continue;
     double v_mv = 5000.0 - ((double)a_raw[i] * 4000.0 / 4095.0);
     v_mv = std::max(0.0, std::min(5000.0, v_mv));
     msg_a.data[i] = v_mv / 5000.0 * 360.0;

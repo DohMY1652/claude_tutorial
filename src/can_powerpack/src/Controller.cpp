@@ -634,9 +634,10 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   }
 
   channel_board_offset_ = get_param_or<int>(this, "channel_board_offset", 4);
-  P_pos_board_id_       = get_param_or<int>(this, "line_pressure_boards.pos",   1);
-  P_neg_board_id_       = get_param_or<int>(this, "line_pressure_boards.neg",   2);
-  P_macro_board_id_     = get_param_or<int>(this, "line_pressure_boards.macro", 3);
+  P_pos_board_id_       = get_param_or<int>(this, "line_pressure_boards.pos",       1);
+  P_neg_board_id_       = get_param_or<int>(this, "line_pressure_boards.neg",       2);
+  P_macro_board_id_     = get_param_or<int>(this, "line_pressure_boards.macro",     3);
+  P_macro_neg_board_id_ = get_param_or<int>(this, "line_pressure_boards.macro_neg", 4);
 
   RCLCPP_INFO(this->get_logger(), "================ PARAMETER DIAGNOSIS ================");
   RCLCPP_INFO(this->get_logger(), "Loaded parameter [Sensor_calibration.boards.4.offset]: %f", sensor_.boards[3].offset);
@@ -693,8 +694,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
 
   sys_valve_operate_   = get_param_or<bool>(this, "system_parameters.valve_operate",   false);
 
-  macro_switch_pwm_index_     = get_param_or<int>(this,    "MacroSwitch.pwm_index",     9);
-  P_macro_neg_kpa_            = get_param_or<double>(this, "MacroNegLine.pressure_kpa", 101.325);
+  macro_switch_pwm_index_     = get_param_or<int>(this, "MacroSwitch.pwm_index", 9);
 
   pid_pos_.kp  = get_param_or<double>(this, "LinePID.pos.kp",  0.5);
   pid_pos_.ki  = get_param_or<double>(this, "LinePID.pos.ki",  0.0);
@@ -791,10 +791,13 @@ Controller::~Controller()
 }
 
 void Controller::build_mpcs() {
-  auto active_channels_param = this->declare_parameter<std::vector<int64_t>>(
-      "active_mpc_channels", std::vector<int64_t>{});
-  std::set<int> active_channels(active_channels_param.begin(), active_channels_param.end());
-  active_channels_ = active_channels;
+  int num_actuators = get_param_or<int>(this, "num_actuators", 1);
+  active_channels_.clear();
+  for (int i = 0; i < num_actuators; ++i) {
+    active_channels_.insert(i);                              // 양압 gid 0..N-1
+    active_channels_.insert(num_positive_channels_ + i);    // 음압 gid num_pos..num_pos+N-1
+  }
+  const std::set<int>& active_channels = active_channels_;
 
   mpcs_.clear();
   mpcs_.reserve(active_channels.size());
@@ -906,7 +909,7 @@ void Controller::on_timer() {
   for (int bid = 1; bid <= NUM_CAN_BOARDS; ++bid) {
     int idx = bid - 1;
     // 라인 압력 보드 or 활성 채널 보드만 처리
-    bool is_line_board = (bid == P_pos_board_id_ || bid == P_neg_board_id_ || bid == P_macro_board_id_);
+    bool is_line_board = (bid == P_pos_board_id_ || bid == P_neg_board_id_ || bid == P_macro_board_id_ || bid == P_macro_neg_board_id_);
     int gid = bid - channel_board_offset_;
     if (!is_line_board && (gid < 0 || gid >= num_total_channels_ || active_channels_.count(gid) == 0)) {
       filt_out_[idx] = sensor_.kpa_atm();
@@ -931,7 +934,7 @@ void Controller::on_timer() {
   const double P_line_pos_kPa       = filt_out_[P_pos_board_id_ - 1];
   const double P_line_neg_kPa       = filt_out_[P_neg_board_id_ - 1];
   const double P_line_macro_kPa     = filt_out_[P_macro_board_id_ - 1];
-  const double P_line_macro_neg_kPa = P_macro_neg_kpa_;
+  const double P_line_macro_neg_kPa = filt_out_[P_macro_neg_board_id_ - 1];
   const double P_atm_kPa            = sensor_.kpa_atm();  
 
   {

@@ -6,6 +6,7 @@
 #include "std_msgs/msg/float64_multi_array.hpp"
 #include <vector>
 #include <array>
+#include <set>
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -39,7 +40,8 @@ private:
   // === Sensor (RX) ===
   std::vector<uint16_t> sensors_snapshot_;                  // [bid], bid = 0..18
   std::vector<std::array<double, 3>> current_snapshot_;     // [bid][0..2], bid 0..18
-  std::vector<uint16_t> analog_snapshot_;                   // [0..6] → board 19..25
+  std::vector<uint16_t> analog_snapshot_;                   // [0..8] → board 17..25
+  std::set<int> active_encoder_boards_;                     // board IDs to read (empty = all)
   std::mutex sensor_mtx_;
 
   // board/sensors  : boards 1..18 pressure (18 values, index 0 = board 1)

@@ -367,6 +367,7 @@ private:
   int P_pos_board_id_{1};         // board carrying P_line_pos sensor
   int P_neg_board_id_{2};         // board carrying P_line_neg sensor
   int P_macro_board_id_{3};       // board carrying P_line_macro sensor
+  int P_macro_neg_board_id_{4};   // board carrying P_line_macro_neg sensor
 
   struct ChannelConfig {
     double pos_ki_micro{0.0};
@@ -445,8 +446,6 @@ private:
   int    pid_neg_pwm_index_{3};    // flat index into zoh_
 
   int    macro_switch_pwm_index_{3};   // flat index into zoh_
-
-  double P_macro_neg_kpa_{101.325};
 
   int log_channel_id_{-1};
   std::ofstream log_file_;
