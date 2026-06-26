@@ -20,6 +20,105 @@
 using std::placeholders::_1;
 using namespace std::chrono_literals;
 
+// ================================
+// RefTcpServer
+// ================================
+RefTcpServer::RefTcpServer(const Config& cfg, Callback cb)
+: cfg_(cfg), cb_(std::move(cb))
+{
+#ifdef __linux__
+    if (cfg_.enable)
+        th_ = std::thread([this](){ run_(); });
+#endif
+}
+
+RefTcpServer::~RefTcpServer()
+{
+    stop_.store(true);
+    int sfd = server_fd_.exchange(-1);
+    int cfd = client_fd_.exchange(-1);
+#ifdef __linux__
+    if (sfd >= 0) ::close(sfd);
+    if (cfd >= 0) ::close(cfd);
+#endif
+    if (th_.joinable()) th_.join();
+}
+
+void RefTcpServer::run_()
+{
+#ifndef __linux__
+    return;
+#else
+    int sfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sfd < 0) {
+        RCLCPP_ERROR(rclcpp::get_logger("RefTcpServer"), "socket() failed");
+        return;
+    }
+    server_fd_.store(sfd);
+
+    int opt = 1;
+    ::setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons((uint16_t)cfg_.port);
+
+    if (::bind(sfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        RCLCPP_ERROR(rclcpp::get_logger("RefTcpServer"), "bind() failed on port %d", cfg_.port);
+        ::close(sfd); server_fd_.store(-1);
+        return;
+    }
+    ::listen(sfd, 1);
+    RCLCPP_INFO(rclcpp::get_logger("RefTcpServer"),
+                "Listening for pressure refs on port %d  [double pos_kpa, double neg_kpa]",
+                cfg_.port);
+
+    while (!stop_.load()) {
+        fd_set fds; FD_ZERO(&fds); FD_SET(sfd, &fds);
+        struct timeval tv{1, 0};
+        if (::select(sfd + 1, &fds, nullptr, nullptr, &tv) <= 0) continue;
+
+        sockaddr_in cli{}; socklen_t cli_len = sizeof(cli);
+        int cfd = ::accept(sfd, (struct sockaddr*)&cli, &cli_len);
+        if (cfd < 0) continue;
+        client_fd_.store(cfd);
+
+        // 1s recv timeout so the inner loop can check stop_
+        struct timeval rtv{1, 0};
+        ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+        RCLCPP_INFO(rclcpp::get_logger("RefTcpServer"), "Client connected.");
+
+        constexpr size_t MSG = 2 * sizeof(double);
+        uint8_t buf[MSG];
+        bool ok = true;
+
+        while (!stop_.load() && ok) {
+            size_t total = 0;
+            while (total < MSG && !stop_.load()) {
+                ssize_t n = ::recv(cfd, buf + total, MSG - total, 0);
+                if (n == 0) { ok = false; break; }
+                if (n < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                    ok = false; break;
+                }
+                total += (size_t)n;
+            }
+            if (!ok || total < MSG) break;
+
+            double pos_kpa, neg_kpa;
+            std::memcpy(&pos_kpa, buf,                  sizeof(double));
+            std::memcpy(&neg_kpa, buf + sizeof(double),  sizeof(double));
+            cb_(pos_kpa, neg_kpa);
+        }
+
+        ::close(cfd); client_fd_.store(-1);
+        RCLCPP_INFO(rclcpp::get_logger("RefTcpServer"), "Client disconnected.");
+    }
+    ::close(sfd); server_fd_.store(-1);
+#endif
+}
+
 template <typename T>
 static T get_param_or(rclcpp::Node* node, const std::string& name, const T& defv) {
   try {
@@ -773,6 +872,26 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   "RefTcp: enable=%d host=%s port=%d expect_n=%d pressure_scale=%.6f",
   (int)ref_client_cfg_.enable, ref_client_cfg_.host.c_str(),
   ref_client_cfg_.port, ref_client_cfg_.expect_n, ref_client_cfg_.pressure_scale);
+
+  ref_server_cfg_.enable  = get_param_or<bool>(this, "RefTcpServer.enable",  false);
+  ref_server_cfg_.port    = get_param_or<int> (this, "RefTcpServer.port",    2293);
+  ref_server_cfg_.pos_gid = get_param_or<int> (this, "RefTcpServer.pos_gid", 0);
+  ref_server_cfg_.neg_gid = get_param_or<int> (this, "RefTcpServer.neg_gid", num_positive_channels_);
+
+  if (ref_server_cfg_.enable) {
+    ref_server_ = std::make_unique<RefTcpServer>(
+      ref_server_cfg_,
+      [this](double pos_kpa, double neg_kpa) {
+        std::lock_guard<std::mutex> lk(mpc_ref_mtx_);
+        const int pg = ref_server_cfg_.pos_gid;
+        const int ng = ref_server_cfg_.neg_gid;
+        if (pg >= 0 && pg < (int)mpc_ref_kpa_.size()) mpc_ref_kpa_[pg] = pos_kpa;
+        if (ng >= 0 && ng < (int)mpc_ref_kpa_.size()) mpc_ref_kpa_[ng] = neg_kpa;
+      }
+    );
+    RCLCPP_INFO(get_logger(), "RefTcpServer: enabled on port %d (pos_gid=%d, neg_gid=%d)",
+                ref_server_cfg_.port, ref_server_cfg_.pos_gid, ref_server_cfg_.neg_gid);
+  }
 
   filt_state_.assign(NUM_CAN_BOARDS, 101.325);
 

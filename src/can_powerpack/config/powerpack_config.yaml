@@ -149,12 +149,18 @@
         k2: 0.70
 
     RefTcp:
-      enable: true
+      enable: false
       host: "169.254.46.254"
       # host: '127.0.0.1'
       port: 2292
       expect_n: 12
       pressure_scale: 0.003052
+
+    RefTcpServer:
+      enable: true
+      port: 2293         # TCP server port (client sends double[2]: [pos_kpa, neg_kpa])
+      pos_gid: 0         # 양압 채널 global_id (board 5)
+      neg_gid: 6         # 음압 채널 global_id (board 11)
 
     LinePID:
       pos:

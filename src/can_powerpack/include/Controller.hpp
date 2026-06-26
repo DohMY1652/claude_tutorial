@@ -333,6 +333,29 @@ private:
     int client_fd_ = -1;
 };
 
+class RefTcpServer {
+public:
+    struct Config {
+        bool enable = false;
+        int port = 2293;
+        int pos_gid = 0;
+        int neg_gid = 6;
+    };
+    using Callback = std::function<void(double pos_kpa, double neg_kpa)>;
+
+    RefTcpServer(const Config& cfg, Callback cb);
+    ~RefTcpServer();
+
+private:
+    void run_();
+    Config cfg_;
+    Callback cb_;
+    std::thread th_;
+    std::atomic<bool> stop_{false};
+    std::atomic<int> server_fd_{-1};
+    std::atomic<int> client_fd_{-1};
+};
+
 class Controller : public rclcpp::Node {
 public:
   explicit Controller(const rclcpp::NodeOptions& opts = rclcpp::NodeOptions());
@@ -432,6 +455,8 @@ private:
   bool sys_valve_operate_{false};
   RefTcpClient::Config ref_client_cfg_;
   std::unique_ptr<RefTcpClient> ref_client_;
+  RefTcpServer::Config ref_server_cfg_;
+  std::unique_ptr<RefTcpServer> ref_server_;
   std::mutex mpc_ref_mtx_;
   std::vector<double> mpc_ref_kpa_;
 
