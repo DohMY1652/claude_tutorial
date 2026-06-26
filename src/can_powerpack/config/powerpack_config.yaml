@@ -5,6 +5,8 @@
   ros__parameters:
     can_channel: 0
     num_actuators: 1
+    current_mode: 0   # 0=Normal(PID), 1=Debug(PWM direct)
+    control_type: 0   # 0=PID, 1=PWM, 2=ID, 3=ZERO
 
 # ==========================================
 # Node 2: PP Controller (Control Algorithm)

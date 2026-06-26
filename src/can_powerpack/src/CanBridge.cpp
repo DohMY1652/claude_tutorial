@@ -16,7 +16,9 @@ using namespace std::chrono_literals;
 CanBridge::CanBridge(const rclcpp::NodeOptions & options)
 : Node("can_bridge", options), hnd_(-1), running_(false)
 {
-  channel_num_ = this->declare_parameter<int>("can_channel", 0);
+  channel_num_   = this->declare_parameter<int>("can_channel",    0);
+  current_mode_  = (uint8_t)this->declare_parameter<int>("current_mode", 1);  // 1=Debug
+  control_type_  = (uint8_t)this->declare_parameter<int>("control_type", 1);  // 1=PWM
 
   int num_actuators = this->declare_parameter<int>("num_actuators", 1);
   for (int i = 0; i < num_actuators; ++i)
@@ -52,7 +54,9 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
   running_ = true;
   rx_thread_ = std::thread(&CanBridge::rx_loop, this);
 
-  RCLCPP_INFO(this->get_logger(), "=== Kvaser CanBridge Running (Ch %d, 5Mbps Manual) ===", channel_num_);
+  RCLCPP_INFO(this->get_logger(),
+    "=== Kvaser CanBridge Running (Ch %d, 5Mbps) | current_mode=%d control_type=%d ===",
+    channel_num_, current_mode_, control_type_);
 }
 
 CanBridge::~CanBridge() {
@@ -231,17 +235,18 @@ void CanBridge::tx_routine() {
   payload_g1[63] = heartbeat_cnt_;
   canWrite(hnd_, CMD_ID_GRP1, payload_g1, 64, canMSG_STD | canFDMSG_FDF | canFDMSG_BRS);
 
-  // Group 2: boards 11..18 (8 boards × 6 bytes = 48 bytes PWM + meta → 64 bytes)
-  uint8_t payload_g2[64];
-  memset(payload_g2, 0, 64);
+  // Group 2: boards 11..17 (7 boards × 6 bytes = 42 bytes PWM + meta → 48 bytes)
+  // Layout matches can_control.py: mode@42, type@43, heartbeat@47
+  uint8_t payload_g2[48];
+  memset(payload_g2, 0, 48);
   offset = 0;
-  for (int i = 11; i <= 18; ++i) {
+  for (int i = 11; i <= 17; ++i) {
     memcpy(&payload_g2[offset], &targets_[i].v1, 2); offset += 2;
     memcpy(&payload_g2[offset], &targets_[i].v2, 2); offset += 2;
     memcpy(&payload_g2[offset], &targets_[i].v3, 2); offset += 2;
   }
-  payload_g2[48] = current_mode_;
-  payload_g2[49] = control_type_;
-  payload_g2[63] = heartbeat_cnt_;
-  canWrite(hnd_, CMD_ID_GRP2, payload_g2, 64, canMSG_STD | canFDMSG_FDF | canFDMSG_BRS);
+  payload_g2[42] = current_mode_;
+  payload_g2[43] = control_type_;
+  payload_g2[47] = heartbeat_cnt_;
+  canWrite(hnd_, CMD_ID_GRP2, payload_g2, 48, canMSG_STD | canFDMSG_FDF | canFDMSG_BRS);
 }
