@@ -356,7 +356,7 @@ private:
   std::vector<double> ref_snapshot_;
   std::vector<double> final_active_vols_ml_;
 
-  int period_ms_{1000 / PWM_RATE_HZ};
+  int period_ms_{2};
   bool enable_thread_pinning_{true};
   std::vector<int64_t> cpu_pins_param_;
 
