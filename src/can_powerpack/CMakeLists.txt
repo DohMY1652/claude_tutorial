@@ -108,6 +108,7 @@ install(PROGRAMS
   scripts/can_control.py
   scripts/log_topics.py
   scripts/self_test_ref_server.py
+  scripts/diagnostic_check.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
