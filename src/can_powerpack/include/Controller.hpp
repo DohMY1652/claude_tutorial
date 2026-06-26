@@ -480,4 +480,11 @@ private:
 
   std::chrono::steady_clock::time_point start_time_;
   double elapsed_time_sec_ = 0.0;
+
+  // Sensor zero-calibration at startup
+  static constexpr int ZERO_SAMPLES = 250;   // ~0.5 sec at 500 Hz
+  bool   sensor_zeroed_{false};
+  int    sensor_zero_tick_{0};
+  std::array<double, NUM_CAN_BOARDS> sensor_zero_sum_{};
+  std::array<int,    NUM_CAN_BOARDS> sensor_zero_cnt_{};
 };

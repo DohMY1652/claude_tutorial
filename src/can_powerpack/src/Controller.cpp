@@ -1017,11 +1017,36 @@ void Controller::on_volume(const std_msgs::msg::Float64MultiArray::SharedPtr msg
 void Controller::on_timer() {
   auto now = std::chrono::steady_clock::now();
   elapsed_time_sec_ = std::chrono::duration<double>(now - start_time_).count();
-  
+
   std::array<uint16_t, NUM_CAN_BOARDS> snap_sensors;
   {
     std::lock_guard<std::mutex> lk(sensors_mtx_);
     snap_sensors = sensors_raw_;
+  }
+
+  // ----------------------------------------------------------------
+  // 0. Sensor zero-calibration: boards 1~16 초기화 (0.5초간 평균)
+  // ----------------------------------------------------------------
+  if (!sensor_zeroed_) {
+    for (int i = 0; i < 16; ++i) {
+      if (snap_sensors[i] > 0) {
+        sensor_zero_sum_[i] += snap_sensors[i];
+        sensor_zero_cnt_[i]++;
+      }
+    }
+    sensor_zero_tick_++;
+
+    if (sensor_zero_tick_ >= ZERO_SAMPLES) {
+      for (int i = 0; i < 16; ++i) {
+        if (sensor_zero_cnt_[i] > 0)
+          sensor_.boards[i].offset = sensor_zero_sum_[i] / sensor_zero_cnt_[i];
+      }
+      sensor_zeroed_ = true;
+      RCLCPP_INFO(get_logger(), "=== Sensor zero-calibration complete ===");
+      for (int bid = 1; bid <= 16; ++bid)
+        RCLCPP_INFO(get_logger(), "  Board %2d: offset=%.1f", bid, sensor_.boards[bid-1].offset);
+    }
+    return;   // 초기화 중에는 제어 출력 없음
   }
 
   // ----------------------------------------------------------------
