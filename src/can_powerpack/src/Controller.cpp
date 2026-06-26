@@ -977,7 +977,9 @@ void Controller::build_mpcs() {
       cfg.leakage_u_neg = (float)mpc_.leakage_u_neg;
 
       cfg.target_time_constant = (float)mpc_.target_tc;
-      
+      cfg.macro_threshold      = (float)mpc_.macro_threshold;
+      cfg.actuating_threshold  = (float)mpc_.actuating_threshold;
+
       auto mpc_obj = std::make_unique<AcadosMpc>(cfg);
       int nv = cfg.n_u * cfg.NP; 
       int nc = 0; 
@@ -1085,34 +1087,35 @@ void Controller::on_timer() {
   for (auto& mpc : mpcs_) {
     if ((mpc->cfg().global_id % MPC_PHASES) != phase) continue;
 
+    AcadosMpc* m = mpc.get();  // capture raw pointer so each lambda binds its own MPC
     tasks.emplace_back([this,
-                        &mpc,
+                        m,
                         P_line_pos_kPa, P_line_neg_kPa, P_line_macro_kPa, P_line_macro_neg_kPa, P_atm_kPa]() {
-      const int brd_idx = mpc->cfg().can_board_id - 1;   // 0-indexed into filt_out_
+      const int brd_idx = m->cfg().can_board_id - 1;
       const double P_state_kPa = filt_out_[brd_idx];
-      const bool pos_side = mpc->cfg().is_positive;
+      const bool pos_side = m->cfg().is_positive;
 
-      mpc->current_P_atm_       = static_cast<float>(P_atm_kPa);
-      mpc->current_P_now_       = static_cast<float>(P_state_kPa);
-      mpc->current_P_micro_     = static_cast<float>(pos_side ? P_line_pos_kPa : P_line_neg_kPa);
-      mpc->current_P_macro_     = static_cast<float>(P_line_macro_kPa);
-      mpc->current_P_macro_neg_ = static_cast<float>(P_line_macro_neg_kPa);
+      m->current_P_atm_       = static_cast<float>(P_atm_kPa);
+      m->current_P_now_       = static_cast<float>(P_state_kPa);
+      m->current_P_micro_     = static_cast<float>(pos_side ? P_line_pos_kPa : P_line_neg_kPa);
+      m->current_P_macro_     = static_cast<float>(P_line_macro_kPa);
+      m->current_P_macro_neg_ = static_cast<float>(P_line_macro_neg_kPa);
 
-      const int gid = mpc->cfg().global_id;
+      const int gid = m->cfg().global_id;
 
-      mpc->set_volume(static_cast<float>(final_active_vols_ml_[gid] * 1e-6));
-      mpc->set_prev_volume(static_cast<float>(prev_vol_m3_[gid]));
+      m->set_volume(static_cast<float>(final_active_vols_ml_[gid] * 1e-6));
+      m->set_prev_volume(static_cast<float>(prev_vol_m3_[gid]));
 
       float ref_kpa = 0.f;
       if (gid >= 0 && gid < (int)ref_snapshot_.size()) ref_kpa = (float)ref_snapshot_[(size_t)gid];
-      mpc->set_ref_value(ref_kpa);
+      m->set_ref_value(ref_kpa);
 
       if (gid == log_channel_id_ && log_file_.is_open()) {
         log_file_ << tick_ << "," << ref_kpa << "," << P_state_kPa << "\n";
       }
 
       std::array<uint16_t, MPC_OUT_DIM> u3{};
-      mpc->solve(static_cast<float>(period_ms_), u3, static_cast<float>(elapsed_time_sec_));
+      m->solve(static_cast<float>(period_ms_), u3, static_cast<float>(elapsed_time_sec_));
 
       const int pwm_base = brd_idx * PWM_PER_BOARD;
       zoh_[pwm_base + 0] = u3[0];
