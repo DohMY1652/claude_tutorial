@@ -12,6 +12,28 @@
 #include <atomic>
 #include <canlib.h>
 
+// CAN FD constants missing from older canlib headers
+#ifndef canOPEN_CAN_FD
+#define canOPEN_CAN_FD   0x0400
+#endif
+#ifndef canFDMSG_FDF
+#define canFDMSG_FDF     0x010000
+#endif
+#ifndef canFDMSG_BRS
+#define canFDMSG_BRS     0x020000
+#endif
+
+// canSetBusParamsFd declaration missing from older canlib headers
+#ifdef __cplusplus
+extern "C" {
+#endif
+canStatus canSetBusParamsFd(canHandle hnd, long freq_brs,
+                             unsigned int tseg1_brs, unsigned int tseg2_brs,
+                             unsigned int sjw_brs);
+#ifdef __cplusplus
+}
+#endif
+
 #define NUM_BOARDS        25   // physical CAN boards (board_id 1..25)
 #define ANALOG_BOARD_START 17  // boards 17..25: angle encoder (0~5V=360°, range 1.7~3.16V)
 
