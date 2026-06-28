@@ -760,9 +760,25 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.actuating_threshold = get_param_or<double>(this, "MPC_parameters.actuating_threshold", 5.0);
 
 
-  default_volume_ml_ = get_param_or<double>(this, "default_volume_ml", 1.0);
-  vol_ml_.assign(num_total_channels_, default_volume_ml_);
-  prev_vol_m3_.assign(num_total_channels_, default_volume_ml_ * 1.0e-6);
+  default_volume_ml_  = get_param_or<double>(this, "default_volume_ml",    1.0);
+  actuator_connected_ = get_param_or<bool>  (this, "actuator_connected",   true);
+  tank_volume_pos_ml_ = get_param_or<double>(this, "tank_volume_pos_ml", 750.0);
+  tank_volume_neg_ml_ = get_param_or<double>(this, "tank_volume_neg_ml", 400.0);
+
+  vol_ml_.resize(num_total_channels_);
+  for (int i = 0; i < num_total_channels_; ++i) {
+    if (!actuator_connected_)
+      vol_ml_[i] = (i < num_positive_channels_) ? tank_volume_pos_ml_ : tank_volume_neg_ml_;
+    else
+      vol_ml_[i] = default_volume_ml_;
+  }
+  prev_vol_m3_.resize(num_total_channels_);
+  for (int i = 0; i < num_total_channels_; ++i)
+    prev_vol_m3_[i] = vol_ml_[i] * 1.0e-6;
+
+  RCLCPP_INFO(get_logger(), "Actuator: %s | vol_pos=%.0f mL, vol_neg=%.0f mL",
+              actuator_connected_ ? "CONNECTED" : "DISCONNECTED",
+              tank_volume_pos_ml_, tank_volume_neg_ml_);
 
   for(int i = 0; i < num_total_channels_; ++i) {
     std::string prefix = "channel_config.ch" + std::to_string(i) + ".";
@@ -1027,6 +1043,7 @@ void Controller::on_sensor(const std_msgs::msg::UInt16MultiArray::SharedPtr m) {
 // 토픽: actuator/volumes_ml  (Float64MultiArray, num_total_channels_ 개, 단위 mL)
 // 활성 채널만 업데이트. 비활성 채널은 default_volume_ml_ 유지.
 void Controller::on_volume(const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
+  if (!actuator_connected_) return;
   const int n = std::min((int)msg->data.size(), num_total_channels_);
   for (int i = 0; i < n; ++i) {
     if (active_channels_.count(i) == 0) continue;

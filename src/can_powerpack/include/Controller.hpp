@@ -423,6 +423,9 @@ private:
   std::vector<ChannelConfig> channel_configs_;
 
   double default_volume_ml_{1.0};
+  bool   actuator_connected_{true};
+  double tank_volume_pos_ml_{750.0};
+  double tank_volume_neg_ml_{400.0};
 
   rclcpp::Subscription<std_msgs::msg::UInt16MultiArray>::SharedPtr sub_sensors_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_volumes_;

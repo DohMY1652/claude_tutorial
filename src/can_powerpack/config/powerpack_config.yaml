@@ -29,6 +29,13 @@
     num_actuators: 1    # 액추에이터 수 → 양압/음압/엔코더 보드 자동 활성화
     sensor_filter_alpha: 1.0
 
+    # 액추에이터 연결 여부
+    # false: 고정 탱크 볼륨 사용 (actuator/volumes_ml 토픽 무시)
+    # true : actuator/volumes_ml 토픽으로 볼륨 업데이트
+    actuator_connected: false
+    tank_volume_pos_ml: 750.0   # 양압 채널 탱크 볼륨 [mL]
+    tank_volume_neg_ml: 400.0   # 음압 채널 탱크 볼륨 [mL]
+
     # 보드 배정:
     #   1~2  : MICRO 양압(board1), 음압(board2)  → 라인압 센서 + PID 밸브
     #   3~4  : MACRO 양압(board3), 음압(board4)  → 라인압 센서 + MacroSwitch PWM
