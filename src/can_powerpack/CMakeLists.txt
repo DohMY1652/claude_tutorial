@@ -14,6 +14,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(qpoases_vendor REQUIRED)
@@ -36,6 +37,7 @@ add_executable(pp_controller
 ament_target_dependencies(pp_controller
   rclcpp
   std_msgs
+  std_srvs
   rcl_interfaces
   qpoases_vendor
 )
@@ -114,6 +116,9 @@ install(PROGRAMS
   scripts/log_topics.py
   scripts/self_test_ref_server.py
   scripts/diagnostic_check.py
+  scripts/live_control.py
+  scripts/pp_monitor.py
+  scripts/run_powerpack.sh
   DESTINATION lib/${PROJECT_NAME}
 )
 

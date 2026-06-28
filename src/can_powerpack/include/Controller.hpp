@@ -3,6 +3,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/u_int16_multi_array.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 #include <Eigen/Dense>
 
@@ -366,6 +367,9 @@ private:
   void on_volume(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
   void on_timer();
   void build_mpcs();
+  void on_zero_calibration(
+    const std_srvs::srv::Trigger::Request::SharedPtr,
+    std_srvs::srv::Trigger::Response::SharedPtr res);
   void inner_loop_1khz(float dt_ms);
   inline uint16_t clamp_pwm(int v) const { return static_cast<uint16_t>( std::min(std::max(v, PWM_CLAMP_MIN), PWM_CLAMP_MAX) ); }
   void publish_cmds();
@@ -487,4 +491,6 @@ private:
   int    sensor_zero_tick_{0};
   std::array<double, NUM_CAN_BOARDS> sensor_zero_sum_{};
   std::array<int,    NUM_CAN_BOARDS> sensor_zero_cnt_{};
+
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr zero_calib_srv_;
 };

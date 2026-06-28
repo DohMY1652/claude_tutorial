@@ -30,27 +30,34 @@ DEFAULT_OFFSET = 1000.0   # 기본 Offset (예: 1V 기준)
 DEFAULT_GAIN   = -0.0253  # 기본 Gain (예: 4000mV 변할 때 약 -100kPa 변동)
 
 PRESSURE_CALIB = {
-    1:  (1107.0, 0.250),
-    2:  (1020.0, -0.02525),
-    3:  (1020.0, 0.250),
-    4:  (1064.0, 0.250),
-    5:  (1077.0, 0.250),
-    6:  (1089.0, 0.250),
-    7:  (1065.0, 0.250),
-    8:  (1072.0, 0.250),
-    9:  (1070.0, 0.250),
-    10:  (1083.0, 0.250),
-    11:  (1094.0, 0.250),
-    12:  (1012.0, -0.02525),
-    13:  (1032.0, -0.02525),
-    14:  (1010.0, -0.02525),
-    15:  (1030.0, -0.02525),
-
+    1:  (1112.0,  0.250),       # P_line_pos
+    2:  (1020.0, -0.02525),     # P_line_neg
+    3:  (1064.0,  0.250),       # P_line_macro
+    4:  (1020.0, -0.02525),     # P_line_macro_neg
+    5:  (1076.0,  0.250),       # gid 0  양압 ch0
+    6:  (1077.0,  0.250),       # gid 1  양압 ch1
+    7:  (1089.0,  0.250),       # gid 2  양압 ch2
+    8:  (1065.0,  0.250),       # gid 3  양압 ch3
+    9:  (1072.0,  0.250),       # gid 4  양압 ch4
+    10: (1070.0,  0.250),       # gid 5  양압 ch5
+    11: (1070.0,  0.250),       # gid 6  양압 ch6
+    12: (1020.0, -0.02525),     # gid 7  음압 ch7
+    13: (1012.0, -0.02525),     # gid 8  음압 ch8
+    14: (1032.0, -0.02525),     # gid 9  음압 ch9
+    15: (1010.0, -0.02525),     # gid 10 음압 ch10
+    16: (1030.0, -0.02525),     # gid 11 음압 ch11
 }
 
+# [엔코더 캘리브레이션] orig_mV 기준 (반전증폭 역산 후)
+# 공식: Angle = (orig_mV - Offset) * Gain
+# orig_mV = (4125 - adc_mv) / 0.825  →  1740mV = 0도, 3127mV = 105도
+ENCODER_OFFSET = 1740.0
+ENCODER_GAIN   = 105.0 / (3127.0 - 1740.0)  # ≈ 0.07569 deg/mV
+ENCODER_CALIB  = {i: (ENCODER_OFFSET, ENCODER_GAIN) for i in range(17, 23)}
+
 # 공유 데이터
-board_data = {i: [0.0, 0.0, 0.0, 0.0] for i in range(1, 18)} # [I1, I2, I3, Pressure]
-last_recv_time = {i: 0.0 for i in range(1, 18)}
+board_data = {i: [0.0, 0.0, 0.0, 0.0] for i in range(1, 23)} # [I1, I2, I3, Pressure]
+last_recv_time = {i: 0.0 for i in range(1, 23)}
 running = True
 
 # 통계
@@ -76,16 +83,12 @@ def calc_original_voltage_mv(adc_mv):
     return (4125.0 - adc_mv) / 0.825
 
 def calc_pressure_kpa(orig_mv, board_id):
-    """
-    압력 계산
-    수식: (mV - Offset) * Gain + 101.325
-    """
-    # 해당 보드의 설정 가져오기 (없으면 기본값 사용)
     offset, gain = PRESSURE_CALIB.get(board_id, (DEFAULT_OFFSET, DEFAULT_GAIN))
+    return (orig_mv - offset) * gain + 101.325
 
-    # 최종 계산
-    pressure = (orig_mv - offset) * gain + 101.325
-    return pressure
+def calc_angle_deg(raw_a, board_id):
+    offset, gain = ENCODER_CALIB.get(board_id, (ENCODER_OFFSET, ENCODER_GAIN))
+    return (raw_a - offset) * gain
 
 # ================= 3. CAN 채널 초기화 =================
 def open_channel():
@@ -118,29 +121,28 @@ def rx_thread_func(ch):
             # 타임아웃 50ms
             msg = ch.read(timeout=50)
 
-            if 0x121 <= msg.id <= 0x131 and len(msg.data) >= 8:
-                rx_count += 1
+            if 0x121 <= msg.id <= 0x136:
                 board_id = msg.id - 0x120
+                rx_count += 1
 
-                raw = struct.unpack('<HHHH', msg.data)
+                if board_id >= 17:
+                    # 엔코더 보드 (17~22): raw[3] -> orig_mV 역산 후 각도 계산
+                    if len(msg.data) >= 8:
+                        raw = struct.unpack('<HHHH', msg.data[:8])
+                        orig_mv = calc_original_voltage_mv(raw[3] * TO_MV)
+                        angle = calc_angle_deg(orig_mv, board_id)
+                        board_data[board_id] = [0.0, 0.0, 0.0, angle]
+                elif len(msg.data) >= 8:
+                    # 압력/전류 보드 (1~16)
+                    raw = struct.unpack('<HHHH', msg.data)
+                    val_pa4 = calc_current_ma(raw[0] * TO_MV)
+                    val_pa5 = calc_current_ma(raw[1] * TO_MV)
+                    val_pa6 = calc_current_ma(raw[2] * TO_MV)
+                    adc_mv_pa7 = raw[3] * TO_MV
+                    orig_mv_pa7 = calc_original_voltage_mv(adc_mv_pa7)
+                    val_pa7 = calc_pressure_kpa(orig_mv_pa7, board_id)
+                    board_data[board_id] = [val_pa4, val_pa5, val_pa6, val_pa7]
 
-                # --- 전류 (PA4, PA5, PA6) ---
-                val_pa4 = calc_current_ma(raw[0] * TO_MV)
-                val_pa5 = calc_current_ma(raw[1] * TO_MV)
-                val_pa6 = calc_current_ma(raw[2] * TO_MV)
-
-                # --- 압력 (PA7) ---
-                # 1. ADC 전압 변환 (mV)
-                adc_mv_pa7 = raw[3] * TO_MV
-
-                # 2. 반전 증폭기 복원 (3.3~0V -> 1~5V)
-                orig_mv_pa7 = calc_original_voltage_mv(adc_mv_pa7)
-
-                # 3. 보드별 캘리브레이션 적용 (Offset, Gain)
-                val_pa7 = calc_pressure_kpa(orig_mv_pa7, board_id)
-
-                # 데이터 저장
-                board_data[board_id] = [val_pa4, val_pa5, val_pa6, val_pa7]
                 last_recv_time[board_id] = time.time()
 
         except (canlib.canNoMsg, canlib.canError):
@@ -160,24 +162,34 @@ def print_dashboard():
     output += f"|------|-----------|-----------|-----------|---------------|-------|\n"
 
     active_cnt = 0
-    for bid in range(1, 18):
+    for bid in range(1, 17):
         vals = board_data[bid]
         t_last = last_recv_time[bid]
-
-        # 1.5초 이내 수신 시 Active
         if now - t_last < 1.5 and t_last != 0:
             status = "OK"
             active_cnt += 1
         else:
             status = "Lost"
-
-        # 압력값 포맷팅
         p_str = f"{vals[3]:8.3f}"
-
         output += f"|  {bid:02d}  | {vals[0]:8.1f}  | {vals[1]:8.1f}  | {vals[2]:8.1f}  |   {p_str}    | {status:^5} |\n"
 
     output += f"==================================================================\n"
-    output += f" Active Boards: {active_cnt} / 17\n"
+    output += f"\n"
+    output += f"|  ID  |    Angle (deg)   | State |\n"
+    output += f"|------|------------------|-------|\n"
+
+    for bid in range(17, 23):
+        vals = board_data[bid]
+        t_last = last_recv_time[bid]
+        if now - t_last < 1.5 and t_last != 0:
+            status = "OK"
+            active_cnt += 1
+        else:
+            status = "Lost"
+        output += f"|  {bid:02d}  |     {vals[3]:8.2f} deg   | {status:^5} |\n"
+
+    output += f"==================================================================\n"
+    output += f" Active Boards: {active_cnt} / 22\n"
     output += f" * Press Ctrl+C to exit.\n"
 
     sys.stdout.write(output)

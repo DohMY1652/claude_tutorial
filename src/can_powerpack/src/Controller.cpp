@@ -895,10 +895,30 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
 
   filt_state_.assign(NUM_CAN_BOARDS, 101.325);
 
+  zero_calib_srv_ = this->create_service<std_srvs::srv::Trigger>(
+    "~/zero_calibration",
+    [this](const std_srvs::srv::Trigger::Request::SharedPtr req,
+           std_srvs::srv::Trigger::Response::SharedPtr res) {
+      on_zero_calibration(req, res);
+    });
+
   start_time_ = std::chrono::steady_clock::now();
   elapsed_time_sec_ = 0.0;
-  
+
   RCLCPP_INFO(this->get_logger(), "Controller node initialization complete.");
+}
+
+void Controller::on_zero_calibration(
+  const std_srvs::srv::Trigger::Request::SharedPtr,
+  std_srvs::srv::Trigger::Response::SharedPtr res)
+{
+  sensor_zero_sum_.fill(0.0);
+  sensor_zero_cnt_.fill(0);
+  sensor_zero_tick_ = 0;
+  sensor_zeroed_    = false;
+  RCLCPP_INFO(get_logger(), "Sensor zero-calibration re-triggered (current values → offset).");
+  res->success = true;
+  res->message = "Zero-calibration started. Offsets will update in ~0.5 sec.";
 }
 
 Controller::~Controller()
@@ -1054,6 +1074,19 @@ void Controller::on_timer() {
   // ----------------------------------------------------------------
   for (int bid = 1; bid <= NUM_CAN_BOARDS; ++bid) {
     int idx = bid - 1;
+
+    // 엔코더 보드 (17~22): 반전증폭 역산(1~5V→3.3V~0V) 후 orig_mV 기준 각도 계산
+    if (bid >= 17 && bid <= 22) {
+      double adc_mv = std::clamp((double)snap_sensors[idx] * (3300.0 / 4095.0), 0.0, 3300.0);
+      double orig_mv = (4125.0 - adc_mv) / 0.825;
+      const auto& ec = sensor_.boards[(size_t)idx];
+      double angle_deg = (orig_mv - ec.offset) * ec.gain;
+      if (!filter_initialized_) filt_state_[idx] = angle_deg;
+      filt_state_[idx] = sensor_filter_alpha_ * angle_deg + (1.0 - sensor_filter_alpha_) * filt_state_[idx];
+      filt_out_[idx]   = filt_state_[idx];
+      continue;
+    }
+
     // 라인 압력 보드 or 활성 채널 보드만 처리
     bool is_line_board = (bid == P_pos_board_id_ || bid == P_neg_board_id_ || bid == P_macro_board_id_ || bid == P_macro_neg_board_id_);
     int gid = bid - channel_board_offset_;

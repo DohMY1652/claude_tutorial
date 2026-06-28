@@ -7,6 +7,8 @@
     num_actuators: 1
     current_mode: 0   # 0=Normal(PID), 1=Debug(PWM direct)
     control_type: 0   # 0=PID, 1=PWM, 2=ID, 3=ZERO
+    encoder_offset: 1740.0   # orig_mV at 0 degrees (after inverting amp recovery)
+    encoder_gain: 0.07570    # deg/mV = 105 / (3127 - 1740)
 
 # ==========================================
 # Node 2: PP Controller (Control Algorithm)
@@ -44,11 +46,11 @@
     Sensor_calibration:
       atm_offset: 101.325
       boards:
-        "1":  { offset: 1107.0,  gain: 0.250 }      # P_line_pos      (Board 1)
+        "1":  { offset: 1112.0,  gain: 0.250 }      # P_line_pos      (Board 1)
         "2":  { offset: 1020.0,  gain: -0.02525 }   # P_line_neg      (Board 2)
-        "3":  { offset: 1020.0,  gain: 0.250 }      # P_line_macro    (Board 3)
+        "3":  { offset: 1064.0,  gain: 0.250 }      # P_line_macro    (Board 3)
         "4":  { offset: 1020.0,  gain: -0.02525 }   # P_line_macro_neg (Board 4)
-        "5":  { offset: 1064.0,  gain: 0.250 }      # gid 0  (Board 5,  양압 ch0)
+        "5":  { offset: 1076.0,  gain: 0.250 }      # gid 0  (Board 5,  양압 ch0)
         "6":  { offset: 1077.0,  gain: 0.250 }      # gid 1  (Board 6,  양압 ch1)
         "7":  { offset: 1089.0,  gain: 0.250 }      # gid 2  (Board 7,  양압 ch2)
         "8":  { offset: 1065.0,  gain: 0.250 }      # gid 3  (Board 8,  양압 ch3)
@@ -60,7 +62,15 @@
         "14": { offset: 1032.0,  gain: -0.02525 }   # gid 9  (Board 14, 음압 ch9)
         "15": { offset: 1010.0,  gain: -0.02525 }   # gid 10 (Board 15, 음압 ch10)
         "16": { offset: 1030.0,  gain: -0.02525 }   # gid 11 (Board 16, 음압 ch11)
-        # Board 17~25: 엔코더 보드, pressure calibration 없음 (board/analog 토픽으로 각도 발행)
+        # Board 17~22: 엔코더 보드 (angle = (orig_mV - offset) * gain [deg])
+        # 반전증폭 역산 후 orig_mV 기준: 1740mV=0도, 3127mV=105도
+        # gain = 105 / (3127 - 1740) ≈ 0.07570 deg/mV
+        "17": { offset: 1740.0,  gain: 0.07570 }    # encoder ch0
+        "18": { offset: 1740.0,  gain: 0.07570 }    # encoder ch1
+        "19": { offset: 1740.0,  gain: 0.07570 }    # encoder ch2
+        "20": { offset: 1740.0,  gain: 0.07570 }    # encoder ch3
+        "21": { offset: 1740.0,  gain: 0.07570 }    # encoder ch4
+        "22": { offset: 1740.0,  gain: 0.07570 }    # encoder ch5
 
     channel_config:
       ch0:
