@@ -16,7 +16,7 @@ BOARD_NAMES = {
     1:'P_line_pos',  2:'P_line_neg',
     3:'P_macro_pos', 4:'P_macro_neg',
     5:'pos ch0',  6:'pos ch1',  7:'pos ch2',  8:'pos ch3',
-    9:'pos ch4', 10:'pos ch5', 11:'pos ch6', 12:'neg ch7',
+    9:'pos ch4', 10:'pos ch5', 11:'neg ch6', 12:'neg ch7',
    13:'neg ch8', 14:'neg ch9', 15:'neg ch10',16:'neg ch11',
 }
 

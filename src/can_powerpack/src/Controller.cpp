@@ -865,6 +865,15 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   sub_volumes_ = create_subscription<std_msgs::msg::Float64MultiArray>(
       "actuator/volumes_ml", 10, std::bind(&Controller::on_volume, this, _1));
 
+  sub_analog_ = create_subscription<std_msgs::msg::Float64MultiArray>(
+      "board/analog", 10,
+      [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
+          std::lock_guard<std::mutex> lk(sensors_mtx_);
+          const size_t n = std::min(msg->data.size(), encoder_angles_.size());
+          for (size_t i = 0; i < n; ++i)
+              encoder_angles_[i] = msg->data[i];
+      });
+
   size_t nth = std::max<size_t>(2, std::min<size_t>(
       (size_t)num_total_channels_,
       std::thread::hardware_concurrency()));
@@ -917,6 +926,12 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
            std_srvs::srv::Trigger::Response::SharedPtr res) {
       on_zero_calibration(req, res);
     });
+
+  pressure_safety_limit_kpa_      = get_param_or<double>(this, "pressure_safety_limit_kpa",           170.0);
+  pressure_safety_hysteresis_kpa_ = get_param_or<double>(this, "pressure_safety_hysteresis_kpa",       10.0);
+  RCLCPP_INFO(get_logger(), "Over-pressure safety: limit=%.1f kPa, hysteresis=%.1f kPa (release at %.1f kPa)",
+    pressure_safety_limit_kpa_, pressure_safety_hysteresis_kpa_,
+    pressure_safety_limit_kpa_ - pressure_safety_hysteresis_kpa_);
 
   start_time_ = std::chrono::steady_clock::now();
   elapsed_time_sec_ = 0.0;
@@ -1143,6 +1158,38 @@ void Controller::on_timer() {
     pub_mpc_refs_->publish(msg);
   }
 
+  // ----------------------------------------------------------------
+  // 액추에이터 연결 시 엔코더 각도로 부피 계산 (actuator_connected=true)
+  //
+  //   r  = 25 mm  (실린더 반경)
+  //   A  = π × r²  = π × 25²  [mm²]
+  //
+  //   양압: V_pos = tank_pos_mL + A × max(0,  40 + 25×angle) / 1000  [mL]
+  //   음압: V_neg = tank_neg_mL + A × max(0,  90 - 25×angle) / 1000  [mL]
+  //
+  //   actuator i  →  encoder board (17+i)  →  ang[i]  [deg]
+  // ----------------------------------------------------------------
+  if (actuator_connected_) {
+      std::array<double, 9> ang;
+      {
+          std::lock_guard<std::mutex> lk(sensors_mtx_);
+          ang = encoder_angles_;
+      }
+      constexpr double A = M_PI * 25.0 * 25.0;   // π × (25 mm)²  [mm²]
+      for (int i = 0; i < num_positive_channels_; ++i) {
+          if (active_channels_.count(i) == 0) continue;
+          const double angle   = ang[i];
+          const int    neg_gid = num_positive_channels_ + i;
+
+          vol_ml_[i] = tank_volume_pos_ml_
+              + A * std::max(0.0, 40.0 + 25.0 * angle) / 1000.0;
+
+          if (neg_gid < num_total_channels_ && active_channels_.count(neg_gid))
+              vol_ml_[neg_gid] = tank_volume_neg_ml_
+                  + A * std::max(0.0, 90.0 - 25.0 * angle) / 1000.0;
+      }
+  }
+
   std::fill(final_active_vols_ml_.begin(), final_active_vols_ml_.end(), 0.0);
   for(int i = 0; i < num_total_channels_; ++i) {
       if (active_channels_.count(i) == 0) continue;
@@ -1287,6 +1334,37 @@ void Controller::on_timer() {
       cmds_[i] = clamp_pwm(static_cast<int>(zoh_[i]) + inner_[i]);
   } else {
     std::fill(cmds_.begin(), cmds_.end(), 0);
+  }
+
+  // ----------------------------------------------------------------
+  // Over-pressure safety: positive channels (hysteresis latch)
+  // Latch ON  when P >= limit            → force exhaust fully open
+  // Latch OFF when P <  limit - hyst     → return control to MPC
+  // ----------------------------------------------------------------
+  for (int gid = 0; gid < num_positive_channels_; ++gid) {
+    if (active_channels_.count(gid) == 0) continue;
+    int bid     = gid + channel_board_offset_;
+    int brd_idx = bid - 1;
+    if (brd_idx < 0 || brd_idx >= NUM_CAN_BOARDS) continue;
+
+    const double P = filt_out_[brd_idx];
+    const double release_threshold = pressure_safety_limit_kpa_ - pressure_safety_hysteresis_kpa_;
+
+    if (P >= pressure_safety_limit_kpa_) {
+      safety_latched_[gid] = true;
+    } else if (P < release_threshold) {
+      safety_latched_[gid] = false;
+    }
+
+    if (safety_latched_[gid]) {
+      int base        = brd_idx * PWM_PER_BOARD;
+      cmds_[base + 0] = 0;     // micro valve: closed
+      cmds_[base + 1] = 4095;  // exhaust valve: fully open
+      cmds_[base + 2] = 0;     // macro valve: closed
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 500,
+        "[SAFETY] ch%d (board %d) P=%.1f kPa, latched (limit=%.1f, release=%.1f)",
+        gid, bid, P, pressure_safety_limit_kpa_, release_threshold);
+    }
   }
 
   publish_cmds();

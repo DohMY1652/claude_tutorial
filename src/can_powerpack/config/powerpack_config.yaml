@@ -32,7 +32,7 @@
     # 액추에이터 연결 여부
     # false: 고정 탱크 볼륨 사용 (actuator/volumes_ml 토픽 무시)
     # true : actuator/volumes_ml 토픽으로 볼륨 업데이트
-    actuator_connected: false
+    actuator_connected: true
     tank_volume_pos_ml: 750.0   # 양압 채널 탱크 볼륨 [mL]
     tank_volume_neg_ml: 400.0   # 음압 채널 탱크 볼륨 [mL]
 
@@ -63,7 +63,7 @@
         "8":  { offset: 1065.0,  gain: 0.250 }      # gid 3  (Board 8,  양압 ch3)
         "9":  { offset: 1072.0,  gain: 0.250 }      # gid 4  (Board 9,  양압 ch4)
         "10": { offset: 1070.0,  gain: 0.250 }      # gid 5  (Board 10, 양압 ch5)
-        "11": { offset: 1070.0,  gain: 0.250 }      # gid 6  (Board 11, 양압 ch6) ← 신규 양압
+        "11": { offset: 1070.0,  gain: -0.02525 }   # gid 6  (Board 11, 음압 ch6)
         "12": { offset: 1020.0,  gain: -0.02525 }   # gid 7  (Board 12, 음압 ch7)
         "13": { offset: 1012.0,  gain: -0.02525 }   # gid 8  (Board 13, 음압 ch8)
         "14": { offset: 1032.0,  gain: -0.02525 }   # gid 9  (Board 14, 음압 ch9)
@@ -122,13 +122,13 @@
         k0: 0.00022
         k1: 0.010
         k2: 0.75
-      ch6:                         # 양압 ch6 (Board 11, gid 6) ← 신규 양압
-        pos_ki_micro: 0.0
-        pos_ki_macro: 0.0
-        pos_ki_atm: 0.0
+      ch6:                         # 음압 ch6 (Board 11, gid 6)
+        neg_ki_micro: 0.0
+        neg_ki_macro: 0.0
+        neg_ki_atm: 0.0
         k0: 0.00022
-        k1: 0.010
-        k2: 0.75
+        k1: 0.008
+        k2: 0.70
       ch7:                         # 음압 ch7 (Board 12, gid 7)
         neg_ki_micro: 0.0
         neg_ki_macro: 0.0
@@ -216,6 +216,9 @@
       macro_threshold : 17.0
       actuating_threshold : 2.0
 
+
+    pressure_safety_limit_kpa: 170.0        # positive channel over-pressure limit → exhaust forced open
+    pressure_safety_hysteresis_kpa: 10.0   # hysteresis: latch releases when P < (limit - hyst) = 160 kPa
 
     default_volume_ml: 1.0
 

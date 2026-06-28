@@ -429,6 +429,8 @@ private:
 
   rclcpp::Subscription<std_msgs::msg::UInt16MultiArray>::SharedPtr sub_sensors_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_volumes_;
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_analog_;
+  std::array<double, 9> encoder_angles_{};   // boards 17..25 [deg], index 0 = board 17
   rclcpp::Publisher<std_msgs::msg::UInt16MultiArray>::SharedPtr pub_pwm_cmd_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_mpc_refs_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_active_vols_;
@@ -490,10 +492,16 @@ private:
 
   // Sensor zero-calibration at startup
   static constexpr int ZERO_SAMPLES = 250;   // ~0.5 sec at 500 Hz
-  bool   sensor_zeroed_{false};
+  bool   sensor_zeroed_{true};   // true = use YAML offsets directly (no auto-calib at startup)
   int    sensor_zero_tick_{0};
   std::array<double, NUM_CAN_BOARDS> sensor_zero_sum_{};
   std::array<int,    NUM_CAN_BOARDS> sensor_zero_cnt_{};
 
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr zero_calib_srv_;
+
+  // Over-pressure safety: positive channels only
+  // Hysteresis: latch ON at >= limit, release only when P < (limit - hysteresis_kpa)
+  double pressure_safety_limit_kpa_{170.0};
+  double pressure_safety_hysteresis_kpa_{10.0};
+  std::array<bool, 12> safety_latched_{};   // per positive channel (gid 0..11)
 };
