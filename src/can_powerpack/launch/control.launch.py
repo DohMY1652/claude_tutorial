@@ -9,6 +9,7 @@ def generate_launch_description():
     pkg_prefix  = get_package_prefix('can_powerpack')
     config_path  = os.path.join(pkg_share,  'config', 'powerpack_config.yaml')
     monitor_path = os.path.join(pkg_prefix, 'lib', 'can_powerpack', 'pp_monitor.py')
+    logger_path  = os.path.join(pkg_prefix, 'lib', 'can_powerpack', 'pp_logger.py')
     setup_bash   = os.path.normpath(os.path.join(pkg_prefix, '..', 'setup.bash'))
 
     can_bridge = Node(
@@ -29,6 +30,11 @@ def generate_launch_description():
         parameters=[config_path],
     )
 
+    logger = ExecuteProcess(
+        cmd=['python3', logger_path],
+        output='log',
+    )
+
     monitor = ExecuteProcess(
         cmd=[
             'gnome-terminal', '--',
@@ -42,5 +48,6 @@ def generate_launch_description():
     return LaunchDescription([
         can_bridge,
         controller,
+        logger,
         monitor,
     ])

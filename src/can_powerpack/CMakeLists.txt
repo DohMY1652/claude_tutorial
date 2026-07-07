@@ -118,6 +118,7 @@ install(PROGRAMS
   scripts/diagnostic_check.py
   scripts/live_control.py
   scripts/pp_monitor.py
+  scripts/pp_logger.py
   scripts/run_powerpack.sh
   DESTINATION lib/${PROJECT_NAME}
 )

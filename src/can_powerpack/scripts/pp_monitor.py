@@ -33,6 +33,8 @@ class MonitorNode(Node):
         self._currents = {}
         self._refs     = [101.325] * NUM_CHANNELS
         self._encoders = []
+        # position_dbg: [angle, angle_ref, p_pos, p_neg, p_pid, p_ff, p_friction, vel_dps]
+        self._pos_dbg  = None
 
         ns = NAMESPACE
         self.create_subscription(Float64MultiArray, f'{ns}/controller/sensors_kpa',
@@ -43,6 +45,8 @@ class MonitorNode(Node):
                                  self._cb_refs,      10)
         self.create_subscription(Float64MultiArray, f'{ns}/board/analog',
                                  self._cb_analog,    10)
+        self.create_subscription(Float64MultiArray, f'{ns}/controller/position_dbg',
+                                 self._cb_pos_dbg,   10)
 
     def _cb_kpa(self, msg):
         with self._lock:
@@ -63,13 +67,17 @@ class MonitorNode(Node):
         with self._lock:
             self._encoders = list(msg.data)
 
+    def _cb_pos_dbg(self, msg):
+        with self._lock:
+            self._pos_dbg = list(msg.data)
+
     def snapshot(self):
         with self._lock:
-            return list(self._kpa), dict(self._currents), list(self._refs), list(self._encoders)
+            return list(self._kpa), dict(self._currents), list(self._refs), list(self._encoders), self._pos_dbg
 
 
 # ─────────────── 화면 구성 ───────────────
-def build_display(kpa, currents, refs, encoders, display_on):
+def build_display(kpa, currents, refs, encoders, pos_dbg, display_on):
     if not display_on:
         return '\033[2J\033[H  [ Display OFF ]  press \'t\' to enable\n'
 
@@ -102,6 +110,20 @@ def build_display(kpa, currents, refs, encoders, display_on):
             o += '  ' + '   '.join(parts) + '\n'
     else:
         o += '  (no encoder data)\n'
+
+    # ── 위치 제어 상태 (position_dbg 수신 시만 표시) ──
+    # pos_dbg: [angle, angle_ref, p_pos, p_neg, p_pid, p_ff, p_friction, vel_dps]
+    o += SEP + '\n'
+    o += ' Position Control\n'
+    if pos_dbg and len(pos_dbg) >= 8:
+        angle, angle_ref, p_pos, p_neg, p_pid, p_ff, p_fric, vel = pos_dbg[:8]
+        err = angle_ref - angle
+        o += (f'  Angle : now={angle:6.2f} deg   target={angle_ref:6.2f} deg'
+              f'   err={err:+6.2f} deg   vel={vel:+6.1f} dps\n')
+        o += (f'  Output: P+={p_pos:6.1f} kPa   P-={p_neg:6.1f} kPa'
+              f'   (pid={p_pid:+5.1f}  ff={p_ff:+5.1f}  fric={p_fric:+5.1f})\n')
+    else:
+        o += '  (위치 제어 비활성 또는 데이터 없음 — control_mode=0 이거나 TCP 미수신)\n'
 
     o += SEP2 + '\n'
     return o
@@ -145,8 +167,8 @@ def main():
                 if display_on:
                     os.system('clear')
 
-            kpa, currents, refs, encoders = node.snapshot()
-            sys.stdout.write(build_display(kpa, currents, refs, encoders, display_on))
+            kpa, currents, refs, encoders, pos_dbg = node.snapshot()
+            sys.stdout.write(build_display(kpa, currents, refs, encoders, pos_dbg, display_on))
             sys.stdout.flush()
             time.sleep(0.1)
     except KeyboardInterrupt:

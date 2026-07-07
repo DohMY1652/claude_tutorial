@@ -374,6 +374,9 @@ private:
   inline uint16_t clamp_pwm(int v) const { return static_cast<uint16_t>( std::min(std::max(v, PWM_CLAMP_MIN), PWM_CLAMP_MAX) ); }
   void publish_cmds();
 
+  // 위치 제어: 엔코더 각도 → 압력 레퍼런스 변환 (on_timer 내 호출)
+  void run_position_control(double dt_sec);
+
 private:
   double sensor_filter_alpha_{1.0};
   std::vector<double> filt_state_;                      // [NUM_CAN_BOARDS]
@@ -480,6 +483,57 @@ private:
   int    pid_neg_pwm_index_{3};    // flat index into zoh_
 
   int    macro_switch_pwm_index_{3};   // flat index into zoh_
+
+  // ──────────────────────────────────────────
+  // 위치 제어기
+  // ──────────────────────────────────────────
+  int control_mode_{0};   // 0: 압력 제어, 1: 위치 제어
+
+  struct PositionCtrlConfig {
+    // PID 게인
+    double kp{3.0};              // [kPa/deg]
+    double ki{0.05};             // [kPa/(deg·s)]
+    double kd{0.02};             // [kPa·s/deg]
+    // 중력 피드포워드
+    double kff_gravity{10.0};    // [kPa/(N·m)]
+    double mass_kg{1.0};
+    double link_length_m{0.2};
+    // 마찰 보상
+    double friction_kpa{2.0};
+    double vel_deadband_dps{0.5};
+    // 바이어스 압력
+    double p_bias_pos_kpa{120.0};
+    double p_bias_neg_kpa{90.0};
+    double neg_coupling{0.5};
+    // 출력 제한
+    double p_pos_max_kpa{165.0};
+    double p_pos_min_kpa{101.325};
+    double p_neg_max_kpa{101.325};
+    double p_neg_min_kpa{70.0};
+    // 채널 매핑
+    int actuator_idx{0};
+    int pos_gid{0};
+    int neg_gid{6};
+    // 필터 / 초기값
+    double vel_filter_alpha{0.05};
+    double default_angle_deg{0.0};
+    double integral_limit_kpa{20.0};
+  } pos_ctrl_cfg_;
+
+  struct PositionCtrlState {
+    double integral{0.0};
+    double prev_angle{0.0};
+    double vel_filt{0.0};    // 필터된 각속도 [deg/s]
+    bool   initialized{false};
+  } pos_ctrl_state_;
+
+  // TCP에서 수신한 목표 각도 (mpc_ref_mtx_ 로 보호)
+  double target_angle_deg_{0.0};
+  bool   pos_tcp_received_{false};
+
+  // 위치 제어 디버그 토픽
+  // data: [angle, angle_ref, p_pos_ref, p_neg_ref, p_pid, p_ff, p_friction, vel_dps]
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_pos_dbg_;
 
   int log_channel_id_{-1};
   std::ofstream log_file_;
