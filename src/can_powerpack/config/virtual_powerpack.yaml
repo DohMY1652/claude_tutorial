@@ -1,0 +1,128 @@
+# ==========================================
+# VirtualPowerpack — 가상 하드웨어 물리 파라미터
+# ==========================================
+# 실제 하드웨어(CAN 보드/밸브/액추에이터)를 대신하는 시뮬레이터 전용 설정.
+# 채널 구성 · 센서 캘리브레이션 · 밸브 13-파라미터 · 위치제어 축 매핑은
+# powerpack_config.yaml 의 값을 virtual.launch.py 가 그대로 주입하므로
+# 여기서 중복 정의하지 않는다. (여기 값이 있으면 그 값이 우선)
+#
+# 노드 이름은 virtual.launch.py 에서 can_bridge 로 띄운다 —
+# pp_controller 는 CanBridge 와 구분할 수 없다.
+/pack2/can_bridge:
+  ros__parameters:
+    # ── 적분 ────────────────────────────────────────────────────────────
+    # period_ms(2ms) 한 tick 을 substeps 로 쪼개 오일러 적분.
+    # 밸브 2차 동역학 wn=45rad/s 대비 dt=0.2ms 면 충분히 안정.
+    Virtual:
+      substeps: 10
+
+      # ── micro 라인 펌프 (슬라이더-크랭크 실기 제원) ───────────────────
+      # 펌프 한 대가 음압 라인(흡입구)에서 양압 라인(토출구)으로 공기를 이송한다.
+      # 양압원/진공원이 따로 있는 게 아니라 같은 펌프의 양 끝이고, 회로가 대기와
+      # 통하는 곳은 board1 v1(방출)과 board2 v1(유입) 두 군데뿐이다.
+      #
+      # 흡입량 = 토출량이라 양압을 높이면 음압이 억눌리는 능력경계가 생긴다.
+      # 기동 시 (양압레일 × 음압레일) 2D 테이블을 만들어 보간해 쓴다.
+      # 검증: 이 제원은 해설서 그림 B 의 두 점을 정확히 재현한다 —
+      #   음압 −90 kPa → 양압 상한 335 kPa,  −80 kPa → 745 kPa
+      pump:
+        delta_m: 0.041           # 피스톤 최대 체적변화 길이 (사구간)
+        crank_m: 0.02
+        rod_m: 0.07
+        piston_area_m2: 0.0038485
+        cb_out_m2: 0.00000146    # 토출 체크밸브 계수 1.46 mm²
+        cb_in_m2: 0.00003347     # 흡입 체크밸브 계수 33.47 mm²
+        rpm: 3000.0              # 1회전 = 20 ms = 생성기 주기와 일치
+        n_piston: 2              # 180° 위상
+
+      # ── 압축탱크 (board 3) ────────────────────────────────────────────
+      # 213 mL 를 30 MPa 로 충전하고 레귤레이터로 700 kPa gauge 로 낮춰 쓴다.
+      # 컴프레서가 없으므로 쓰면 줄어들 뿐 회복되지 않는다.
+      # 저장 질량 ≈ 76 g ≈ 표준 63 L → 이젝터(57 LPM)만 돌려도 약 1분이면 바닥.
+      # board 3 센서는 레귤레이터 출력을 읽고, 상류가 다 마르면 그 값이 내려간다.
+      tank:
+        volume_ml: 213.0
+        charge_kpa: 30000.0            # 30 MPa 초기 충전 (절대압)
+        regulated_kpa_gauge: 700.0     # 레귤레이터 출력
+
+      # ── 라인 부피 [mL] / 기생 누설 [LPM/kPa] ──────────────────────────
+      # 매니폴드 + 튜빙 부피. 작을수록 라인압이 채널 소비에 민감하게 반응.
+      # 누설은 제어 경로가 아니라 실제 피팅 누설분이므로 작게 둔다
+      # (제어는 board1/board2 의 대기 창구로 한다).
+      line_volume_pos_ml: 500.0
+      line_volume_neg_ml: 500.0
+      line_volume_macro_ml: 1000.0
+      line_volume_macro_neg_ml: 500.0
+      line_leak_pos_lpm_per_kpa: 0.002
+      line_leak_neg_lpm_per_kpa: 0.002
+      line_leak_macro_lpm_per_kpa: 0.002
+      line_leak_macro_neg_lpm_per_kpa: 0.002
+
+      # 라인 압력 수치 가드 [kPa] — 물리 한계는 펌프 모델이 만들고, 이 값은 발산 방지용
+      line_pos_min_kpa: 50.0
+      line_pos_max_kpa: 800.0
+      line_neg_min_kpa: 5.0
+      line_neg_max_kpa: 110.0
+
+      # ── 센서 모델 ─────────────────────────────────────────────────────
+      # CanBridge::rx_loop 의 1차 LPF(alpha=0.2) 를 그대로 재현
+      sensor_lpf_enable: true
+      sensor_lpf_alpha: 0.2
+      # 밸브 전류센서 출력 스케일: I[A] × 이 값 = 센서 출력 [mV]
+      # 11000 mV/A → u=100%(I=0.3A) 에서 3300mV(ADC 풀스케일)
+      current_mv_per_amp: 11000.0
+
+      # ── 초기 압력 [kPa abs] ───────────────────────────────────────────
+      init_line_pos_kpa: 101.325
+      init_line_neg_kpa: 101.325
+      init_line_macro_kpa: 101.325
+      init_line_macro_neg_kpa: 101.325
+
+      # ── 액추에이터 축 0 ───────────────────────────────────────────────
+      # 부피 모델은 Controller::on_timer 의 각도-부피 식과 동일하다:
+      #   x     = reel_radius · θ_rad                       [mm]
+      #   V_pos = tank_pos + A·max(0, pos_offset + x)/1000   [mL]
+      #   V_neg = tank_neg + A·max(0, neg_offset - x)/1000   [mL]
+      # 피스톤 지름·릴 반경·사구간 길이는 powerpack_config.yaml 의 Geometry 블록이
+      # 단일 출처다 (여기서 중복 정의하지 않는다).
+      # tank_pos/neg 는 powerpack_config.yaml 의 tank_volume_pos_ml/neg_ml 을 쓴다.
+      actuator0:
+        pos_offset_mm: 40.0
+        neg_offset_mm: 90.0
+
+        # 회전 동역학
+        #   J·ω̇ = A_piston·torque_arm·(P_pos - P_neg) - m·g·L·sinθ - b·ω - τ_coulomb·sgn(ω)
+        # torque_arm = 릴 반경 0.025 m (실측). 피스톤 면적·부피식과 같은 기하다.
+        # 정격에서 τ_max = 1.9635e-3 × 0.025 × 158e3 = 7.76 N·m 이고
+        # 중력은 5×9.81×0.15 = 7.36 N·m @90° → 여유 5% 뿐이다.
+        torque_arm_m: 0.025
+        inertia_kgm2: 0.05
+        damping_nms: 0.30      # 점성 감쇠 [N·m·s/rad]
+        coulomb_nm: 0.50       # 쿨롱 마찰 [N·m] (정지마찰 포함)
+
+        # 기계적 스토퍼 [deg] — 엔코더 캘리브레이션 유효 범위(0~105°)와 일치
+        theta_min_deg: 0.0
+        theta_max_deg: 105.0
+        theta_init_deg: 0.0
+
+      actuator1:
+        pos_offset_mm: 40.0
+        neg_offset_mm: 90.0
+        torque_arm_m: 0.025
+        inertia_kgm2: 0.05
+        damping_nms: 0.30
+        coulomb_nm: 0.50
+        theta_min_deg: 0.0
+        theta_max_deg: 105.0
+        theta_init_deg: 0.0
+
+      actuator2:
+        pos_offset_mm: 40.0
+        neg_offset_mm: 90.0
+        torque_arm_m: 0.025
+        inertia_kgm2: 0.05
+        damping_nms: 0.30
+        coulomb_nm: 0.50
+        theta_min_deg: 0.0
+        theta_max_deg: 105.0
+        theta_init_deg: 0.0

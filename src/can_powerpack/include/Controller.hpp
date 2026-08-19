@@ -7,6 +7,8 @@
 
 #include <Eigen/Dense>
 
+#include "PressureRefGen.hpp"
+
 #include <deque>
 #include <set>
 #include <vector>
@@ -378,6 +380,9 @@ private:
   // 위치 제어: 엔코더 각도 → 압력 레퍼런스 변환 (on_timer 내 호출)
   void run_position_control(double dt_sec);
 
+  // control_mode 2: 위치 PID → 목표 토크 → 최적화 생성기 → 12개 목표 압력
+  void run_optimized_pressure_ref(double dt_sec);
+
 private:
   double sensor_filter_alpha_{1.0};
   std::vector<double> filt_state_;                      // [NUM_CAN_BOARDS]
@@ -546,6 +551,36 @@ private:
   // 위치 제어 디버그 토픽
   // data: 축마다 8개씩 이어붙임 [angle, angle_ref, p_pos_ref, p_neg_ref, p_pid, p_ff, p_friction, vel_dps] × num_actuators_
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_pos_dbg_;
+
+  // ──────────────────────────────────────────
+  // control_mode 2: 최적화 기반 압력 레퍼런스 생성기
+  // ──────────────────────────────────────────
+  std::unique_ptr<PressureRefGen> refgen_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_refgen_dbg_;
+
+  int      gen_period_ms_{20};       // 생성기 주기 (제어 tick 여러 개마다 1회)
+  uint64_t gen_tick_{0};
+  bool     gen_use_ej_meas_{true};   // board 4 측정 음압을 이젝터 하류압으로 사용
+
+  // 액추에이터 기하 (단일 출처). 부피식·토크 환산이 모두 여기서 나온다.
+  double piston_area_mm2_{M_PI * 25.0 * 25.0};   // Ø50 mm
+  double reel_radius_mm_{25.0};                  // 조인트 ~ 피스톤 로드 (= 부피식 mm/rad)
+  double vol_offset_pos_mm_{40.0};
+  double vol_offset_neg_mm_{90.0};
+
+  // 축별 토크 PID (mode 2). 게인 단위는 N·m/deg 계열.
+  struct TorquePid {
+    double kp{0.0786}, ki{0.0295}, kd{0.0049};
+    double integ_limit_nm{2.0};
+    double friction_nm{0.30};
+  };
+  std::vector<TorquePid>  tau_pid_;
+  std::vector<double>     tau_integ_;
+
+  // 생성기 결과 ZOH (생성기 주기 사이 유지)
+  std::vector<double> gen_pos_ref_kpa_, gen_neg_ref_kpa_;
+  double gen_rail_pos_sp_kpa_{155.0}, gen_rail_neg_sp_kpa_{30.0};
+  bool   gen_has_result_{false};
 
   int log_channel_id_{-1};
   std::ofstream log_file_;

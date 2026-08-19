@@ -23,12 +23,24 @@ static double raw_to_orig_mv(double raw_adc) {
 
 // double 파라미터를 선언하되, yaml에 소수점 없이 정수로 적혀 있어도(예: raw_0deg: 1200)
 // rclcpp의 엄격한 타입 검사로 노드가 죽지 않도록 int로도 허용해서 double로 변환.
+// (ParameterDescriptor::dynamic_typing은 ROS2 Foxy에 없으므로 예외 처리로 대체)
+//
+// 주의: declare_parameter<double>()이 타입 불일치로 던질 때 rclcpp는 이미 파라미터를
+// 등록한 상태다. 따라서 int로 다시 declare하면 ParameterAlreadyDeclared로 노드가 죽는다.
+// → 예외를 삼키고 get_parameter()로 실제 타입에 맞춰 읽는다.
 static double declare_double_flexible(rclcpp::Node* node, const std::string& name, double default_value) {
-  rcl_interfaces::msg::ParameterDescriptor desc;
-  desc.dynamic_typing = true;
-  rclcpp::ParameterValue pv = node->declare_parameter(name, rclcpp::ParameterValue(default_value), desc);
-  if (pv.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER) return static_cast<double>(pv.get<int64_t>());
-  if (pv.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE)  return pv.get<double>();
+  if (!node->has_parameter(name)) {
+    try {
+      node->declare_parameter<double>(name, default_value);
+    } catch (const rclcpp::exceptions::InvalidParameterTypeException&) {
+      // yaml 값이 int — 아래 get_parameter에서 정수로 읽는다
+    }
+  }
+  rclcpp::Parameter p;
+  if (node->get_parameter(name, p)) {
+    if (p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE)  return p.as_double();
+    if (p.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER) return static_cast<double>(p.as_int());
+  }
   return default_value;
 }
 

@@ -30,6 +30,7 @@ include_directories(include)
 # =========================================
 add_executable(pp_controller
   src/Controller.cpp
+  src/PressureRefGen.cpp
   src/controller_main.cpp
 )
 
@@ -92,6 +93,45 @@ if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 # =========================================
+# 4-1. PressureRefGen 단독 검증 실행파일
+# =========================================
+add_executable(pressure_ref_test
+  src/PressureRefGen.cpp
+  src/pressure_ref_test.cpp
+)
+
+ament_target_dependencies(pressure_ref_test
+  rclcpp
+  std_msgs
+  std_srvs
+  rcl_interfaces
+  qpoases_vendor
+)
+
+target_link_libraries(pressure_ref_test
+  Eigen3::Eigen
+  ${qpoases_vendor_LIBRARIES}
+)
+
+# =========================================
+# 4-2. Virtual Powerpack (CanBridge 대체 가상 하드웨어)
+# =========================================
+add_executable(virtual_powerpack
+  src/VirtualPowerpack.cpp
+  src/virtual_powerpack_main.cpp
+)
+
+ament_target_dependencies(virtual_powerpack
+  rclcpp
+  std_msgs
+  rcl_interfaces
+)
+
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+  target_compile_options(virtual_powerpack PRIVATE -O3 -march=native)
+endif()
+
+# =========================================
 # 5. 설치 설정
 # =========================================
 
@@ -99,6 +139,8 @@ endif()
 install(TARGETS
   pp_controller
   pneumatic_sim
+  virtual_powerpack
+  pressure_ref_test
   DESTINATION lib/${PROJECT_NAME}
 )
 

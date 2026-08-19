@@ -1,0 +1,1086 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage[table]{xcolor}
+\usepackage{colortbl}
+\usepackage{siunitx}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc,shapes.geometric}
+\usepackage{enumitem}
+\usepackage{titlesec}
+
+\usepackage{fontspec}
+\setmainfont{Noto Serif CJK KR}
+\newfontfamily\kosans{Noto Sans CJK KR}
+
+\hypersetup{colorlinks=true,linkcolor=blue!60!black,urlcolor=blue!60!black}
+\setlength{\parskip}{0.45em}
+\setlength{\parindent}{0pt}
+
+\renewcommand{\figurename}{그림}
+\renewcommand{\tablename}{표}
+\renewcommand{\contentsname}{목차}
+
+\titleformat{\section}{\Large\bfseries\kosans}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\large\bfseries\kosans}{\thesubsection}{0.5em}{}
+
+\definecolor{boxblue}{RGB}{232,240,254}
+\definecolor{boxyellow}{RGB}{255,248,225}
+\definecolor{boxred}{RGB}{255,235,238}
+\definecolor{boxgreen}{RGB}{232,245,233}
+
+\newtcolorbox{analogy}[1][]{colback=boxyellow,colframe=orange!55!black,
+  fonttitle=\bfseries\kosans,title={\small 비유},boxrule=0.6pt,arc=2pt,#1}
+\newtcolorbox{keybox}[1][]{colback=boxblue,colframe=blue!55!black,
+  fonttitle=\bfseries\kosans,title={\small 핵심},boxrule=0.6pt,arc=2pt,#1}
+\newtcolorbox{pitfall}[1][]{colback=boxred,colframe=red!55!black,
+  fonttitle=\bfseries\kosans,title={\small 개발 중 발견한 함정},boxrule=0.6pt,arc=2pt,#1}
+\newtcolorbox{codebox}[1][]{colback=boxgreen,colframe=green!45!black,
+  fonttitle=\bfseries\kosans,title={\small 코드에서는},boxrule=0.6pt,arc=2pt,#1}
+
+\newcommand{\Ppos}{P_{\mathrm{p}}}
+\newcommand{\Pneg}{P_{\mathrm{n}}}
+\newcommand{\Apos}{A_{\mathrm{p}}}
+\newcommand{\Aneg}{A_{\mathrm{n}}}
+\newcommand{\Patm}{P_{\mathrm{atm}}}
+\newcommand{\mdot}{\dot{m}}
+
+\title{\bf\kosans 공압 압력 레퍼런스 생성기\\[2mm]
+\large 왜 이렇게 만들었는지 처음부터 끝까지 설명하는 문서}
+\author{\kosans (논문과는 별개의 이해용 해설 문서)}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{tcolorbox}[colback=gray!8,colframe=gray!60,arc=2pt]
+\textbf{\kosans 이 문서는 무엇인가}\\[2mm]
+논문은 ``결과를 정확하게 주장하는'' 글이라 압축되어 있습니다. 이 문서는 반대로
+``왜 그렇게 되었는지 이해하는'' 것이 목적입니다. 그래서 다음을 담았습니다.
+\begin{itemize}[leftmargin=1.2em,itemsep=1pt]
+\item 각 수식이 \emph{어떤 직관}에서 나왔는지 (비유 포함)
+\item 개발 과정에서 \emph{틀렸다가 고친 것들} --- 이게 사실 제일 중요합니다
+\item 그림으로 본 실제 숫자들
+\item 코드의 어느 함수가 어느 식에 대응하는지
+\end{itemize}
+읽는 순서: 2절(전체 그림) $\to$ 3절(왜 어려운가) $\to$ 4절(물리) $\to$
+5절(최적화) $\to$ 6절(함정들) $\to$ 7절(결과). 급하면 3절과 6절만 읽어도 됩니다.
+\end{tcolorbox}
+
+\tableofcontents
+
+\newpage
+\section{한 문단 요약}
+
+6개의 공압 액추에이터가 있고, 각각은 \textbf{양압 챔버}와 \textbf{음압 챔버}를
+동시에 써서 힘을 만듭니다(둘이 반대로 싸우는 게 아니라 \emph{같은 방향}으로
+협력합니다). 이 12개 챔버가 \textbf{하나의 펌프}를 나눠 쓰고, 급할 때 쓸
+\textbf{압축탱크}가 하나 더 있습니다. 우리가 만든 것은
+``\emph{지금 각 축이 이만큼 힘을 내라}''는 지령을 받아서
+``\emph{그러면 12개 챔버는 각각 이 압력을 목표로 해라}''로 바꿔주는 계산기입니다.
+어려운 점은 세 가지입니다: (1) 챔버에 공기를 넣는 속도는 밸브 양단 \emph{압력차}로
+정해지고, (2) 하나의 펌프가 양압과 음압을 동시에 만들기 때문에 둘이 \emph{서로
+발목을 잡고}, (3) 압축탱크는 \emph{금방 바닥}납니다. 이 셋을 물리식으로 다 반영한
+뒤, 매 제어 주기(20\,ms)마다 작은 최적화를 풀어서 12개 목표 압력을 뽑아냅니다.
+
+\section{전체 그림: 무엇이 무엇에 연결되어 있는가}
+
+\subsection{시스템 구조}
+
+먼저 배관도부터 봅시다. 그림~\ref{fig:sys}는 액추에이터 1개만 그린 것이고, 실제로는
+이 액추에이터가 6개 있어서 같은 레일에 병렬로 매달려 있습니다.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  supply/.style={draw,rounded corners,minimum width=2.1cm,minimum height=1.0cm,align=center,thick},
+  chamber/.style={draw,minimum width=1.5cm,minimum height=0.9cm,align=center,thick},
+  atm/.style={draw,dashed,minimum width=1.3cm,minimum height=0.7cm,align=center},
+  v/.style={-{Latex[length=2.4mm]},thick},
+  vlab/.style={font=\scriptsize,fill=white,inner sep=1pt},
+]
+% 펌프
+\node[draw,circle,minimum size=1.3cm,thick,fill=gray!12] (pump) at (-3.6,1.1) {펌프};
+% 공급원
+\node[supply,fill=red!14]     (prail) at (0,2.6)  {양압 레일\\\footnotesize$\Ppos^{\mathrm r}$};
+\node[supply,fill=blue!14]    (nrail) at (0,-0.4) {음압 레일\\\footnotesize$\Pneg^{\mathrm r}$};
+\node[supply,fill=magenta!14] (tank)  at (0,-3.2) {압축탱크\\\footnotesize$P_{\mathrm t}$ = 700 kPa};
+% 챔버
+\node[chamber,fill=red!14]  (cp) at (6.2,2.0)  {\footnotesize$\Ppos^i$};
+\node[chamber,fill=blue!14] (cn) at (6.2,-0.6) {\footnotesize$\Pneg^i$};
+\node[draw,dashed,thick,fit=(cp)(cn),inner sep=9pt,
+      label={[font=\small\bfseries]above:액추에이터 $i$}] (act) {};
+% 대기
+\node[atm] (atm1) at (9.6,2.0)  {\footnotesize 대기};
+\node[atm] (atm2) at (9.6,-0.6) {\footnotesize 대기};
+\node[atm] (atmr1) at (-1.9,3.6) {\footnotesize 대기};
+\node[atm] (atmr2) at (-1.9,-1.5) {\footnotesize 대기};
+\node[draw,rounded corners,fill=orange!16,minimum height=0.7cm] (ej) at (6.2,-3.2) {\footnotesize 이젝터 $-84$ kPa};
+
+% 펌프-레일
+\draw[v] (pump.north) to[out=70,in=180] node[vlab,pos=0.6]{토출} (prail.west);
+\draw[v] (nrail.west) to[out=180,in=290] node[vlab,pos=0.4]{흡입} (pump.south);
+\node[align=center,font=\scriptsize,text=purple] at (-3.6,-0.5) {흡입량 = 토출량\\(질량보존)};
+
+% 양압 경로
+\draw[v] (prail.east) -- node[vlab,pos=0.5]{충진 2.3} (cp.west);
+\draw[v] (cp.east) -- node[vlab,pos=0.5]{배기 4} (atm1.west);
+\draw[v] (tank.east) to[out=0,in=250] node[vlab,pos=0.72]{부스트 1.6} (cp.south);
+% 음압 경로
+\draw[v] (cn.west) -- node[vlab,pos=0.5]{흡입 4} (nrail.east);
+\draw[v] (atm2.west) -- node[vlab,pos=0.5]{완화 4} (cn.east);
+\draw[v] (cn.south) -- node[vlab,pos=0.5]{심화 4} (ej.north);
+\draw[v,gray] (tank.south) to[out=-30,in=180] node[vlab,pos=0.5]{\color{gray}구동 1.6} (ej.west);
+% 릴리프
+\draw[v] (prail.north west) to[out=140,in=0] node[vlab,pos=0.5]{릴리프 1.6} (atmr1.east);
+\draw[v] (atmr2.east) to[out=0,in=210] node[vlab,pos=0.5]{릴리프 1.6} (nrail.south west);
+
+\node[align=left,font=\scriptsize] at (6.2,-4.3) {$\tau_i=\Ppos^i\Apos^i-\Pneg^i\Aneg^i$\\[1mm]
+($\Pneg^i$는 음수이므로 두 항 모두 힘을 \emph{더한다})};
+\end{tikzpicture}
+\caption{시스템 배관도(액추에이터 1개만 표시, 실제 6개). 숫자는 밸브 오리피스
+지름[mm]. 액추에이터당 밸브 6개 $\times$ 6축 $+$ 레일 릴리프 2개 $+$ 이젝터 구동
+1개 $=$ 총 \textbf{39개}. 회색 화살표는 이젝터가 탱크 공기를 먹는 경로(탱크 수명에
+영향).}
+\label{fig:sys}
+\end{figure}
+
+\begin{keybox}
+챔버 압력을 \emph{올리는} 길은 두 개(레일 충진 2.3mm, 탱크 부스트 1.6mm),
+\emph{내리는} 길은 하나(대기 배기 4mm)입니다. 음압 챔버는 \emph{깊게 만드는} 길이
+두 개(음압레일 흡입 4mm, 이젝터 4mm), \emph{얕게 되돌리는} 길이 하나(대기 완화
+4mm)입니다. 이 비대칭이 나중에 성능을 좌우합니다.
+\end{keybox}
+
+\subsection{힘은 어떻게 만들어지는가}
+
+이 부분이 처음에 저도 헷갈렸고, 실제로 중간에 한 번 크게 틀렸던 곳입니다.
+
+\begin{analogy}
+문을 밀어서 닫는다고 생각해 봅시다. 보통은 손으로 \emph{밀기만} 합니다(양압).
+그런데 이 시스템은 문 반대편에 \emph{진공청소기}를 붙여서 동시에 \emph{빨아당깁니다}
+(음압). 두 힘은 싸우는 게 아니라 \textbf{같은 방향}입니다. 그래서 문이 훨씬 빨리
+닫힙니다. 이게 ``양압과 음압이 힘을 합쳐 구동''한다는 말의 뜻입니다.
+\end{analogy}
+
+수식으로는
+\begin{equation}
+\tau_i = \Ppos^i\,\Apos^i \;-\; \Pneg^i\,\Aneg^i
+\label{eq:force}
+\end{equation}
+입니다. 여기서 부호를 조심해야 합니다. $\Pneg^i$는 \textbf{게이지 압력}이라
+대기압보다 낮으면 음수입니다(예: $-60$\,kPa). 그래서 $-\Pneg^i\Aneg^i$는
+$+60000 \times \Aneg^i$가 되어 힘을 \emph{더합니다}. 즉 식~\eqref{eq:force}의 두 항은
+둘 다 양수 기여입니다.
+
+\begin{pitfall}
+\textbf{음수 목표는 물리적으로 불가능하다.} 개발 중에 데모 궤적에 ``$-70$\,N''
+같은 음수 목표를 넣어 본 적이 있는데, 두 축이 전혀 추종하지 못했습니다. 처음엔
+버그를 의심했지만, 식~\eqref{eq:force}을 보면 $\Ppos\ge0$, $\Pneg\le0$이므로 두 항
+모두 양수 $\Rightarrow$ $\tau_i$는 \textbf{절대 음수가 될 수 없습니다}. 이 시스템은
+\emph{한 방향 힘}만 냅니다. 버그가 아니라 잘못된 입력이었던 것이고, 이후 모든 목표를
+$\tau^{\mathrm{ref}}\ge 0$으로 제한했습니다.
+\end{pitfall}
+
+같은 목표 힘을 만드는 $(\Ppos,\Pneg)$ 조합은 \textbf{무한히 많습니다}. 예를 들어
+면적이 둘 다 \SI{1e-3}{m^2}일 때 130\,N을 내려면
+\begin{itemize}[leftmargin=1.4em,itemsep=0pt]
+\item 양압 130\,kPa $+$ 음압 0\,kPa, 또는
+\item 양압 70\,kPa $+$ 음압 $-60$\,kPa, 또는
+\item 양압 46\,kPa $+$ 음압 $-84$\,kPa \dots
+\end{itemize}
+모두 답입니다. 이 \textbf{자유도}를 어떻게 쓸지가 최적화의 핵심이고, 5절에서
+다룹니다.
+
+\section{왜 어려운가: 세 개의 병목}
+
+\subsection{병목 1 --- 유량은 ``압력차''가 만든다}
+
+\begin{analogy}
+수도꼭지를 아무리 활짝 열어도, \emph{수압}이 낮으면 물이 졸졸 나옵니다. 밸브도
+똑같습니다. 밸브를 100\% 열어도 레일과 챔버의 압력차가 없으면 공기는 흐르지
+않습니다.
+\end{analogy}
+
+압축성 유체의 오리피스 질량유량은 다음과 같습니다.
+\begin{equation}
+\mdot(P_u,P_d) \;=\; A\,\frac{P_u}{\sqrt{R\,T}}\;\Phi\!\left(\frac{P_d}{P_u}\right)
+\label{eq:orifice}
+\end{equation}
+$A$는 유효 오리피스 면적, $P_u/P_d$는 상류/하류 \emph{절대}압력, $\Phi$는 무차원
+유량함수입니다. 여기서 주목할 점 두 개:
+\begin{enumerate}[leftmargin=1.6em,itemsep=1pt]
+\item $\mdot \propto P_u$ --- \textbf{상류 압력에 비례}합니다. 상류가 세면 많이 흐릅니다.
+\item $\Phi$는 압력비만의 함수이고, 압력비가 어느 값 이하로 내려가면 \textbf{더
+내려도 유량이 안 늘어납니다}(초킹, choked flow).
+\end{enumerate}
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.78\linewidth]{figA_phi.png}
+\caption{$\Phi(r)$ 곡선. 오른쪽(압력비 1 근처)은 차압이 거의 없어 유량이 0.
+왼쪽으로 갈수록(차압 커짐) 유량이 늘지만, $r<0.528$부터는 음속에 걸려 더 이상
+늘지 않습니다.}
+\end{figure}
+
+\begin{analogy}
+\textbf{초킹}은 빨대로 음료를 빨 때와 같습니다. 어느 정도 세게 빨면 그 이상 세게
+빨아도 빨대 목이 좁아서 더 빨리 안 올라옵니다. 공기도 오리피스에서 음속에 도달하면
+그게 상한입니다.
+\end{analogy}
+
+\subsection{병목 2 --- 하나의 펌프, 두 개의 레일 (시소)}
+
+이게 가장 까다로운 부분입니다. 피스톤 펌프 하나가 왕복하면서 \emph{한쪽에서
+빨아들인 공기를 다른 쪽으로 뱉습니다}. 그래서 정상 상태에서
+\begin{equation}
+\underbrace{\mathcal{F}_{-}}_{\text{음압 레일에서 빨아낸 양}}
+=\underbrace{\mathcal{F}_{+}}_{\text{양압 레일로 뱉은 양}}
+\label{eq:masscons}
+\end{equation}
+가 \textbf{항등적으로} 성립합니다. 이건 가정이 아니라 질량보존입니다.
+
+\begin{analogy}
+\textbf{시소}입니다. 양압을 높이려고 세게 뱉으려면 그만큼 음압 쪽에서 빨아와야
+합니다. 그런데 음압이 이미 깊으면(공기가 희박하면) 빨아올 게 없어서 뱉지도 못합니다.
+거꾸로 음압을 아주 깊게 만들려면 양압 쪽 부담을 줄여야 합니다. \emph{양쪽 다 최대}는
+불가능합니다.
+\end{analogy}
+
+실제로 계산해 보면 이 상충 관계가 뚜렷합니다.
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.78\linewidth]{figB_frontier.png}
+\caption{펌프 \textbf{능력경계}. 음압 셋포인트를 $-90$\,kPa로 고집하면 양압은
+335\,kPa에서 막히지만, 음압을 $-80$\,kPa로 10\,kPa만 양보하면 양압이 745\,kPa까지
+열립니다. 이 곡선 위/아래가 ``동시에 유지 가능''의 경계입니다.}
+\label{fig:frontier}
+\end{figure}
+
+\begin{pitfall}
+\textbf{처음에 잡은 500\,kPa는 애초에 불가능한 값이었다.} 초기에 양압 레일 목표를
+500\,kPa, 음압을 $-90$\,kPa로 잡았는데, 그 조건에서 펌프 공급이 거의 0으로
+붕괴한다는 것을 나중에 발견했습니다. 그림~\ref{fig:frontier}의 왼쪽 끝이 바로 그
+상황입니다. 이후 목표를 능력경계 안쪽으로 옮겼습니다.
+\end{pitfall}
+
+\subsection{병목 3 --- 압축탱크는 예비 배터리}
+
+압축탱크는 13\,ci(213\,mL)를 30\,MPa로 충전해서 레귤레이터로 700\,kPa로 낮춰
+씁니다. 컴프레서가 없으므로 \textbf{쓰면 줄어들 뿐 회복되지 않습니다}.
+
+계산해 보면 30\,MPa/213\,mL에 저장된 공기는 표준상태로 환산해 약 63\,L입니다.
+이젝터(소비 57\,LPM)만 연속으로 돌려도 약 \textbf{1분}이면 바닥납니다. 부스트 경로를
+6축이 동시에 열면 초 단위로 마릅니다.
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.68\linewidth]{figJ_tank.png}
+\caption{탱크 지속 시간. 62\,ci로 4배 키워도 이젝터 연속 가동 기준 5분 남짓입니다.
+그래서 탱크는 ``상시 공급원''이 아니라 \textbf{급할 때만 잠깐 쓰는 부스터}로
+설계해야 합니다.}
+\end{figure}
+
+\begin{keybox}
+탱크를 최적화에서 \emph{아껴 쓰는 자원}으로 명시적으로 다뤄야 합니다. 그래서
+목적함수에 ``탱크 사용 벌점''과 ``이젝터 사용 벌점''을 넣었고, 잔량이 줄어들면
+벌점이 커지도록 했습니다(5.3절).
+\end{keybox}
+
+\section{물리 모형: 식 하나씩}
+
+\subsection{챔버 압력이 변하는 속도}
+
+챔버에 공기가 $\mdot$만큼 들어오면 압력이 얼마나 빨리 오를까요? 여기서 \textbf{열역학
+가정}이 결정적입니다. 처음 저는 등온($PV=mRT$, $T$ 일정)으로 놓았는데, \textbf{이는
+잘못된 선택이었습니다}(2차 검토 Q1). 에너지 보존에서 엄밀히 유도하면
+\begin{align}
+\frac{d(m\,u)}{dt}&=\mdot_{\mathrm{in}}h_{\mathrm{in}}-\mdot_{\mathrm{out}}h,
+\qquad u=c_vT,\; h=c_pT,\; PV=mRT\notag\\
+\Rightarrow\quad \dot P &= \frac{\kappa R}{V}\big(\mdot_{\mathrm{in}}T_{\mathrm{in}}
+-\mdot_{\mathrm{out}}T_{\mathrm{ch}}\big)
+\label{eq:chamber_adia}
+\end{align}
+가 되어, 공급 온도가 챔버 온도와 비슷하면($T_{\mathrm{in}}\approx T_{\mathrm{ch}}$)
+등온식보다 정확히 $\kappa=1.4$배 빠릅니다.
+\begin{equation}
+\dot P = \frac{n\,R\,T_{\mathrm{ch}}}{V}\,\mdot_{\mathrm{net}},\qquad
+n=1(\text{등온}),\quad n=\kappa=1.4(\text{단열})
+\label{eq:chamber}
+\end{equation}
+
+\begin{analogy}
+\textbf{풍선}입니다. 같은 양의 공기를 넣어도 작은 풍선(작은 $V$)은 압력이 확 오르고
+큰 풍선은 천천히 오릅니다. 식에서 $V$가 분모에 있는 이유입니다. 그리고 급하게 불면
+풍선 속 공기가 \emph{뜨거워지는데}(단열 압축), 뜨거워진 공기는 같은 질량으로 더 높은
+압력을 만듭니다. 이게 $\kappa$배의 정체입니다.
+\end{analogy}
+
+\begin{keybox}
+\textbf{어느 쪽이 맞는가는 시간 스케일로 갈린다.} 챔버 공기가 벽으로 열을 잃는 열
+시상수를 계산하면 0.4$\sim$4초입니다(대류계수 10$\sim$100 W/m$^2$K 가정). 제어주기
+20\,ms의 \textbf{수십$\sim$수백 배}이므로, \emph{한 스텝 동안은 열이 빠져나갈 시간이
+없어 단열이 맞습니다}. 반대로 수 초 이상 유지되는 레일/탱크는 등온으로 수렴합니다.
+그래서 최종 코드는 \textbf{챔버 $n=1.4$, 레일/탱크 $n=1.0$}으로 분리했습니다.
+\end{keybox}
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.95\linewidth]{figQ_scales.png}
+\caption{(a) 펌프 1회전(20\,ms)이 제어주기와 정확히 일치하므로 주기평균이 정합적입니다
+(Q2). (b) 열 시상수가 제어주기보다 압도적으로 커서 1스텝 동안은 단열이 맞습니다(Q1).}
+\end{figure}
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.98\linewidth]{figK_adiabatic.png}
+\caption{등온$\to$단열 수정의 실제 영향. 슬루가 1.43배 커져 추종 오차가 28\% 줄고,
+\emph{불필요했던 탱크 소모가 사라집니다}. 등온으로 레일 능력을 40\% 과소평가한 탓에
+``레일로 못 댄다''고 오판해 탱크를 꺼내 쓰고 있었습니다.}
+\end{figure}
+
+\begin{tcolorbox}[colback=boxyellow,colframe=orange!55!black,title={\bfseries\kosans\small 남은 근사},fonttitle=\bfseries]
+식~\eqref{eq:chamber}은 \emph{온도를 상수로 두고 $P$만 추적}하는 근사입니다. 엄밀히
+하려면 챔버당 상태를 2개($P$와 $T$)로 두고 $T$의 변화도 함께 풀어야 합니다. 우리는
+슬루 한계(1스텝 $\Delta P$)만 필요하므로 이 근사로 충분하지만, 실험에서 압력 응답이
+예측과 다르면 이 지점을 먼저 의심해야 합니다.
+\end{tcolorbox}
+
+\subsection{펌프 모형}
+
+펌프는 슬라이더-크랭크로 피스톤을 왕복시킵니다. 크랭크 각 $\theta$에서 피스톤
+챔버 부피는
+\begin{equation}
+V_{\mathrm{pis}}(\theta)=S_{\mathrm{pis}}\Big(\delta-r+l-r\cos\theta-\sqrt{l^2-r^2\sin^2\theta}\Big)
+\end{equation}
+이고, 이 부피가 줄어들 때 압력이 올라가 토출 체크밸브가 열리고, 늘어날 때 흡입
+체크밸브가 열립니다. 체크밸브도 식~\eqref{eq:orifice}를 씁니다.
+
+문제는 이걸 매 제어 주기마다 적분하면 너무 무겁다는 점입니다. 그래서
+\textbf{한 바퀴 평균값}을 미리 계산해서 2차원 표(양압레일 $\times$ 음압레일)로
+만들어 둡니다.
+\begin{equation}
+\mdot^{+}_{\mathrm{pump}}=\mathcal{F}_{+}(\Ppos^{\mathrm r},\Pneg^{\mathrm r}),\qquad
+\mdot^{-}_{\mathrm{pump}}=\mathcal{F}_{-}(\Ppos^{\mathrm r},\Pneg^{\mathrm r})
+\end{equation}
+이것이 ``준정적 펌프 가정''입니다. 정당화는 4.4절의 시간 스케일 차이입니다.
+
+\subsection{가장 중요한 통찰: 레일 압력이 곧 응답 속도다}
+
+이 부분은 제가 개발 중에 \textbf{거꾸로 이해했다가 고친} 지점입니다. 처음에는
+``펌프가 계속 유량을 흘리고 있어야 응답이 빠르다''고 생각했습니다. 틀렸습니다.
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.78\linewidth]{figC_railflow.png}
+\caption{레일 압력을 올리면 \textbf{채널로 갈 수 있는 유량은 늘고}(빨강),
+\textbf{그 순간 펌프가 내는 유량은 줄어듭니다}(파랑). 둘은 반대 방향입니다.}
+\label{fig:railflow}
+\end{figure}
+
+이유는 식~\eqref{eq:orifice}에 있습니다. 채널 충진 유량은
+$\mdot=A_{\mathrm{fill}}\cdot(\Ppos^{\mathrm r}+\Patm)/\sqrt{RT}\cdot\Phi(\cdot)$이므로
+\textbf{레일 압력만} 관계합니다. 펌프가 지금 돌고 있는지 여부는 무관합니다.
+
+\begin{analogy}
+\textbf{물탱크와 수도꼭지}입니다. 응답 속도를 정하는 건 \emph{탱크에 물이 얼마나
+높이 차 있는지}(레일 압력)입니다. \emph{펌프가 지금 물을 퍼 올리고 있는지}는
+수도꼭지를 열었을 때 나오는 세기와 상관없습니다. 오히려 탱크가 꽉 차면 펌프는 더
+퍼 올릴 수 없어서 멈추게 됩니다 --- 그래도 수도꼭지는 가장 세게 나옵니다.
+\end{analogy}
+
+\begin{keybox}
+따라서 목표는 \textbf{레일 압력을 가능한 한 높게(음압은 깊게) 유지}하는 것입니다.
+릴리프 밸브로 압력을 버리는 것은 손해이므로, 릴리프는 셋포인트를 넘는 초과분만
+최소로 방출합니다.
+\end{keybox}
+
+\begin{pitfall}
+\textbf{그럼 릴리프를 아예 닫으면 되지 않나?} 안 됩니다. 릴리프를 완전히 막고
+무부하로 두면 레일이 ``펌프 유량이 0이 되는 점''으로 흘러가서 멈추는데, 그 점이
+\emph{초기 조건에 따라 제각각}입니다(빈 상태에서 시작하면 양압 96\,kPa, 가득 찬
+상태에서 시작하면 700\,kPa에 그대로 정지). 즉 릴리프가 없으면 레일 압력을
+\textbf{제어할 수단 자체가 사라집니다}. 릴리프 셋포인트가 곧 ``양압과 음압 중
+어디에 펌프 능력을 배분할지''를 정하는 손잡이입니다.
+\end{pitfall}
+
+\subsection{시간 스케일: 레일은 느리고 챔버는 빠르다}
+
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item \textbf{레일}: 펌프가 큰 리저버를 채우므로 수 초 규모로 변합니다.
+\item \textbf{챔버}: 4\,mm급 밸브로 20\,ms 안에 수십 kPa가 움직입니다.
+\end{itemize}
+비율이 약 100배입니다. 이 차이가 크기 때문에 문제를 \textbf{두 계층으로 쪼개도}
+됩니다.
+
+\begin{tcolorbox}[colback=boxblue,colframe=blue!55!black,title={\bfseries\kosans\small 특이섭동(singular perturbation)이란},fonttitle=\bfseries]
+빠른 상태와 느린 상태가 섞인 시스템을 이렇게 씁니다.
+\[
+\dot x=f(x,z)\quad(\text{느림}),\qquad \varepsilon\,\dot z=g(x,z)\quad(\text{빠름})
+\]
+$\varepsilon$은 시간 스케일의 비($\varepsilon\ll1$)입니다. $\varepsilon\to0$의
+극한에서 빠른 변수 $z$는 즉시 \emph{준정상 다양체} $g(x,z)=0$에 붙습니다. 그러면 설계를
+둘로 나눌 수 있습니다.
+\begin{itemize}[leftmargin=1.3em,itemsep=1pt]
+\item \textbf{느린 설계}: 빠른 동역학이 이미 정착했다고 보고 $x$만 다룬다.
+\item \textbf{빠른 설계}: 느린 상태 $x$를 \emph{상수로 고정}하고 $z$만 다룬다.
+\end{itemize}
+우리 경우 $x$는 레일 압력, $z$는 챔버 압력이고
+$\varepsilon\approx 0.02\,\text{s}/2\,\text{s}=0.01$입니다. 챔버 최적화가 레일 압력을
+파라미터(상수)로 받는 것이 ``빠른 설계'', 레일 배분기가 채널 수요를 총량으로만 보는
+것이 ``느린 설계''에 해당합니다.
+
+\textbf{솔직한 한계}: 저는 이 분리를 \emph{설계 정당화}로만 썼고, Tikhonov 정리로
+안정성을 증명하지는 않았습니다. 엄밀히 하려면 경계층(boundary layer)의 안정성과
+준정상 다양체의 유일성을 보여야 합니다. 논문에서 주장할 때 이 선을 넘지 않는 것이
+좋습니다.
+\end{tcolorbox}
+
+\textbf{그리고 이 분리에는 조건이 있습니다} --- 레일이 충분히 커야 합니다. 6.6절에서
+레일 부피를 줄이면 이 가정이 어떻게 무너지는지 보입니다.
+
+\section{최적화: 무엇을 정하고, 무엇이 제약인가}
+
+\subsection{결정변수와 제약}
+
+매 제어 주기에 정하는 것은 \textbf{12개 숫자}입니다.
+\[
+\bm u=[\;\Ppos^1,\dots,\Ppos^6,\;\Pneg^1,\dots,\Pneg^6\;]
+\]
+제약은 두 종류입니다.
+
+\textbf{(1) 액추에이터 정격} --- 절대 넘지 못하는 한계
+\[
+0\le \Ppos^i\le \SI{175}{kPa},\qquad \SI{-84}{kPa}\le \Pneg^i\le 0
+\]
+
+\textbf{(2) 슬루 제약} --- ``한 스텝(20\,ms)에 갈 수 있는 거리''.
+이게 이 설계의 특징입니다. 임의로 튜닝한 마진이 아니라, \emph{지금 이 순간의 압력차로
+밸브에 실제 흐르는 유량}에서 계산합니다.
+\begin{equation}
+\Delta\Ppos^{i\uparrow}=\big(\underbrace{\mdot^i_{\mathrm{fill}}}_{\text{레일 2.3mm}}
++\underbrace{\mdot^i_{\mathrm{boost}}}_{\text{탱크 1.6mm}}\big)
+\frac{\Delta t\,R T_{\mathrm{ch}}}{V^i_{\mathrm p}}
+\end{equation}
+그래서 레일이 처지면 갈 수 있는 거리가 자동으로 줄고, 채널이 레일 압력에 가까워지면
+차압이 줄어 유량이 0으로 수렴하므로 \textbf{채널이 레일을 넘어서는 일이 물리적으로
+불가능}해집니다. 인위적 마진이 필요 없는 이유입니다.
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.62\linewidth]{figE_freedom.png}
+\caption{$(\Ppos,\Pneg)$ 평면. 회색 등고선은 같은 힘을 내는 조합들(무한히 많음),
+굵은 검정선이 목표 130\,N입니다. 파란 박스가 이번 스텝에 도달 가능한 범위(슬루)이고,
+최적화는 이 박스 $\cap$ 목표선 위에서 한 점을 고릅니다.}
+\end{figure}
+
+\subsection{목적함수: 자유도를 어디에 쓸까}
+
+박스와 목표선이 만나는 점이 여러 개일 때 무엇을 고를지 정하는 것이 목적함수입니다.
+\begin{equation}
+J = \underbrace{w_0 J_{\mathrm{trk}}}_{\text{추종}}
++\underbrace{w_2 J_{\mathrm{flow}}}_{\text{여력}}
++\underbrace{w_f J_{\mathrm{fast}}}_{\text{빠른 쪽}}
++\underbrace{w_4 J_{\mathrm{smo}}}_{\text{평활}}
++\underbrace{w_t J_{\mathrm{tank}}+w_e J_{\mathrm{ej}}}_{\text{자원 절약}}
+\end{equation}
+
+\textbf{$J_{\mathrm{trk}}$ (추종, 가중치가 압도적으로 큼)}
+\[
+J_{\mathrm{trk}}=\sum_i\Big(\frac{\tau_i-\tau_i^{\mathrm{ref}}}{\tau_{\mathrm{sc}}}\Big)^2
+\]
+목표 힘에 최대한 맞춥니다. \emph{등식 제약이 아니라 소프트 항}으로 둔 것이 중요한
+설계 결정입니다. 유량이 부족해서 목표를 못 낼 때, 등식 제약이면 ``해가 없음''으로
+계산이 실패하지만, 소프트 항이면 ``가능한 만큼 최대로 근접''한 답을 줍니다.
+
+\textbf{$J_{\mathrm{fast}}$ (빠른 쪽 우선) --- 검토 결과 \emph{제거}했습니다.}
+\[
+J_{\mathrm{fast}}=\frac1N\sum_i\Big(\frac{[\Delta\Ppos^i]_+}{s^+_i}+\frac{[\Delta\Pneg^i]_+}{s^-_i}\Big),
+\qquad
+s^\pm_i=\underbrace{\frac{\mdot_{\text{valve}}\,\Delta t\,nRT}{V_{\text{chamber}}}}_{\text{1스텝 }\Delta P}\times A_{\text{piston}}
+\]
+분모 $s^\pm_i$는 ``그 챔버가 이번 스텝에 만들 수 있는 힘''입니다. 여기서 두 가지를
+바로잡아야 합니다.
+
+\begin{pitfall}
+\textbf{(a) 제가 쓴 비유가 틀렸습니다.} 이전 판에서 $s^\pm$를 ``바가지 크기(밸브
+굵기)''로 비유했는데, 식을 보면 $s^\pm$는 밸브 유량뿐 아니라 \emph{챔버 부피로 나누고
+피스톤 면적을 곱한} 값이며, 게다가 \emph{그 순간의 차압에 따라 매 스텝 변합니다}.
+밸브만 가리키는 비유는 부정확합니다. 정확히는 ``이 챔버의 압력을 얼마나 빨리 올릴 수
+있는가'' $=$ (호스 굵기) $\div$ (챔버 크기) $\times$ (피스톤 면적)입니다.
+
+\textbf{(b) 더 중요한 것: 이 항은 추종을 \emph{해칩니다}.} $w_{\mathrm{fast}}$를
+스윕해 보니 0(제거)일 때 오차 0.188\,N, 0.5일 때 0.270\,N, 10일 때 1.549\,N이었습니다.
+이유는 이렇습니다 --- 목표가 도달 가능하면 $J_{\mathrm{trk}}=0$인 해가 여러 개라
+$J_{\mathrm{fast}}$가 그중 하나를 고르는 \emph{동점 처리}만 합니다. 그런데 목표가
+도달 \emph{불가능}(포화)한 순간에는 $J_{\mathrm{trk}}$가 박스의 최적 코너로 밀어야
+하는데, $J_{\mathrm{fast}}$가 거기서 해를 끌어내립니다. 그래서 제거했습니다.
+\end{pitfall}
+
+\textbf{그럼 느린 챔버는 방치되는가? 아닙니다 --- 물리가 이미 처리합니다.}
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.98\linewidth]{figP_jfast.png}
+\caption{(a) $w_{\mathrm{fast}}$가 커질수록 추종이 나빠집니다. (b) \textbf{자기균형}:
+$t=1.58$s에서는 음압 능력($s^-{=}22.3$)이 커서 음압이 100\%를 담당하지만, 음압을 쓰면
+음압 챔버가 깊어져 차압이 줄어 자기 능력이 $22.3\to5.7$로 떨어지고, 양압이 자동으로
+$0\%\to52\%$를 인수받습니다. ``배제''가 아니라 ``인수인계''입니다.}
+\end{figure}
+
+$w_{\mathrm{fast}}=0$으로 두어도 음압은 힘의 약 33\%를 담당하고 $-73.5$\,kPa까지
+깊어집니다. 슬루 박스가 이미 두 챔버의 물리적 능력을 담고 있으므로,
+``박스 안에서 최대한 목표에 접근''하는 $J_{\mathrm{trk}}$ 하나만으로도 자동으로 그
+순간 유리한 챔버를 씁니다. \emph{빠른 쪽 우선은 별도 항으로 강제할 필요가 없었습니다.}
+
+\textbf{$J_{\mathrm{tank}}$, $J_{\mathrm{ej}}$ (탱크/이젝터 절약)}
+\[
+J_{\mathrm{tank}}=\sum_i \frac{[\;\Delta\Ppos^i-\Delta\Ppos^{i,\mathrm{rail}}\;]_+}{\Ppos^{\max}}
+\]
+벌점 대상은 \textbf{``레일이 낼 수 있는 양을 초과하는 부분''}뿐입니다. 레일로 감당되는
+범위에서는 벌점이 0이므로 추종이 자유롭고, 정말 탱크가 필요한 순간에만 비용이
+발생합니다.
+
+\begin{pitfall}
+\textbf{처음에는 벌점을 잘못 걸었습니다.} ``압력 상승분 전체''에 벌점을 걸었더니
+최적화가 탱크를 아끼는 게 아니라 \emph{압력을 올리는 것 자체}를 피해서, 어떤 축은
+90\,N 목표에 1\,N만 내는 참사가 났습니다. 위처럼 ``레일 초과분''으로 한정해 고쳤습니다.
+\end{pitfall}
+
+\begin{pitfall}
+\textbf{그리고 ``잔량이 줄면 더 아끼기''(scarcity)는 제거했습니다.} 이전 판에는
+$P^{\mathrm{sp}}_{\mathrm t}/\max(P_{\mathrm t},\underline P)$라는 증폭 계수를 넣어
+탱크가 비어갈수록 더 보수적으로 만들었습니다. 검토 결과 이것은 나쁜 설계였습니다.
+\begin{itemize}[leftmargin=1.3em,itemsep=1pt]
+\item \textbf{성능이 서서히 저하됩니다.} 탱크 250\,kPa에서 오차가 2.849$\to$3.997\,N
+(33\% 악화), 120\,kPa에서 3.015$\to$4.201\,N(39\% 악화).
+\item \textbf{남은 자원을 쓰지도 못합니다.} 120\,kPa 남았는데 25\,kPa만 쓰고 끝냅니다.
+\item \textbf{하위 제어기에게 최악입니다.} 시간에 따라 플랜트 특성이 바뀌므로
+MPC/RL 입장에서 \emph{비정상(non-stationary) 환경}이 됩니다. 학습·튜닝을 방해합니다.
+\end{itemize}
+대신 \textbf{정책은 일정하게 두고, 명시적 하한 임계값}($P_{\mathrm t}<450$\,kPa이면
+\texttt{usage.tank\_low=true})으로 교체/정지를 판단합니다. ``성능이 알 수 없게
+나빠지는 것''보다 ``예측 가능한 성능을 유지하다가 명확히 멈추는 것''이 낫습니다.
+\end{pitfall}
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.98\linewidth]{figO_scarcity.png}
+\caption{scarcity 항의 실제 영향. 잔량이 낮아질수록 오차가 커지고(왼쪽), 남은 자원을
+쓰지 않습니다(오른쪽).}
+\end{figure}
+
+\subsection{2계층 구조}
+
+레일은 느리고 챔버는 빠르므로(4.4절), 한 번에 다 풀지 않고 나눕니다.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[font=\small,
+  box/.style={draw,rounded corners,align=center,minimum height=1.1cm,thick},
+  a/.style={-{Latex[length=2.4mm]},thick}]
+\node[box,fill=blue!10,minimum width=4.6cm] (slow) at (0,1.6)
+  {\textbf{느린 계층} (레일 셋포인트)\\\footnotesize 프리뷰 0.5초로 총 수요 크기 판단\\
+   \footnotesize $\to$ 능력경계 위에서 양/음 배분};
+\node[box,fill=red!10,minimum width=4.6cm] (fast) at (0,-0.6)
+  {\textbf{빠른 계층} (챔버 압력)\\\footnotesize 현재 상태만으로 12개 목표 압력\\
+   \footnotesize $\to$ 슬루 제약 하 최적화};
+\node[box,fill=gray!10,minimum width=3.0cm] (plant) at (6.4,0.5)
+  {공급원 상태 갱신\\\footnotesize 레일 $\cdot$ 탱크\\\footnotesize (질량보존 적분)};
+\node[align=center,font=\footnotesize] at (-4.3,1.6) {목표 토크\\프리뷰};
+\node[align=center,font=\footnotesize] at (-4.3,-0.6) {현재 압력\\(측정/추정)};
+\draw[a] (-3.4,1.6) -- (slow.west);
+\draw[a] (-3.4,-0.6) -- (fast.west);
+\draw[a] (slow.south) -- node[right,font=\footnotesize]{셋포인트} (fast.north);
+\draw[a] (fast.east) -- (plant.south west);
+\draw[a] (plant.north west) to[out=160,in=20] node[above,font=\footnotesize,pos=0.5]{레일/탱크 압력} (slow.east);
+\draw[a] (fast.south) -- ++(0,-0.9) node[below,align=center,font=\footnotesize]
+  {12개 목표 압력\\$\to$ 하위 제어기(MPC/RL)};
+\node[font=\footnotesize,text=gray] at (0,0.5) {시간 스케일 $\sim$100배 차이};
+\end{tikzpicture}
+\caption{2계층 구조. 느린 계층은 ``어디에 힘을 저장할지'', 빠른 계층은 ``지금 어떻게
+쓸지''를 정합니다.}
+\end{figure}
+
+\textbf{느린 계층 (레일 배분).} 힘이 한 방향뿐이므로 ``음압 수요''라는 개념이
+없습니다. 그래서 앞으로 0.5초 안에 들어올 \emph{총 힘의 크기}만 봅니다.
+\begin{equation}
+\bar d=\min\Big(\frac{1}{N F_{\mathrm{ref}}}\sum_i \max_j \tau^{\mathrm{ref}}_{i,k+j},\;1\Big)\in[0,1]
+\end{equation}
+\begin{itemize}[leftmargin=1.4em,itemsep=0pt]
+\item $\bar d$가 크면(큰 힘이 몰려온다): 양압을 높게, 음압을 깊게 --- \textbf{양쪽 다} 밀어 여력 확보
+\item $\bar d$가 작으면: 적당히만 --- 에너지와 탱크 보존
+\end{itemize}
+그리고 양압 상한은 \emph{그 음압 깊이에서 펌프가 물리적으로 닿는 최대}
+(능력경계, 그림~\ref{fig:frontier})로 둡니다.
+
+\begin{pitfall}
+\textbf{프리뷰의 효과는 생각보다 작았다.} 미래 수요를 미리 알면 레일을 준비해 둘 수
+있으니 큰 이득을 기대했지만, 실제 측정해 보니 개선이 몇 \% 수준이었습니다. 이유는
+이 하드웨어의 능력경계가 $-75\sim-84$\,kPa 구간에서 \emph{완만}해서, 배분을 바꿔도
+양압 능력이 크게 변하지 않기 때문입니다. 구조는 남겨 두었으니(끄면 현재 수요만 사용)
+다른 하드웨어나 더 가파른 영역을 쓸 때 의미가 생깁니다. \emph{솔직히 말하면 이
+시스템에서는 ``레일을 최대한 높게'' 자체가 이득의 대부분이었습니다.}
+\end{pitfall}
+
+\subsection{공급원 상태 갱신}
+
+챔버 목표가 정해지면, 그 수요를 누가 댔는지 나눠서 공급원 압력을 갱신합니다.
+원칙은 \textbf{``레일이 최대한 담당, 부족분만 탱크/이젝터''}입니다.
+\[
+\mdot^i_{\mathrm{fill}}=\min(\mdot^i_{\mathrm{dem}},\;\mdot^i_{\mathrm{fill,cap}}),\qquad
+\mdot^i_{\mathrm{boost}}=[\mdot^i_{\mathrm{dem}}-\mdot^i_{\mathrm{fill}}]_+
+\]
+레일은 ``펌프 공급 $-$ 채널 인출 $-$ 릴리프''를 적분하고, 탱크는 ``부스트 $+$
+이젝터의 탱크 소비''만큼 줄어듭니다(회복 없음).
+
+\begin{keybox}
+이젝터는 탱크 공기를 써서 진공을 만듭니다(소비 57\,LPM / 흡입 100\,LPM). 그래서
+\textbf{음압을 쓰면 양압 자원(탱크)도 같이 줄어드는 결합}이 있습니다. 이걸 무시하면
+탱크 수명을 낙관적으로 잘못 예측하므로 모델에 포함했습니다.
+\end{keybox}
+
+\section{개발 중 발견한 물리적 함정 모음}
+
+이 절이 사실 이 문서의 핵심입니다. 직관이 틀렸던 지점들을 모았습니다.
+
+\subsection{``배기는 빠르다''는 틀렸다}
+
+목표 힘이 급하게 0으로 떨어질 때 압력이 잘 안 따라 내려가는 현상을 보고 처음엔
+버그를 의심했습니다. 확인해 보니 물리적으로 맞는 결과였습니다.
+
+식~\eqref{eq:orifice}에서 유량은 \textbf{상류} 압력에 비례합니다. 그런데 배기할 때
+상류는 \emph{챔버 자신}입니다. 챔버가 낮아질수록 배기 유량도 같이 줄어듭니다.
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.92\linewidth]{figD_vent.png}
+\caption{배기의 자기감쇠. 200$\to$50\,kPa로 내려가는 동안 배기 유량이 절반으로
+줄어들고(왼쪽), 그 결과 압력은 RC 방전 같은 지수적 꼬리를 갖습니다(오른쪽).}
+\end{figure}
+
+\begin{analogy}
+욕조 물빼기입니다. 물이 많을 때는 콸콸 빠지지만, 바닥에 조금 남으면 수압이 없어서
+찔끔찔끔 빠집니다. 마지막 한 방울까지 빼는 데 오래 걸립니다.
+\end{analogy}
+
+\subsection{밸브 유량의 단위를 임의로 환산했던 실수}
+
+초기에 밸브 유량을 업로드된 코드의 상대 단위에서 절대 단위(kg/s)로 바꾸려고 환산
+계수를 직접 유도해 썼습니다. 그런데 그 값으로는 채널 압력이 8초에 15\,kPa밖에 안
+움직이는 비현실적 결과가 나왔습니다. 근거가 약한 환산이었던 것입니다.
+
+해결은 \textbf{물리적 실체가 있는 값으로 대체}하는 것이었습니다. 실제 밸브의
+오리피스 지름을 쓰고, 펌프 체크밸브와 \emph{동일한 형태}의 오리피스 식을 적용했습니다.
+이후 유일하게 남은 비카탈로그 파라미터는 방출계수 $C_d=0.8$(표준 가정)입니다.
+
+\begin{keybox}
+교훈: 근거가 불확실한 환산 계수를 쓰는 것보다, 물리적으로 측정 가능한 양(오리피스
+지름)으로 모델을 다시 세우는 것이 낫습니다. 남은 불확실성($C_d$)도 한 곳에 모아
+두면 나중에 실험으로 교정하기 쉽습니다.
+\end{keybox}
+
+\subsection{릴리프 밸브를 ``항상 열림''으로 모델링했던 실수}
+
+처음엔 레일 압력이 셋포인트를 넘으면 릴리프가 활짝 열린다고 단순화했습니다. 그
+결과 무부하에서도 레일이 계속 새어 나가 셋포인트에 안착하지 못했습니다. 실제
+레귤레이터는 \emph{도달했을 때만, 초과분만큼만} 엽니다. 이렇게 고치니 무부하 평형이
+정확히 셋포인트에 앉았습니다.
+
+\subsection{음압을 안 쓰는 것처럼 보였던 문제}
+
+중간에 음압 레일이 거의 처지지 않아서 ``최적화가 음압을 안 쓰나?''라고 의심했습니다.
+확인해 보니 최적화는 그 순간 가능한 음압을 최대로 쓰고 있었고, 진짜 원인은
+\textbf{음압 경로 오리피스를 1.6\,mm로 잘못 가정}한 것이었습니다. 실제 4\,mm를
+반영하니 음압 사용 깊이가 $-35 \to -78$\,kPa로 두 배 이상 깊어졌습니다.
+
+\begin{keybox}
+교훈: ``최적화가 이상하다''고 느낄 때, 최적화 로직보다 \textbf{모델 파라미터}를 먼저
+의심하는 게 빠를 때가 많습니다. 병목은 리저버 공급이 아니라 채널 밸브 크기였습니다.
+\end{keybox}
+
+\subsection{레일 부피가 작으면 2계층 설계가 무너진다 (가장 위험)}
+
+``레일 부피가 리저버 1\,L이 아니라 배관뿐이라 수 mL면?''이라는 질문은 이 설계의
+\textbf{가장 취약한 가정}을 정확히 찌릅니다. 계산해 보니 명확한 임계점이 있습니다.
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.95\linewidth]{figL_railvol.png}
+\caption{레일 부피 민감도. 1\,L$\to$200\,mL$\to$50\,mL까지는 완만하게 나빠지지만
+10\,mL에서 오차가 \textbf{27배}로 폭발합니다.}
+\end{figure}
+
+\begin{center}\small
+\begin{tabular}{lccc}
+\toprule
+레일 부피 & 평균오차 & 양압레일 범위 & 스텝당 최대 변동\\
+\midrule
+1000\,mL & 0.188\,N & 111$\sim$156\,kPa & 2.8\,kPa\\
+200\,mL & 0.221\,N & 64$\sim$164\,kPa & 13.1\,kPa\\
+50\,mL & 0.238\,N & 32$\sim$175\,kPa & 42.7\,kPa\\
+\textbf{10\,mL} & \textbf{5.03\,N} & 0$\sim$245\,kPa & \textbf{190.8\,kPa}\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{keybox}
+\textbf{왜 무너지는가}: 레일이 작아지면 한 스텝에 190\,kPa씩 출렁이는데, 이는 챔버가
+한 스텝에 움직이는 양($\sim$20\,kPa)보다 \emph{훨씬 큽니다}. 즉 \textbf{레일이 시스템에서
+가장 빠른 요소}가 되어 ``레일은 느리다''는 전제가 역전되고, 4.4절의 시간 스케일 분리와
+2계층 구조 전체가 무효가 됩니다.
+
+\textbf{진단 방법}: 레일의 스텝당 압력 변동이 챔버의 스텝당 변동보다 충분히 작은지
+확인하십시오. 비슷해지면 (a) 어큐뮬레이터를 달아 레일 부피를 키우거나, (b) 레일을
+빠른 최적화 \emph{안으로} 넣어(결정변수 14개로) 통합해서 풀어야 합니다.
+\end{keybox}
+
+\subsection{이젝터는 정압 싱크가 아니다}
+
+이전 판은 이젝터를 ``$-84$\,kPa 정압 싱크 $+$ 4\,mm 오리피스''로 놓았습니다. 그런데
+$-84$\,kPa는 데이터시트의 \textbf{무유량 최대 진공도}입니다. 실제로 공기를 빨아내는
+동안에는 도달 진공도가 훨씬 얕아집니다.
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.95\linewidth]{figN_ejector.png}
+\caption{(a) 정압 가정은 채널 0\,kPa에서 흡입 120\,LPM을 요구해 정격(100\,LPM)을
+1.2배 초과합니다. (b) 더 중요한 것: 실제 도달 진공은 채널 0\,kPa에서 $-84$가 아니라
+\textbf{$-13.6$\,kPa}에 불과합니다.}
+\end{figure}
+
+\begin{analogy}
+\textbf{진공청소기}입니다. 호스 끝을 손바닥으로 막으면(무유량) 아주 센 진공이 걸리지만,
+활짝 열어 공기가 콸콸 들어가는 상태에서는 진공도가 거의 없습니다. 카탈로그의 ``최대
+진공도''는 막았을 때의 값입니다.
+\end{analogy}
+
+수정: 선형 특성곡선 $P_{\mathrm{ej}}(Q)=P_{\mathrm{ej}}^{\max}(1-Q/Q^{\max})$을 쓰고,
+오리피스 유량식과의 교점을 매 스텝 구합니다. 이러면 흡입 유량이 정격 이내로 자동
+제한되고 진공도도 현실적이 됩니다.
+
+\begin{keybox}
+\textbf{측정값이 있으면 그게 최선입니다.} 이젝터 후단 음압을 측정하고 있다면, 곡선을
+추정할 필요 없이 그 측정값을 오리피스 식의 \emph{하류 압력}으로 그대로 넣으면 됩니다
+(코드의 \texttt{sys.P\_ej\_meas}). 이러면 이젝터를 모델링하지 않아도 되고, 시동
+지연이나 비선형성도 자동으로 반영됩니다. 다만 측정 지연/노이즈는 필터링이 필요합니다.
+\end{keybox}
+
+\subsection{부하(질량)가 배기를 도와주는가}
+
+``수직 액추에이터 끝에 200\,mm 링크와 5\,kg''이라면 질량이 공기를 밀어내 배기를 도울
+것 같습니다. 절반은 맞고 절반은 다릅니다. 먼저 챔버를 \emph{고정 체적}으로 본 것이
+근사임을 인정해야 합니다. 액추에이터가 움직이면
+\begin{equation}
+\dot P=\frac{n R T}{V}\mdot-\underbrace{\frac{n P}{V}\dot V}_{\text{피스톤 운동}}
+\end{equation}
+의 둘째 항이 생깁니다. 부호가 결정적입니다.
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item 중력이 양압 챔버를 \textbf{수축}시키면($\dot V<0$): 압력 하강을 \emph{방해}합니다.
+질량유량은 더 많이 빠지지만 \emph{압력(=힘)은 더 천천히} 떨어집니다.
+\item 중력이 양압 챔버를 \textbf{팽창}시키면($\dot V>0$): 압력 하강을 \emph{가속}합니다.
+이 경우 직관대로 질량이 배기를 돕습니다.
+\end{itemize}
+어느 쪽인지는 실린더 배치(로드 방향 대 중력)로 결정되므로 확인이 필요합니다.
+
+\begin{keybox}
+\textbf{그런데 이 조건에서는 영향이 미미합니다.} 5\,kg/200\,mm를 피스톤 등가로 바꾸면
+등가 질량 80\,kg, 등가 중력 196\,N(모멘트암 5\,cm 가정)입니다. 부하 결합 시뮬레이션 결과
+\textbf{힘이 절반으로 떨어지는 데 21.5\,ms}밖에 걸리지 않는데, 그 사이 무거운 부하는
+거의 움직이지 못합니다. 즉 \emph{힘 과도 구간에서는 피스톤이 정지 상태}이므로 고정
+체적 가정이 유효합니다. 또 하나의 시간 스케일 분리입니다.
+\end{keybox}
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.95\linewidth]{figR_load.png}
+\caption{(a) 체적변화 항은 피스톤이 빠를 때만 커집니다. (b) 힘 감쇠(21.5\,ms)가 부하
+운동보다 훨씬 빨라 고정체적/가변체적 결과가 거의 같습니다.}
+\end{figure}
+
+그래도 코드에는 \texttt{sys.dVdt\_pos/neg} 입력을 열어 두었습니다(기본 0). 조인트
+엔코더로 피스톤 속도를 알 수 있으면 넣어서 정확도를 높일 수 있고, 부하 관성이 작거나
+스트로크가 짧은 축에서는 반드시 넣어야 합니다.
+
+\begin{pitfall}
+\textbf{부수적으로 발견한 모델 불일치}: $A_{\mathrm{pos}}=10^{-3}$\,m$^2$와
+$V_{\mathrm{pos}}=0.75$\,L을 함께 쓰면 등가 스트로크가 $V/A=750$\,mm입니다. 일반적인
+실린더로는 비현실적이므로, 면적과 부피 중 하나가 실제와 다를 가능성이 큽니다. 실제
+값으로 교체가 필요합니다.
+\end{pitfall}
+
+\subsection{펌프 주기 평균은 언제 타당한가}
+
+``한 바퀴 평균''이 제어 주기에 영향받지 않는지 확인했습니다. 결과적으로 이 시스템은
+\emph{우연히} 아주 잘 맞습니다.
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item 펌프 3000\,rpm $\to$ 1회전 $=$ \textbf{20\,ms} $=$ 제어 주기와 정확히 일치.
+피스톤 2개(180$^\circ$)라 한 주기에 맥동이 정확히 2번 들어갑니다.
+\item 레일 압력 리플은 0.8$\sim$2.6\,kPa(레일 수백 kPa의 0.3$\sim$1.7\%). 1\,L 리저버가
+저역통과 필터 역할을 합니다.
+\item \textbf{깨지는 조건}: 제어 주기 $<$ 펌프 1회전(20\,ms). 100\,Hz 이상으로 올리면
+순간 유량 모델이 필요합니다(그림 Q(a)).
+\item \textbf{추가 위험}: 펌프 속도가 부하에 따라 변하면 평균값도 달라집니다.
+$\omega$를 측정해 3차원 테이블 $(\Ppos^{\mathrm r},\Pneg^{\mathrm r},\omega)$로 확장을
+권합니다.
+\end{itemize}
+
+\subsection{요약 표}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{p{4.0cm}p{5.0cm}p{5.2cm}}
+\toprule
+\textbf{처음 생각} & \textbf{실제} & \textbf{교훈} \\
+\midrule
+\multicolumn{3}{l}{\textit{1차 (초기 개발)}}\\
+배기는 빠르니 하강은 문제없다 & 상류가 챔버 자신이라 자기감쇠 & 상·하강 모두 유량 제한 \\
+양압 500\,kPa \& 음압 $-90$\,kPa 동시 가능 & 펌프 결합으로 공급 붕괴 & 능력경계를 먼저 계산 \\
+펌프가 유량을 흘려야 응답이 빠름 & 레일 \emph{압력}이 응답을 정함 & 레일을 높게 유지 \\
+릴리프 없애면 압력 최대 유지 & 초기조건에 갇혀 제어 불능 & 릴리프가 배분 손잡이 \\
+압축탱크는 보조 공급원 & 수십 초$\sim$1분이면 소진 & 부스터로만 \\
+음수 목표도 낼 수 있다 & 한 방향 힘만 가능 & $\tau^{\mathrm{ref}}\ge0$ 강제 \\
+절약 벌점 $=$ 압력 상승 억제 & 추종이 무너짐 & 벌점은 \emph{레일 초과분}에만 \\
+\midrule
+\multicolumn{3}{l}{\textit{2차 (해설서 검토)}}\\
+등온이면 충분하다 & 1스텝은 단열($\kappa$배) & 슬루 43\%↑, 탱크 소모 사라짐 \\
+$J_{\mathrm{fast}}$로 빠른 쪽 유도 & 추종을 \emph{해친다} & 슬루 박스가 이미 처리 \\
+느린 챔버가 방치될 것 & 자기균형으로 인수인계 & 물리가 알아서 배분 \\
+잔량 적으면 더 아껴야 & 성능 서서히 저하 & 일정 정책 $+$ 명시적 정지 \\
+프리뷰 0.5초로 충분 & 시상수의 1/4뿐 & 2초로(효과 $9\%\to20\%$) \\
+이젝터 $=$ $-84$\,kPa 정압 & 유량 흐르면 $-13.6$\,kPa & 특성곡선/측정값 사용 \\
+레일 부피는 대충 1\,L & 10\,mL면 설계 붕괴 & 계층분리 조건 확인 필수 \\
+질량이 배기를 돕는다 & 부호 의존 $+$ 이 조건선 미미 & 힘 감쇠가 부하보다 빠름 \\
+주기평균은 항상 OK & 제어주기 $\ge$ 1회전일 때만 & 20\,ms$=$1회전 (우연히 정합) \\
+\bottomrule
+\end{tabular}
+\caption{직관이 틀렸던 지점들. 아래 절반이 2차 검토에서 새로 발견/수정한 것입니다.}
+\end{table}
+
+\section{자주 헷갈리는 세 가지}
+
+\subsection{``소프트항''이라는 게 무슨 뜻이고 어떻게 확인하나}
+
+$J_{\mathrm{trk}}$가 소프트항이라는 말은 ``$\tau=\tau^{\mathrm{ref}}$를 \emph{강제하지
+않고} 목적함수로만 유도한다''는 뜻입니다. 두 가지로 확인할 수 있습니다.
+
+\textbf{(1) 구조로 확인.} \texttt{fmincon}에 넘기는 제약이 무엇인지 보면 됩니다.
+우리 코드는 상·하한 박스(\texttt{lb},\texttt{ub})만 넘기고, 등식 제약
+(\texttt{Aeq},\texttt{beq})이나 비선형 제약(\texttt{nonlcon}) 인자는 \emph{비어
+있습니다}. 즉 토크 등식은 제약 집합에 아예 없습니다.
+
+\textbf{(2) 실험으로 확인.} 물리적으로 불가능한 목표를 주고 솔버가 실패하는지 봅니다.
+최대 가능 힘은 $175\text{k}\times10^{-3}+84\text{k}\times10^{-3}=259$\,N인데:
+\begin{center}\small
+\begin{tabular}{lccc}
+\toprule
+목표 & 달성 & 오차 & 솔버 상태\\
+\midrule
+150\,N & 47.8\,N & 102\,N & 정상 해 반환\\
+259\,N & 47.8\,N & 211\,N & 정상 해 반환\\
+1000\,N & 47.8\,N & 952\,N & 정상 해 반환\\
+\bottomrule
+\end{tabular}
+\end{center}
+1000\,N을 요구해도 ``불가능''이라고 멈추지 않고 \emph{한 스텝에 갈 수 있는 최대}인
+47.8\,N을 반환합니다. 등식 제약이었다면 infeasible로 계산이 중단됐을 것입니다.
+
+\begin{keybox}
+이것이 소프트항을 쓴 이유입니다. 다축이 유량을 다투는 시스템에서 목표가 일시적으로
+불가능해지는 것은 \emph{정상}입니다. 그때마다 계산이 실패하면 실시간 제어기가
+멈춰버립니다. 소프트항은 ``가능한 만큼 최대로''라는 답을 항상 돌려줍니다.
+\end{keybox}
+
+\subsection{``음압 수요''라는 말은 왜 사라졌나}
+
+이전 판 문서와 코드에 ``음압 수요''라는 용어가 있었는데, 이는 제가 \textbf{양방향 힘을
+잘못 가정했던 시기의 잔재}입니다. 당시에는 목표 토크를
+$\max(\tau^{\mathrm{ref}},0)$(양압 수요)와 $\max(-\tau^{\mathrm{ref}},0)$(음압 수요)로
+쪼개서 그 \emph{비율}로 레일을 배분했습니다.
+
+그런데 이 시스템은 한 방향 힘만 내므로 $\tau^{\mathrm{ref}}\ge0$이고, 따라서
+$\max(-\tau^{\mathrm{ref}},0)\equiv0$입니다. ``음압 수요''는 항등적으로 0인 죽은
+개념이었습니다. 그래서 배분 기준을 \emph{비율}에서 \emph{총 수요 크기}로 바꿨습니다
+(5.3절).
+
+\begin{keybox}
+혼동하지 말아야 할 점: \textbf{음압 챔버는 물론 계속 쓰입니다}(힘의 약 1/3). 없어진
+것은 ``음압을 얼마나 원하는지''를 \emph{외부에서 지령받는} 개념입니다. 음압을 얼마나
+쓸지는 최적화가 내부에서 결정하는 \emph{분배} 문제입니다.
+\end{keybox}
+
+\subsection{밸브 동특성과 4\,kHz 전류 제어기의 관계}
+
+밸브의 전류 히스테리시스 모델이 있고 4\,kHz PID로 전류를 정확히 맞출 수 있다면, 계층
+구성은 이렇게 됩니다.
+\begin{center}
+\begin{tikzpicture}[font=\scriptsize,node distance=3mm,
+  b/.style={draw,rounded corners,minimum height=0.8cm,align=center,inner sep=3pt},
+  a/.style={-{Latex[length=1.8mm]}}]
+\node[b,fill=blue!10] (g) {본 생성기\\(50 Hz)};
+\node[b,right=of g,fill=red!8] (c) {하위 제어기\\목표압$\to$필요유량};
+\node[b,right=of c,fill=red!8] (o) {필요 개도\\$\to$역히스테리시스};
+\node[b,right=of o,fill=green!10] (p) {전류 PID\\(4 kHz)};
+\node[b,right=of p,fill=gray!10] (v) {밸브};
+\draw[a](g)--(c); \draw[a](c)--(o); \draw[a](o)--(p); \draw[a](p)--(v);
+\end{tikzpicture}
+\end{center}
+
+\begin{pitfall}
+\textbf{남는 문제 하나}: 우리 슬루 한계는 밸브가 \emph{완전 개방}($A_{\max}$)이라고
+가정합니다. 실제로는 전류가 목표에 도달해도 스풀이 움직이는 데 수 ms가 걸리고
+히스테리시스도 있으므로, 한 스텝(20\,ms) 안에 평균 개도는 $A_{\max}$보다 작습니다.
+즉 \textbf{우리 슬루는 약간 낙관적}입니다.
+
+\textbf{권장}: 밸브 스텝 응답을 실측해 ``한 스텝 평균 개도 계수'' $\eta\in(0,1]$을 구한
+뒤 모든 면적에 곱하십시오($A\leftarrow\eta A$). 이 값은 제가 임의로 정할 수 없습니다 ---
+$C_d$와 함께 실측이 필요한 항목입니다.
+\end{pitfall}
+
+\section{2차 검토 12개 항목 색인}
+
+\begin{table}[h]
+\centering\footnotesize
+\begin{tabular}{@{}p{0.35cm}p{3.5cm}p{1.5cm}p{7.4cm}@{}}
+\toprule
+\# & 지적 & 판정 & 조치 / 근거\\
+\midrule
+1 & 단열로 바꿔야 하지 않나 & \textbf{맞음} & 챔버 $n{=}1.4$, 레일 $n{=}1.0$. 오차 $0.380\to0.274$\,N, 탱크 소모 소멸 (4.1절)\\
+2 & 주기평균이 제어주기에 영향받나 & \textbf{조건부} & 20\,ms$=$1회전이라 정합. 20\,ms보다 짧아지면 무효. $\omega$ 변동은 3D 테이블로 (6.9절)\\
+3 & 특이섭동이 뭔가 & 설명 & $\varepsilon\dot z=g$ 형태의 2시간척도 분리. 단 안정성 증명은 안 함 (4.4절)\\
+4 & 소프트항인 걸 어떻게 확인 & 설명 & 제약에 등식 없음 $+$ 1000\,N 지령에도 해 반환 (7.1절)\\
+5 & $J_{\mathrm{fast}}$ 비유가 틀렸다 & \textbf{맞음} & 비유 수정, 그리고 항 자체를 \emph{제거}(추종 악화) (5.2절)\\
+6 & scarcity가 필요한가 & \textbf{맞음} & 제거. 성능 저하 33$\sim$39\%, 자원 미사용, 비정상 플랜트 (5.2절)\\
+7 & 레일이 수 mL면 & \textbf{위험} & 10\,mL에서 오차 27배, 계층분리 역전. 실제 부피 확인 필수 (6.6절)\\
+8 & ``음압 수요''가 뭔가 & 설명 & 양방향 가정 시절의 죽은 개념. 크기 기반으로 교체 (7.2절)\\
+9 & 프리뷰가 짧지 않나 & \textbf{맞음} & 0.5$\to$2초. 개선 $9\%\to20\%$, 시상수에서 포화 (5.3절)\\
+10 & 이젝터 지연 무시 가능? & \textbf{부정확} & 정압 싱크$\to$특성곡선. 측정값 직접 입력 지원 (6.7절)\\
+11 & 부하가 배기를 돕나 & \textbf{부호의존} & 배치에 따라 반대. 이 조건선 미미(힘감쇠 21.5\,ms) (6.8절)\\
+12 & 밸브 히스테리시스 사용 예정 & 보완필요 & 슬루가 낙관적. 개도 계수 $\eta$ 실측 권장 (7.3절)\\
+\bottomrule
+\end{tabular}
+\caption{2차 검토 결과. ``맞음''은 지적대로 수정한 항목입니다.}
+\end{table}
+
+\section{결과 읽는 법}
+
+\subsection{힘 추종}
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.98\linewidth]{figF_track.png}
+\caption{6축 추종. 서로 다른 시각·크기·폭의 요구를 모두 따라갑니다. 급한 축
+(축4: 폭 0.25\,s, 축6: 폭 0.35\,s)의 꼭대기에서 미세한 갭이 보이는데, 이것이 그
+순간의 공용 유량 한계입니다.}
+\end{figure}
+
+\subsection{힘 분담: 두 챔버가 어떻게 나눠 내는가}
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.98\linewidth]{figI_split.png}
+\caption{빨간 영역이 양압이 만든 힘, 파란 영역이 음압이 만든 힘, 검정선이 목표입니다.
+둘을 \emph{쌓아서} 목표에 도달하는 것이 보입니다. 음압 쪽 기여가 큰 것은 음압 밸브가
+4\,mm로 더 굵어서 $J_{\mathrm{fast}}$가 그쪽을 선호하기 때문입니다.}
+\end{figure}
+
+\subsection{공급원과 셋포인트}
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.94\linewidth]{figG_supply.png}
+\caption{점선이 적응 셋포인트, 실선이 실제 레일 압력입니다. 회색이 총 요구 힘인데,
+요구가 커지면 셋포인트가 함께 올라가는(음압은 깊어지는) 것이 보입니다. 자홍색 탱크는
+거의 수평 --- 정격 부하에서는 부스트를 쓰지 않고 예비로 남습니다.}
+\end{figure}
+
+\subsection{최종 출력: 12개 목표 압력}
+
+\begin{figure}[h]
+\centering\includegraphics[width=0.88\linewidth]{figH_12ch.png}
+\caption{이것이 하위 제어기로 나가는 실제 출력입니다. 각 축이 \emph{필요한 순간에만}
+압력을 만들고, 양압(왼쪽)과 음압(오른쪽)이 \emph{동시에} 움직이는 것을 확인할 수
+있습니다.}
+\end{figure}
+
+\clearpage
+\section{코드와 식의 대응}
+
+\begin{codebox}
+\small
+\begin{tabular}{@{}ll@{}}
+\texttt{pressure\_reference\_init()} & 1회 초기화: 펌프 표, 능력경계 표 생성\\
+\texttt{pressure\_reference\_step()} & 매 틱 호출 (실시간 진입점)\\[2mm]
+\quad$\hookrightarrow$ \texttt{decide\_rail\_setpoint()} & 식 (13): 총 수요 $\to$ 레일 셋포인트\\
+\quad$\hookrightarrow$ \texttt{optimize\_channels()} & 슬루 계산 + \texttt{fmincon} 호출\\
+\quad\quad$\hookrightarrow$ \texttt{obj\_fun\_ch()} & 목적함수 $J$ 전체\\
+\quad$\hookrightarrow$ \texttt{update\_sources()} & 레일 3개 상태 적분 + 릴리프\\[2mm]
+\texttt{valve\_phys\_kgps()} & 식 (2): 오리피스 물리 유량 [kg/s]\\
+\texttt{orifice\_phi()} & 식 (3): $\Phi$ 함수\\
+\texttt{pump\_piston\_avg()} & 슬라이더-크랭크 1주기 평균\\
+\texttt{build\_pump\_table()} & $\mathcal F_\pm$ 및 $\overline P_{\mathrm p}(\cdot)$ 사전계산\\
+\end{tabular}
+\end{codebox}
+
+\textbf{실시간 사용법}은 두 줄입니다.
+\begin{verbatim}
+sys = pressure_reference_init();                 % 기동 시 1회
+[ch, rail] = pressure_reference_step(tau_k, ch, rail, sys, tau_preview);  % 매 틱
+\end{verbatim}
+\texttt{tau\_preview}를 생략하면 현재 목표만 써서 순수 실시간으로 동작합니다.
+
+\textbf{수치적 주의점 하나:} \texttt{fmincon}에 압력을 Pa 단위($\sim10^5$)로 그대로
+넣으면 그래디언트가 수치적으로 뭉개져서 솔버가 첫 스텝만 찔끔 움직이고 멈춥니다.
+변수를 $10^5$로 나눠 $O(1)$로 스케일링하는 것이 필수입니다.
+
+\section{남은 가정과 실험으로 확인할 것}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}p{3.6cm}p{4.6cm}p{6.0cm}@{}}
+\toprule
+\textbf{항목} & \textbf{현재} & \textbf{어떻게 확인/개선} \\
+\midrule
+\rowcolor{red!8}
+\textbf{레일/리저버 부피} & 각 1.0\,L 가정 & \textbf{최우선}. 10\,mL 수준이면 설계 재구성 필요(6.6절) \\
+\rowcolor{red!8}
+\textbf{$C_d$ (방출계수)} & 0.8 가정 & 제조사 $C_v$ 또는 유량 실측 \\
+\rowcolor{red!8}
+\textbf{밸브 개도 계수 $\eta$} & 1.0(완전개방 가정) & 스텝 응답 실측 $\to$ $A\leftarrow\eta A$ (7.3절) \\
+액추에이터 면적/부피 & $10^{-3}$m$^2$ / 0.75\,L & 등가 스트로크 750\,mm는 비현실적. 실제값 필요 \\
+이젝터 특성곡선 & 선형 근사 & 후단 음압 측정값으로 동정 또는 직접 입력 \\
+실린더 배치(중력 방향) & 미확정 & 체적항 부호 결정(6.8절) \\
+챔버 온도 & 상수 $+$ $n{=}1.4$ & 엄밀히는 $(P,T)$ 2상태. 응답 불일치 시 의심 \\
+펌프 속도 $\omega$ & 3000\,rpm 고정 & 부하 변동 시 측정해 3D 테이블로 \\
+이젝터 개수 & 공용 1개 가정 & 실제 구성 확인 \\
+\bottomrule
+\end{tabular}
+\caption{남은 가정. 붉은 항목이 성능 예측에 가장 큰 영향을 줍니다.}
+\end{table}
+
+\begin{keybox}
+가장 먼저 확인할 값은 \textbf{리저버 부피}입니다. 다른 항목들은 정확도를 떨어뜨리는
+정도지만, 리저버 부피가 예상보다 훨씬 작으면 \emph{2계층 설계 자체가 성립하지 않기}
+때문입니다(6.6절). 그다음이 $C_d$와 밸브 개도 계수 $\eta$로, 이 둘이 슬루 한계를 직접
+정하므로 시뮬레이션과 실제의 응답 속도 차이가 대부분 여기서 옵니다.
+\end{keybox}
+
+\section{용어 대응표}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+한국어 & English & 한국어 & English\\
+\midrule
+길항형 & antagonistic & 능력경계 & capability frontier\\
+셋포인트 & set-point & 슬루 한계 & slew limit\\
+프리뷰 & preview & 시간 스케일 분리 & time-scale separation\\
+특이섭동 & singular perturbation & 방출계수 & discharge coefficient\\
+초킹 압력비 & choked pressure ratio & 주기 평균 & cycle-mean\\
+소프트 추종 & soft tracking & 빠른 쪽 우선 & fastest-channel-first\\
+릴리프 밸브 & relief valve & 부스터 & booster\\
+게이지 압력 & gauge pressure & 자기감쇠 & self-limiting decay\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\vfill
+\begin{center}\small\color{gray}
+이 문서는 이해를 돕기 위한 해설이며, 정식 주장은 논문 본문을 따릅니다.
+\end{center}
+
+\end{document}
