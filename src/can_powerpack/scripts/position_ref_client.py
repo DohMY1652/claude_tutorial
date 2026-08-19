@@ -17,16 +17,19 @@ import socket
 import struct
 import sys
 
-NUM_AXES     = 1   # 1축만 구동 테스트 (3→1) — powerpack_config.yaml의 num_actuators와 일치시킬 것
+NUM_AXES     = 6   # powerpack_config.yaml 의 num_actuators 와 일치. --once 는 인자 개수로 자동 추론
 DEFAULT_HOST = '127.0.0.1'   # RefTcpServer는 pp_controller가 뜬 머신에서 0.0.0.0으로 bind됨.
                               # pp_controller를 다른 머신에서 돌린다면 그 머신의 IP를 인자로 넘길 것.
 DEFAULT_PORT = 2293
 
 
-def send_angles(sock, angles):
-    if len(angles) != NUM_AXES:
-        raise ValueError(f"각도는 {NUM_AXES}개여야 합니다 (받은 값: {len(angles)}개)")
-    sock.sendall(struct.pack(f'<{NUM_AXES}d', *angles))
+def send_angles(sock, angles, n_axes=None):
+    n = n_axes if n_axes else NUM_AXES
+    if len(angles) == 1 and n > 1:
+        angles = angles * n          # 값 하나면 전 축에 같은 각도
+    if len(angles) != n:
+        raise ValueError(f"각도는 {n}개여야 합니다 (받은 값: {len(angles)}개)")
+    sock.sendall(struct.pack(f'<{n}d', *angles))
 
 
 def main():

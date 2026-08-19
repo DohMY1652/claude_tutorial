@@ -119,13 +119,36 @@ void RefTcpServer::run_()
 #endif
 }
 
+// yaml 파라미터를 읽되, 없으면 기본값을 쓴다.
+//
+// 주의: yaml 에 소수점 없이 적힌 값(예: pos_sp_max_kpa: 150)은 int 로 파싱되어
+// declare_parameter<double>() 이 InvalidParameterTypeException 을 던진다. 예전 구현은
+// 그 예외를 삼키고 **기본값을 조용히 반환**했다 — yaml 을 고쳐도 반영되지 않는 함정이라
+// 튜닝 중에 실제로 물렸다. 이제 예외 후 get_parameter 로 실제 타입에 맞춰 읽고,
+// 산술 타입이면 정수 → 실수 변환까지 구제한다.
+// (CanBridge::declare_double_flexible / VirtualPowerpack::gpd 와 같은 처리)
 template <typename T>
 static T get_param_or(rclcpp::Node* node, const std::string& name, const T& defv) {
-  try {
-    return node->declare_parameter<T>(name, defv);
-  } catch (...) {
-    return defv;
+  if (!node->has_parameter(name)) {
+    try {
+      return node->declare_parameter<T>(name, defv);
+    } catch (...) {
+      // 타입 불일치 — 아래에서 읽는다
+    }
   }
+  T out = defv;
+  if (node->get_parameter(name, out)) return out;
+
+  if constexpr (std::is_arithmetic_v<T>) {
+    rclcpp::Parameter p;
+    if (node->get_parameter(name, p)) {
+      if (p.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER)
+        return static_cast<T>(p.as_int());
+      if (p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE)
+        return static_cast<T>(p.as_double());
+    }
+  }
+  return defv;
 }
 
 // ================================
@@ -1000,7 +1023,11 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     const double neg_min_abs = pos_ctrl_cfg_.empty() ?  27.0   : pos_ctrl_cfg_[0].p_neg_min_kpa;
     gp.Pch_pos_max   = (pos_max_abs - atm) * 1000.0;
     gp.Pch_neg_min   = (neg_min_abs - atm) * 1000.0;
-    gp.Pneg_cap_deep = gp.Pch_neg_min;
+    // 레일 음압 셋포인트의 최대 깊이. 기본값은 채널 정격과 같지만 **별도 파라미터**다 —
+    // 챔버가 필요한 깊이보다 레일을 더 깊게 요구하면 펌프 하나로 리저버+6챔버를 그
+    // 깊이까지 뽑는 데 시간만 더 걸린다 (6축 정착시간의 지배 요인).
+    gp.Pneg_cap_deep = get_param_or<double>(this, "PressureRefGen.rail.neg_sp_deep_kpa",
+                                            neg_min_abs - atm) * 1000.0;
 
     gp.n_ch     = get_param_or<double>(this, "PressureRefGen.n_chamber", 1.4);
     gp.n_rail   = get_param_or<double>(this, "PressureRefGen.n_rail",    1.0);

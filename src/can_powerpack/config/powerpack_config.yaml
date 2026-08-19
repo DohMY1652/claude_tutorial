@@ -4,7 +4,7 @@
 /pack2/can_bridge:
   ros__parameters:
     can_channel: 0
-    num_actuators: 1   # 1축만 구동 테스트 (3→1)
+    num_actuators: 6    # 6축 전체 구동
     current_mode: 0   # 0=Normal(PID), 1=Debug(PWM direct)
     control_type: 0   # 0=PID, 1=PWM, 2=ID, 3=ZERO
     encoder_offset: 1740.0   # orig_mV at 0 degrees (after inverting amp recovery) — 보드별 override 없을 때 기본값
@@ -35,7 +35,7 @@
     # ──────────────────────────────────────────
     num_total_channels: 12
     num_positive_channels: 6
-    num_actuators: 1    # 1축만 구동 테스트 (3→1) — 액추에이터 수 → 양압/음압/엔코더 보드 + 위치제어기 축 자동 활성화
+    num_actuators: 6    # 6축 전체 구동
     sensor_filter_alpha: 0.2   # 1.0→0.2: 액추에이터 미연결 시 라인압 진동 억제용 저역통과 필터
 
     # 액추에이터 연결 여부
@@ -207,30 +207,58 @@
 
     # ──────────────────────────────────────────
     # 축별 토크 PID (control_mode 2). 게인 단위는 N·m/deg 계열.
-    # 출발점은 mode 1 게인을 토크로 환산한 값:
-    #   mode 1 의 1 kPa delta ≈ 2 kPa 차압 ≈ 3.93 N ≈ 0.098 N·m
+    # 출발점은 mode 1 게인을 토크로 환산한 값 (1 kPa delta ≈ 0.098 N·m):
     #   kp 0.8 → 0.0786,  ki 0.3 → 0.0295,  kd 0.05 → 0.0049
-    # 중력 FF 가 이제 정확해졌으므로(기존은 29% 만 보상) 재튜닝 여지가 크다.
+    #
+    # 6축 시뮬레이터 튜닝 결과 (20/45/70° 스텝, 축별 다른 각도 포함):
+    #   ki 0.0295 → 0.20  : 쿨롱 마찰 데드밴드를 적분으로 밀어낸다.
+    #                       오차 RMS 0.26° → 0.04° (0.0295 에서는 수렴에 4분 걸림)
+    #   friction_nm 0.30 → 0.48 : 시뮬 쿨롱 0.50 에 맞춤. 과보상 채터를 피해 조금 낮게.
+    #   kd 0.0049 → 0.04  : 오버슈트 2.5° → 1.0°. 단 vel_filter_alpha 를 함께
+    #                       0.05 → 0.3 으로 풀어야 효과가 난다 (필터 지연 때문에
+    #                       alpha 0.05 에서는 kd 를 8배 올려도 변화 없음).
+    #   kd 를 0.09 로 더 올리면 정착이 3.6 → 4.6 s 로 나빠져 0.04 에서 멈췄다.
     # ──────────────────────────────────────────
     TorquePID:
       axis0:
         kp: 0.0786
-        ki: 0.0295
-        kd: 0.0049
+        ki: 0.20
+        kd: 0.04
         integ_limit_nm: 2.0       # 적분항 최대 기여 [N·m] (τ_max 7.76 의 26%)
-        friction_nm: 0.30         # 쿨롱 마찰 보상 [N·m]
+        friction_nm: 0.48         # 쿨롱 마찰 보상 [N·m]
       axis1:
         kp: 0.0786
-        ki: 0.0295
-        kd: 0.0049
+        ki: 0.20
+        kd: 0.04
         integ_limit_nm: 2.0
-        friction_nm: 0.30
+        friction_nm: 0.48
       axis2:
         kp: 0.0786
-        ki: 0.0295
-        kd: 0.0049
+        ki: 0.20
+        kd: 0.04
         integ_limit_nm: 2.0
-        friction_nm: 0.30
+        friction_nm: 0.48
+
+      axis3:
+        kp: 0.0786
+        ki: 0.20
+        kd: 0.04
+        integ_limit_nm: 2.0
+        friction_nm: 0.48
+
+      axis4:
+        kp: 0.0786
+        ki: 0.20
+        kd: 0.04
+        integ_limit_nm: 2.0
+        friction_nm: 0.48
+
+      axis5:
+        kp: 0.0786
+        ki: 0.20
+        kd: 0.04
+        integ_limit_nm: 2.0
+        friction_nm: 0.48
 
     # ──────────────────────────────────────────
     # 최적화 기반 압력 레퍼런스 생성기 (pressure_reference_optimizer.m 포팅)
@@ -267,8 +295,17 @@
       # 레일 셋포인트 배분 범위
       rail:
         neg_shallow_kpa: -30.0   # 저수요 시 음압 셋포인트 [kPa gauge]
+        # 고수요 시 음압 레일 깊이 [kPa gauge]. 채널 정격(-74.3)과 별도 파라미터다 —
+        # 45° 유지에 필요한 챔버 음압은 -22 kPa gauge 정도인데 레일을 -74 까지 뽑으면
+        # 펌프 하나로 리저버(500 mL)+음압챔버 6개(1.36 L)를 그 깊이까지 비우는 시간이
+        # 6축 정착시간을 지배한다. 챔버 수요보다 약간만 깊게 두는 것이 유리하다.
+        neg_sp_deep_kpa: -74.3
         pos_sp_min_kpa: 30.0     # 저수요 시 양압 셋포인트 [kPa gauge]
-        pos_sp_max_kpa: 400.0    # 고수요 시 양압 셋포인트 [kPa gauge]
+        # 고수요 시 양압 셋포인트 [kPa gauge]. 원본은 400 이지만 우리 채널 정격이
+        # 84 kPa gauge 뿐이라 400 은 과다하다. 250 이 정착시간·충전시간 균형점
+        # (400 → 16.9 s, 250 → 16.9 s, 150 → 14.9 s 였고 이후 MPC 시상수가
+        #  진짜 병목임이 드러나 250 으로 두었다).
+        pos_sp_max_kpa: 250.0
         demand_ref_N: 150.0      # 수요 정규화 기준 힘 (축 1개 '큰 힘')
 
       tank_stop_kpa: 450.0       # 이하로 떨어지면 tank_low 플래그 (교체/정지 판단)
@@ -338,8 +375,11 @@
         pos_gid: 0         # 제어할 양압 채널 global_id
         neg_gid: 6         # 제어할 음압 채널 global_id
 
-        # 속도 추정 LPF (엔코더 노이즈 억제)
-        vel_filter_alpha: 0.05   # 작을수록 강한 필터 (0 < α ≤ 1)
+        # 속도 추정 LPF (엔코더 노이즈 억제). 작을수록 강한 필터 (0 < α ≤ 1)
+        # 0.05 → 0.3: 강한 필터는 속도 지연을 만들어 kd 를 무력화한다. alpha 0.05 에서는
+        # kd 를 8배 올려도 오버슈트가 안 줄었고, 0.3 에서 kd=0.04 와 함께 2.5° → 1.0°.
+        # 엔코더 양자화(≈0.08°) 때문에 더 올리면 속도 노이즈가 커진다.
+        vel_filter_alpha: 0.3
 
         # TCP 미연결 시 기본 목표 각도
         default_angle_deg: 0.0
@@ -371,7 +411,7 @@
         actuator_idx: 1    # board18
         pos_gid: 1         # board6
         neg_gid: 7         # board12
-        vel_filter_alpha: 0.05
+        vel_filter_alpha: 0.3
         default_angle_deg: 0.0
         integral_limit_kpa: 45.0
 
@@ -394,7 +434,76 @@
         actuator_idx: 2    # board19
         pos_gid: 2         # board7
         neg_gid: 8         # board13
-        vel_filter_alpha: 0.05
+        vel_filter_alpha: 0.3
+        default_angle_deg: 0.0
+        integral_limit_kpa: 45.0
+
+      axis3:
+        kp: 0.8
+        ki: 0.3
+        kd: 0.05
+        kff_gravity: 3.0
+        mass_kg: 5.0
+        link_length_m: 0.15   # 0.2→0.15: 실측 링크 150 mm (중력토크 9.81→7.36 N·m)
+        friction_kpa: 3.0
+        vel_deadband_dps: 0.5
+        p_bias_pos_kpa: 105.0
+        p_bias_neg_kpa: 90.0
+        neg_coupling: 1.0
+        p_pos_max_kpa: 185.0
+        p_pos_min_kpa: 101.325
+        p_neg_max_kpa: 101.325
+        p_neg_min_kpa: 27.0
+        actuator_idx: 3    # board20
+        pos_gid: 3         # board8
+        neg_gid: 9         # board14
+        vel_filter_alpha: 0.3
+        default_angle_deg: 0.0
+        integral_limit_kpa: 45.0
+
+      axis4:
+        kp: 0.8
+        ki: 0.3
+        kd: 0.05
+        kff_gravity: 3.0
+        mass_kg: 5.0
+        link_length_m: 0.15   # 0.2→0.15: 실측 링크 150 mm (중력토크 9.81→7.36 N·m)
+        friction_kpa: 3.0
+        vel_deadband_dps: 0.5
+        p_bias_pos_kpa: 105.0
+        p_bias_neg_kpa: 90.0
+        neg_coupling: 1.0
+        p_pos_max_kpa: 185.0
+        p_pos_min_kpa: 101.325
+        p_neg_max_kpa: 101.325
+        p_neg_min_kpa: 27.0
+        actuator_idx: 4    # board21
+        pos_gid: 4         # board9
+        neg_gid: 10         # board15
+        vel_filter_alpha: 0.3
+        default_angle_deg: 0.0
+        integral_limit_kpa: 45.0
+
+      axis5:
+        kp: 0.8
+        ki: 0.3
+        kd: 0.05
+        kff_gravity: 3.0
+        mass_kg: 5.0
+        link_length_m: 0.15   # 0.2→0.15: 실측 링크 150 mm (중력토크 9.81→7.36 N·m)
+        friction_kpa: 3.0
+        vel_deadband_dps: 0.5
+        p_bias_pos_kpa: 105.0
+        p_bias_neg_kpa: 90.0
+        neg_coupling: 1.0
+        p_pos_max_kpa: 185.0
+        p_pos_min_kpa: 101.325
+        p_neg_max_kpa: 101.325
+        p_neg_min_kpa: 27.0
+        actuator_idx: 5    # board22
+        pos_gid: 5         # board10
+        neg_gid: 11         # board16
+        vel_filter_alpha: 0.3
         default_angle_deg: 0.0
         integral_limit_kpa: 45.0
 
@@ -413,7 +522,13 @@
 
       neg:
         kp: 0.8               # 2.0→0.8: 위와 동일한 사유로 하향
-        ki: 0.04              # 0.2→0.04
+        # ki 0.04 → 0.5: 양압과 **같은 구조 문제**였다. board2 v1 은 '대기 유입'
+        # 밸브라 진공을 유지하려면 정상상태에 u≈100 이 필요한데, ki=0.04 로는
+        # 유입 밸브를 닫는 데 289 s 가 걸려 음압 레일이 27 셋포인트에 도달하지
+        # 못하고 35 kPa 에 멈췄다. 그러면 음압 챔버가 레일 아래로 못 가고
+        # 토크가 7.4 N·m 에 묶여 70° 명령이 67° 에서 정지했다.
+        # 0.5 로 올리자 레일이 27.0 에 도달하고 70° 오차가 3.2° → 0.06° 가 됐다.
+        ki: 0.5              # 0.2→0.04
         kd: 0.01              # 0.0→0.01
         ref: 30.0         # 50→30: 강한 진공 라인 공급
         pwm_index: 3    # (board 2 - 1)*3 + 0 = 3
@@ -435,7 +550,12 @@
       leakage_u_pos: 0.0
       leakage_u_neg: 0.0
 
-      target_time_constant: 8.0   # 1.0→4.0→8.0: 2초 릴레이 주기가 이 값에 비례하는지 확인용 실험 (threshold=1.5 유지, 20260818)
+      # 0.5: MPC 가 레퍼런스에 접근하는 목표 시상수 [s].
+      # 8.0 은 릴레이 진동 진단용 실험값이 남은 것이었고, 6축 정착시간을 지배했다.
+      #   8.0 → 17.1 s,  2.0 → 8.1 s,  0.5 → 3.2 s  (정확도는 모두 동일)
+      # 0.2/0.1 로 더 줄여도 정착은 3.0/2.5 s 로 소폭 빨라지는 대신 오버슈트가
+      # 2.5° → 3.4° 로 커져 0.5 를 택했다.
+      target_time_constant: 0.5
 
       macro_threshold : 50.0   # 10→50: 50mL 소부피 단일채널 테스트에선 macro(대유량) 개입 시 과압 스파이크 유발 → 거의 안 열리게 상향 (20260818)
       actuating_threshold : 1.5   # 2.0→5.0→1.5: 2.4초 릴레이 진동이 데드존-크로싱 기전인지 확인용 실험 (20260818)

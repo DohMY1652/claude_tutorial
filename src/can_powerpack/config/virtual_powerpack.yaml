@@ -126,3 +126,36 @@
         theta_min_deg: 0.0
         theta_max_deg: 105.0
         theta_init_deg: 0.0
+
+      actuator3:
+        pos_offset_mm: 40.0
+        neg_offset_mm: 90.0
+        torque_arm_m: 0.025
+        inertia_kgm2: 0.05
+        damping_nms: 0.30
+        coulomb_nm: 0.50
+        theta_min_deg: 0.0
+        theta_max_deg: 105.0
+        theta_init_deg: 0.0
+
+      actuator4:
+        pos_offset_mm: 40.0
+        neg_offset_mm: 90.0
+        torque_arm_m: 0.025
+        inertia_kgm2: 0.05
+        damping_nms: 0.30
+        coulomb_nm: 0.50
+        theta_min_deg: 0.0
+        theta_max_deg: 105.0
+        theta_init_deg: 0.0
+
+      actuator5:
+        pos_offset_mm: 40.0
+        neg_offset_mm: 90.0
+        torque_arm_m: 0.025
+        inertia_kgm2: 0.05
+        damping_nms: 0.30
+        coulomb_nm: 0.50
+        theta_min_deg: 0.0
+        theta_max_deg: 105.0
+        theta_init_deg: 0.0
