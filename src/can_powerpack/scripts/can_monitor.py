@@ -55,8 +55,17 @@ ENCODER_OFFSET = 1740.0
 ENCODER_GAIN   = 105.0 / (3127.0 - 1740.0)  # ≈ 0.07569 deg/mV
 ENCODER_CALIB  = {i: (ENCODER_OFFSET, ENCODER_GAIN) for i in range(17, 23)}
 
+# 보드별 raw ADC 실측값 (0도 / 90도) — 여기 raw 값만 입력하면
+# calib_from_raw_2pt()가 offset/gain을 자동 계산해서 ENCODER_CALIB에 반영함
+ENCODER_RAW_POINTS = {
+    17: (1200, 2470),   # raw 1430 @ 0도, raw 2580 @ 90도
+    18: (860, 2000),    # raw  860 @ 0도, raw 2000 @ 90도
+    19: (2115, 3155),   # raw 2115 @ 0도, raw 3155 @ 90도
+}
+
 # 공유 데이터
 board_data = {i: [0.0, 0.0, 0.0, 0.0] for i in range(1, 23)} # [I1, I2, I3, Pressure]
+encoder_raw = {i: (0, 0, 0, 0) for i in range(17, 23)}       # 엔코더 보드 raw ADC (Raw1~Raw4)
 last_recv_time = {i: 0.0 for i in range(1, 23)}
 running = True
 
@@ -81,6 +90,19 @@ def calc_original_voltage_mv(adc_mv):
     if adc_mv < 0.0: adc_mv = 0.0
 
     return (4125.0 - adc_mv) / 0.825
+
+def calib_from_raw_2pt(raw_0deg, raw_90deg):
+    """raw ADC 값(0도/90도 실측)으로부터 (offset, gain)을 orig_mV 기준으로 자동 계산"""
+    orig_mv_0deg  = calc_original_voltage_mv(raw_0deg  * TO_MV)
+    orig_mv_90deg = calc_original_voltage_mv(raw_90deg * TO_MV)
+    gain = 90.0 / (orig_mv_90deg - orig_mv_0deg)
+    offset = orig_mv_0deg
+    return offset, gain
+
+ENCODER_CALIB.update({
+    board_id: calib_from_raw_2pt(raw_0deg, raw_90deg)
+    for board_id, (raw_0deg, raw_90deg) in ENCODER_RAW_POINTS.items()
+})
 
 def calc_pressure_kpa(orig_mv, board_id):
     offset, gain = PRESSURE_CALIB.get(board_id, (DEFAULT_OFFSET, DEFAULT_GAIN))
@@ -132,6 +154,7 @@ def rx_thread_func(ch):
                         orig_mv = calc_original_voltage_mv(raw[3] * TO_MV)
                         angle = calc_angle_deg(orig_mv, board_id)
                         board_data[board_id] = [0.0, 0.0, 0.0, angle]
+                        encoder_raw[board_id] = raw
                 elif len(msg.data) >= 8:
                     # 압력/전류 보드 (1~16)
                     raw = struct.unpack('<HHHH', msg.data)
@@ -175,18 +198,19 @@ def print_dashboard():
 
     output += f"==================================================================\n"
     output += f"\n"
-    output += f"|  ID  |    Angle (deg)   | State |\n"
-    output += f"|------|------------------|-------|\n"
+    output += f"|  ID  |  Raw1 |  Raw2 |  Raw3 |  Raw4 |    Angle (deg)   | State |\n"
+    output += f"|------|-------|-------|-------|-------|------------------|-------|\n"
 
     for bid in range(17, 23):
         vals = board_data[bid]
+        raw = encoder_raw[bid]
         t_last = last_recv_time[bid]
         if now - t_last < 1.5 and t_last != 0:
             status = "OK"
             active_cnt += 1
         else:
             status = "Lost"
-        output += f"|  {bid:02d}  |     {vals[3]:8.2f} deg   | {status:^5} |\n"
+        output += f"|  {bid:02d}  | {raw[0]:5d} | {raw[1]:5d} | {raw[2]:5d} | {raw[3]:5d} |     {vals[3]:8.2f} deg   | {status:^5} |\n"
 
     output += f"==================================================================\n"
     output += f" Active Boards: {active_cnt} / 22\n"

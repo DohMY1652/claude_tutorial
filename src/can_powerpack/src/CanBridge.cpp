@@ -1,6 +1,10 @@
 #include "CanBridge.hpp"
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <iostream>
+#include <limits>
+#include <string>
 #include <vector>
 
 #define CMD_ID_GRP1 0x100
@@ -10,6 +14,23 @@
 // Same signal conditioning as pressure: 1~5V → 3.3V~0V inverted, ADC 12-bit.
 // Conversion: V_mv = 5000 - (raw * 4000/4095), angle_deg = V_mv / 5000 * 360
 static constexpr int PWM_BOARDS = ANALOG_BOARD_START - 1;  // 16
+
+// raw ADC(0~4095) → orig_mV (반전증폭 역산), can_monitor.py의 calc_original_voltage_mv()와 동일
+static double raw_to_orig_mv(double raw_adc) {
+  double adc_mv = std::clamp(raw_adc * (3300.0 / 4095.0), 0.0, 3300.0);
+  return (4125.0 - adc_mv) / 0.825;
+}
+
+// double 파라미터를 선언하되, yaml에 소수점 없이 정수로 적혀 있어도(예: raw_0deg: 1200)
+// rclcpp의 엄격한 타입 검사로 노드가 죽지 않도록 int로도 허용해서 double로 변환.
+static double declare_double_flexible(rclcpp::Node* node, const std::string& name, double default_value) {
+  rcl_interfaces::msg::ParameterDescriptor desc;
+  desc.dynamic_typing = true;
+  rclcpp::ParameterValue pv = node->declare_parameter(name, rclcpp::ParameterValue(default_value), desc);
+  if (pv.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER) return static_cast<double>(pv.get<int64_t>());
+  if (pv.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE)  return pv.get<double>();
+  return default_value;
+}
 
 using namespace std::chrono_literals;
 
@@ -24,8 +45,27 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
   for (int i = 0; i < num_actuators; ++i)
     active_encoder_boards_.insert(ANALOG_BOARD_START + i);
 
-  enc_offset_ = this->declare_parameter<double>("encoder_offset", 1740.0);
-  enc_gain_   = this->declare_parameter<double>("encoder_gain",   105.0 / (3127.0 - 1740.0));
+  double enc_offset_default = declare_double_flexible(this, "encoder_offset", 1740.0);
+  double enc_gain_default   = declare_double_flexible(this, "encoder_gain",   105.0 / (3127.0 - 1740.0));
+  enc_offset_.fill(enc_offset_default);
+  enc_gain_.fill(enc_gain_default);
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  for (int bid = ANALOG_BOARD_START; bid <= NUM_BOARDS; ++bid) {
+    const std::string base = "EncoderCalibration.boards." + std::to_string(bid);
+    // raw_0deg/raw_90deg 실측값이 있으면 offset/gain을 자동 계산 (can_monitor.py의
+    // calib_from_raw_2pt()와 동일 로직). 없으면 offset/gain 직접 override로 폴백.
+    double raw_0deg  = declare_double_flexible(this, base + ".raw_0deg",  nan);
+    double raw_90deg = declare_double_flexible(this, base + ".raw_90deg", nan);
+    if (!std::isnan(raw_0deg) && !std::isnan(raw_90deg)) {
+      double orig_mv_0deg  = raw_to_orig_mv(raw_0deg);
+      double orig_mv_90deg = raw_to_orig_mv(raw_90deg);
+      enc_offset_[bid] = orig_mv_0deg;
+      enc_gain_[bid]   = 90.0 / (orig_mv_90deg - orig_mv_0deg);
+    } else {
+      enc_offset_[bid] = declare_double_flexible(this, base + ".offset", enc_offset_[bid]);
+      enc_gain_[bid]   = declare_double_flexible(this, base + ".gain",   enc_gain_[bid]);
+    }
+  }
 
   targets_.resize(NUM_BOARDS + 1);
   sensors_snapshot_.assign(PWM_BOARDS + 1, 0);
@@ -213,7 +253,7 @@ void CanBridge::sensor_routine() {
     if (!active_encoder_boards_.empty() && !active_encoder_boards_.count(board_id)) continue;
     double adc_mv = std::clamp((double)a_raw[i] * (3300.0 / 4095.0), 0.0, 3300.0);
     double orig_mv = (4125.0 - adc_mv) / 0.825;
-    msg_a.data[i] = (orig_mv - enc_offset_) * enc_gain_;
+    msg_a.data[i] = (orig_mv - enc_offset_[board_id]) * enc_gain_[board_id];
   }
   pub_analog_->publish(msg_a);
 }

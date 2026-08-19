@@ -71,8 +71,8 @@ void RefTcpServer::run_()
     }
     ::listen(sfd, 1);
     RCLCPP_INFO(rclcpp::get_logger("RefTcpServer"),
-                "Listening for pressure refs on port %d  [double pos_kpa, double neg_kpa]",
-                cfg_.port);
+                "Listening for refs on port %d  [%d doubles per message]",
+                cfg_.port, cfg_.num_values);
 
     while (!stop_.load()) {
         fd_set fds; FD_ZERO(&fds); FD_SET(sfd, &fds);
@@ -89,14 +89,14 @@ void RefTcpServer::run_()
         ::setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
         RCLCPP_INFO(rclcpp::get_logger("RefTcpServer"), "Client connected.");
 
-        constexpr size_t MSG = 2 * sizeof(double);
-        uint8_t buf[MSG];
+        const size_t MSG = (size_t)cfg_.num_values * sizeof(double);
+        std::vector<uint8_t> buf(MSG);
         bool ok = true;
 
         while (!stop_.load() && ok) {
             size_t total = 0;
             while (total < MSG && !stop_.load()) {
-                ssize_t n = ::recv(cfd, buf + total, MSG - total, 0);
+                ssize_t n = ::recv(cfd, buf.data() + total, MSG - total, 0);
                 if (n == 0) { ok = false; break; }
                 if (n < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
@@ -106,10 +106,10 @@ void RefTcpServer::run_()
             }
             if (!ok || total < MSG) break;
 
-            double pos_kpa, neg_kpa;
-            std::memcpy(&pos_kpa, buf,                  sizeof(double));
-            std::memcpy(&neg_kpa, buf + sizeof(double),  sizeof(double));
-            cb_(pos_kpa, neg_kpa);
+            std::vector<double> vals((size_t)cfg_.num_values);
+            for (size_t i = 0; i < vals.size(); ++i)
+                std::memcpy(&vals[i], buf.data() + i * sizeof(double), sizeof(double));
+            cb_(vals);
         }
 
         ::close(cfd); client_fd_.store(-1);
@@ -708,6 +708,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
 
   num_positive_channels_ = this->declare_parameter<int>("num_positive_channels", 8);
   num_total_channels_   = this->declare_parameter<int>("num_total_channels", 12);
+  num_actuators_        = this->declare_parameter<int>("num_actuators", 1);
 
   // 채널 수에 맞게 동적 벡터 초기화
   channel_configs_.resize(num_total_channels_);
@@ -907,45 +908,49 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
               control_mode_, control_mode_ == 1 ? "POSITION" : "PRESSURE");
 
   // ──────────────────────────────────────────
-  // 위치 제어기 파라미터 로드
+  // 위치 제어기 파라미터 로드 (축마다 PositionController.axis<i>.* , 크기 = num_actuators_)
   // ──────────────────────────────────────────
-  pos_ctrl_cfg_.kp               = get_param_or<double>(this, "PositionController.kp",               3.0);
-  pos_ctrl_cfg_.ki               = get_param_or<double>(this, "PositionController.ki",               0.05);
-  pos_ctrl_cfg_.kd               = get_param_or<double>(this, "PositionController.kd",               0.02);
-  pos_ctrl_cfg_.kff_gravity      = get_param_or<double>(this, "PositionController.kff_gravity",      10.0);
-  pos_ctrl_cfg_.mass_kg          = get_param_or<double>(this, "PositionController.mass_kg",          1.0);
-  pos_ctrl_cfg_.link_length_m    = get_param_or<double>(this, "PositionController.link_length_m",    0.2);
-  pos_ctrl_cfg_.friction_kpa     = get_param_or<double>(this, "PositionController.friction_kpa",     2.0);
-  pos_ctrl_cfg_.vel_deadband_dps = get_param_or<double>(this, "PositionController.vel_deadband_dps", 0.5);
-  pos_ctrl_cfg_.p_bias_pos_kpa   = get_param_or<double>(this, "PositionController.p_bias_pos_kpa",  120.0);
-  pos_ctrl_cfg_.p_bias_neg_kpa   = get_param_or<double>(this, "PositionController.p_bias_neg_kpa",  90.0);
-  pos_ctrl_cfg_.neg_coupling     = get_param_or<double>(this, "PositionController.neg_coupling",     0.5);
-  pos_ctrl_cfg_.p_pos_max_kpa    = get_param_or<double>(this, "PositionController.p_pos_max_kpa",   165.0);
-  pos_ctrl_cfg_.p_pos_min_kpa    = get_param_or<double>(this, "PositionController.p_pos_min_kpa",   101.325);
-  pos_ctrl_cfg_.p_neg_max_kpa    = get_param_or<double>(this, "PositionController.p_neg_max_kpa",   101.325);
-  pos_ctrl_cfg_.p_neg_min_kpa    = get_param_or<double>(this, "PositionController.p_neg_min_kpa",   70.0);
-  pos_ctrl_cfg_.actuator_idx     = get_param_or<int>   (this, "PositionController.actuator_idx",    0);
-  pos_ctrl_cfg_.pos_gid          = get_param_or<int>   (this, "PositionController.pos_gid",         0);
-  pos_ctrl_cfg_.neg_gid          = get_param_or<int>   (this, "PositionController.neg_gid",         num_positive_channels_);
-  pos_ctrl_cfg_.vel_filter_alpha = get_param_or<double>(this, "PositionController.vel_filter_alpha",0.05);
-  pos_ctrl_cfg_.default_angle_deg= get_param_or<double>(this, "PositionController.default_angle_deg",0.0);
-  pos_ctrl_cfg_.integral_limit_kpa= get_param_or<double>(this,"PositionController.integral_limit_kpa",20.0);
+  pos_ctrl_cfg_.assign(num_actuators_, PositionCtrlConfig{});
+  pos_ctrl_state_.assign(num_actuators_, PositionCtrlState{});
+  target_angle_deg_.assign(num_actuators_, 0.0);
 
-  RCLCPP_INFO(get_logger(),
-    "[PosCtrl] PID: kp=%.2f ki=%.3f kd=%.3f | kff_gravity=%.1f  m=%.1fkg  L=%.3fm",
-    pos_ctrl_cfg_.kp, pos_ctrl_cfg_.ki, pos_ctrl_cfg_.kd,
-    pos_ctrl_cfg_.kff_gravity, pos_ctrl_cfg_.mass_kg, pos_ctrl_cfg_.link_length_m);
-  RCLCPP_INFO(get_logger(),
-    "[PosCtrl] Friction: %.1f kPa (deadband %.1f dps) | vel_alpha=%.3f",
-    pos_ctrl_cfg_.friction_kpa, pos_ctrl_cfg_.vel_deadband_dps, pos_ctrl_cfg_.vel_filter_alpha);
-  RCLCPP_INFO(get_logger(),
-    "[PosCtrl] Bias: P+=%.1f kPa  P-=%.1f kPa  neg_coupling=%.2f",
-    pos_ctrl_cfg_.p_bias_pos_kpa, pos_ctrl_cfg_.p_bias_neg_kpa, pos_ctrl_cfg_.neg_coupling);
-  RCLCPP_INFO(get_logger(),
-    "[PosCtrl] Limits: P+=[%.1f,%.1f]  P-=[%.1f,%.1f] kPa | gid: pos=%d neg=%d enc=%d",
-    pos_ctrl_cfg_.p_pos_min_kpa, pos_ctrl_cfg_.p_pos_max_kpa,
-    pos_ctrl_cfg_.p_neg_min_kpa, pos_ctrl_cfg_.p_neg_max_kpa,
-    pos_ctrl_cfg_.pos_gid, pos_ctrl_cfg_.neg_gid, pos_ctrl_cfg_.actuator_idx);
+  for (int a = 0; a < num_actuators_; ++a) {
+    const std::string prefix = "PositionController.axis" + std::to_string(a) + ".";
+    auto& c = pos_ctrl_cfg_[(size_t)a];
+
+    c.kp                = get_param_or<double>(this, prefix + "kp",               3.0);
+    c.ki                = get_param_or<double>(this, prefix + "ki",               0.05);
+    c.kd                = get_param_or<double>(this, prefix + "kd",               0.02);
+    c.kff_gravity       = get_param_or<double>(this, prefix + "kff_gravity",      10.0);
+    c.mass_kg           = get_param_or<double>(this, prefix + "mass_kg",          1.0);
+    c.link_length_m      = get_param_or<double>(this, prefix + "link_length_m",    0.2);
+    c.friction_kpa       = get_param_or<double>(this, prefix + "friction_kpa",     2.0);
+    c.vel_deadband_dps   = get_param_or<double>(this, prefix + "vel_deadband_dps", 0.5);
+    c.p_bias_pos_kpa     = get_param_or<double>(this, prefix + "p_bias_pos_kpa",  120.0);
+    c.p_bias_neg_kpa     = get_param_or<double>(this, prefix + "p_bias_neg_kpa",  90.0);
+    c.neg_coupling       = get_param_or<double>(this, prefix + "neg_coupling",     0.5);
+    c.p_pos_max_kpa      = get_param_or<double>(this, prefix + "p_pos_max_kpa",   165.0);
+    c.p_pos_min_kpa      = get_param_or<double>(this, prefix + "p_pos_min_kpa",   101.325);
+    c.p_neg_max_kpa      = get_param_or<double>(this, prefix + "p_neg_max_kpa",   101.325);
+    c.p_neg_min_kpa      = get_param_or<double>(this, prefix + "p_neg_min_kpa",   70.0);
+    c.actuator_idx       = get_param_or<int>   (this, prefix + "actuator_idx",    a);
+    c.pos_gid            = get_param_or<int>   (this, prefix + "pos_gid",         a);
+    c.neg_gid            = get_param_or<int>   (this, prefix + "neg_gid",         num_positive_channels_ + a);
+    c.vel_filter_alpha   = get_param_or<double>(this, prefix + "vel_filter_alpha",0.05);
+    c.default_angle_deg  = get_param_or<double>(this, prefix + "default_angle_deg",0.0);
+    c.integral_limit_kpa = get_param_or<double>(this, prefix + "integral_limit_kpa",20.0);
+    c.ref_slew_kpa_per_s  = get_param_or<double>(this, prefix + "ref_slew_kpa_per_s", 3.0);
+
+    target_angle_deg_[(size_t)a] = c.default_angle_deg;
+
+    RCLCPP_INFO(get_logger(),
+      "[PosCtrl axis%d] PID: kp=%.2f ki=%.3f kd=%.3f | kff_gravity=%.1f  m=%.1fkg  L=%.3fm",
+      a, c.kp, c.ki, c.kd, c.kff_gravity, c.mass_kg, c.link_length_m);
+    RCLCPP_INFO(get_logger(),
+      "[PosCtrl axis%d] Limits: P+=[%.1f,%.1f]  P-=[%.1f,%.1f] kPa | gid: pos=%d neg=%d enc=%d",
+      a, c.p_pos_min_kpa, c.p_pos_max_kpa, c.p_neg_min_kpa, c.p_neg_max_kpa,
+      c.pos_gid, c.neg_gid, c.actuator_idx);
+  }
 
   ref_server_cfg_.enable  = get_param_or<bool>(this, "RefTcpServer.enable",  false);
   ref_server_cfg_.port    = get_param_or<int> (this, "RefTcpServer.port",    2293);
@@ -954,32 +959,37 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
 
   if (ref_server_cfg_.enable) {
     if (control_mode_ == 1) {
-      // 위치 제어 모드: TCP가 [angle_ref_deg, unused] 수신
+      // 위치 제어 모드: TCP가 축 개수(num_actuators_)만큼의 angle_ref_deg 를 수신
+      ref_server_cfg_.num_values = num_actuators_;
       ref_server_ = std::make_unique<RefTcpServer>(
         ref_server_cfg_,
-        [this](double angle_ref_deg, double /*unused*/) {
+        [this](const std::vector<double>& angles) {
           {
             std::lock_guard<std::mutex> lk(mpc_ref_mtx_);
-            target_angle_deg_ = angle_ref_deg;
+            for (size_t i = 0; i < angles.size() && i < target_angle_deg_.size(); ++i)
+              target_angle_deg_[i] = angles[i];
             pos_tcp_received_ = true;
           }
-          RCLCPP_INFO(rclcpp::get_logger("RefTcpServer"),
-            "[PosCtrl] angle_ref = %.2f deg", angle_ref_deg);
+          std::string s;
+          for (double a : angles) s += (s.empty() ? "" : ", ") + std::to_string(a);
+          RCLCPP_INFO(rclcpp::get_logger("RefTcpServer"), "[PosCtrl] angle_ref = [%s] deg", s.c_str());
         }
       );
       RCLCPP_INFO(get_logger(),
-        "RefTcpServer [POSITION mode]: port %d — expects [double angle_ref_deg, double unused]",
-        ref_server_cfg_.port);
+        "RefTcpServer [POSITION mode]: port %d — expects [%d doubles: angle_ref_deg per axis]",
+        ref_server_cfg_.port, num_actuators_);
     } else {
       // 압력 제어 모드: TCP가 [pos_kpa, neg_kpa] 수신 (기존 동작)
+      ref_server_cfg_.num_values = 2;
       ref_server_ = std::make_unique<RefTcpServer>(
         ref_server_cfg_,
-        [this](double pos_kpa, double neg_kpa) {
+        [this](const std::vector<double>& v) {
+          if (v.size() < 2) return;
           std::lock_guard<std::mutex> lk(mpc_ref_mtx_);
           const int pg = ref_server_cfg_.pos_gid;
           const int ng = ref_server_cfg_.neg_gid;
-          if (pg >= 0 && pg < (int)mpc_ref_kpa_.size()) mpc_ref_kpa_[pg] = pos_kpa;
-          if (ng >= 0 && ng < (int)mpc_ref_kpa_.size()) mpc_ref_kpa_[ng] = neg_kpa;
+          if (pg >= 0 && pg < (int)mpc_ref_kpa_.size()) mpc_ref_kpa_[pg] = v[0];
+          if (ng >= 0 && ng < (int)mpc_ref_kpa_.size()) mpc_ref_kpa_[ng] = v[1];
         }
       );
       RCLCPP_INFO(get_logger(),
@@ -1031,9 +1041,8 @@ Controller::~Controller()
 }
 
 void Controller::build_mpcs() {
-  int num_actuators = get_param_or<int>(this, "num_actuators", 1);
   active_channels_.clear();
-  for (int i = 0; i < num_actuators; ++i) {
+  for (int i = 0; i < num_actuators_; ++i) {
     active_channels_.insert(i);                              // 양압 gid 0..N-1
     active_channels_.insert(num_positive_channels_ + i);    // 음압 gid num_pos..num_pos+N-1
   }
@@ -1471,130 +1480,172 @@ void Controller::on_timer() {
 // 출력:
 //   P_pos_ref = p_bias_pos + (P_pid + P_ff + P_friction)
 //   P_neg_ref = p_bias_neg - (P_pid + P_ff + P_friction) × neg_coupling
+//
+// actuator_connected_=false (액추에이터 미연결, 순수 압력추종 테스트):
+//   엔코더 각도가 고정돼 있어 PID/마찰 보상은 의미가 없으므로 끄고,
+//   중력 FF만 목표각(angle_ref) 기준으로 계산해 목표압력을 만든다.
+//   → position_ref_client.py로 보낸 각도(30°, 45°, ...)마다 서로 다른
+//     목표압력이 생성되고, 그 압력을 MPC(단일 채널)가 추종하는지 확인 가능.
 void Controller::run_position_control(double dt_sec)
 {
-  // 엔코더 각도: board/analog 토픽 → encoder_angles_[] (sensors_mtx_ 보호)
-  // board/sensors raw(filt_out_) 는 데이터가 없으면 0이라 사용 불가
-  const int enc_idx = pos_ctrl_cfg_.actuator_idx;
-  if (enc_idx < 0 || enc_idx >= (int)encoder_angles_.size()) {
-    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-      "[PosCtrl] actuator_idx=%d out of range", enc_idx);
-    return;
-  }
-  double angle;
-  {
-    std::lock_guard<std::mutex> lk(sensors_mtx_);
-    angle = encoder_angles_[(size_t)enc_idx];
-  }
+  const int n = (int)pos_ctrl_cfg_.size();
+  std::vector<double> dbg_all;
+  dbg_all.reserve((size_t)n * 8);
 
-  // 목표 각도: TCP 수신 전까지는 현재 각도 유지 (급격한 움직임 방지)
-  double angle_ref;
-  {
-    std::lock_guard<std::mutex> lk(mpc_ref_mtx_);
-    angle_ref = pos_tcp_received_ ? target_angle_deg_ : angle;
-  }
+  for (int a = 0; a < n; ++a) {
+    auto& cfg   = pos_ctrl_cfg_[(size_t)a];
+    auto& state = pos_ctrl_state_[(size_t)a];
 
-  // 최초 진입: 속도 추정기 초기화만 하고 제어 출력은 건너뜀
-  if (!pos_ctrl_state_.initialized) {
-    pos_ctrl_state_.prev_angle  = angle;
-    pos_ctrl_state_.vel_filt    = 0.0;
-    pos_ctrl_state_.integral    = 0.0;
-    pos_ctrl_state_.initialized = true;
-    return;
-  }
+    // 엔코더 각도: board/analog 토픽 → encoder_angles_[] (sensors_mtx_ 보호)
+    // board/sensors raw(filt_out_) 는 데이터가 없으면 0이라 사용 불가
+    const int enc_idx = cfg.actuator_idx;
+    if (enc_idx < 0 || enc_idx >= (int)encoder_angles_.size()) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "[PosCtrl axis%d] actuator_idx=%d out of range", a, enc_idx);
+      dbg_all.insert(dbg_all.end(), 8, 0.0);
+      continue;
+    }
+    double angle;
+    {
+      std::lock_guard<std::mutex> lk(sensors_mtx_);
+      angle = encoder_angles_[(size_t)enc_idx];
+    }
 
-  // ── 각속도 추정 (유한차분 + LPF) ──
-  const double vel_raw = (angle - pos_ctrl_state_.prev_angle) / dt_sec;   // [deg/s]
-  pos_ctrl_state_.vel_filt = pos_ctrl_cfg_.vel_filter_alpha * vel_raw
-                            + (1.0 - pos_ctrl_cfg_.vel_filter_alpha) * pos_ctrl_state_.vel_filt;
-  pos_ctrl_state_.prev_angle = angle;
-  const double vel = pos_ctrl_state_.vel_filt;
+    // 목표 각도: TCP 수신 전까지는 현재 각도 유지 (급격한 움직임 방지)
+    double angle_ref;
+    {
+      std::lock_guard<std::mutex> lk(mpc_ref_mtx_);
+      angle_ref = pos_tcp_received_ ? target_angle_deg_[(size_t)a] : angle;
+    }
 
-  // ── PID ──
-  const double error = angle_ref - angle;
+    // 최초 진입: 속도 추정기 초기화만 하고 제어 출력은 건너뜀
+    if (!state.initialized) {
+      state.prev_angle    = angle;
+      state.vel_filt      = 0.0;
+      state.integral      = 0.0;
+      state.p_pos_ref_filt = cfg.p_bias_pos_kpa;
+      state.p_neg_ref_filt = cfg.p_bias_neg_kpa;
+      state.initialized   = true;
+      dbg_all.insert(dbg_all.end(), {angle, angle_ref, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
+      continue;
+    }
 
-  // 적분 (부호 반전 시 리셋: 목표 반대 방향으로 쌓인 적분이 오버슈트를 유발하지 않도록)
-  if ((error > 0.0 && pos_ctrl_state_.integral < 0.0) ||
-      (error < 0.0 && pos_ctrl_state_.integral > 0.0)) {
-    pos_ctrl_state_.integral = 0.0;
-  }
-  // 적분 (와인드업 방지: 포화 전 클램핑)
-  pos_ctrl_state_.integral += error * dt_sec;
-  const double integ_limit = (std::abs(pos_ctrl_cfg_.ki) > 1e-9)
-                             ? pos_ctrl_cfg_.integral_limit_kpa / pos_ctrl_cfg_.ki
-                             : 0.0;
-  pos_ctrl_state_.integral = std::clamp(pos_ctrl_state_.integral, -integ_limit, integ_limit);
+    // ── 각속도 추정 (유한차분 + LPF) ──
+    const double vel_raw = (angle - state.prev_angle) / dt_sec;   // [deg/s]
+    state.vel_filt = cfg.vel_filter_alpha * vel_raw
+                    + (1.0 - cfg.vel_filter_alpha) * state.vel_filt;
+    state.prev_angle = angle;
+    const double vel = state.vel_filt;
 
-  const double p_pid = pos_ctrl_cfg_.kp * error
-                     + pos_ctrl_cfg_.ki * pos_ctrl_state_.integral
-                     - pos_ctrl_cfg_.kd * vel;   // 미분: 측정값 미분 (setpoint kick 방지)
+    // ── PID ──
+    // actuator_connected_=false 이면 엔코더가 실제로 움직이지 않아 error가 절대 해소되지
+    // 않는다. 이 상태에서 PID를 그대로 돌리면 kp*error(비례항은 클램프 없음)가 각도 명령에
+    // 비례해 무한정 커져 45°만 넘어도 p_pos_max_kpa에 곧장 포화되고, 45/60/90°가 전부 같은
+    // 압력으로 뭉개진다 (20260818, 액추에이터 미연결 압력추종 테스트 중 확인).
+    // → 액추에이터 미연결 시에는 PID를 끄고, 아래 중력 FF만으로 목표압력을 생성한다.
+    const double error = angle_ref - angle;
+    double p_pid = 0.0;
 
-  // ── 중력 피드포워드 ──
-  // τ = m·g·L·cos(90°-angle) = m·g·L·sin(angle_rad)
-  const double angle_rad = angle * M_PI / 180.0;
-  const double tau_gravity = pos_ctrl_cfg_.mass_kg * 9.81
-                            * pos_ctrl_cfg_.link_length_m
-                            * std::sin(angle_rad);          // [N·m]
-  const double p_ff = pos_ctrl_cfg_.kff_gravity * tau_gravity;   // [kPa]
+    if (actuator_connected_) {
+      // 적분 (부호 반전 시 리셋: 목표 반대 방향으로 쌓인 적분이 오버슈트를 유발하지 않도록)
+      if ((error > 0.0 && state.integral < 0.0) ||
+          (error < 0.0 && state.integral > 0.0)) {
+        state.integral = 0.0;
+      }
+      // 적분 (와인드업 방지: 포화 전 클램핑)
+      state.integral += error * dt_sec;
+      const double integ_limit = (std::abs(cfg.ki) > 1e-9)
+                                 ? cfg.integral_limit_kpa / cfg.ki
+                                 : 0.0;
+      state.integral = std::clamp(state.integral, -integ_limit, integ_limit);
 
-  // ── 마찰 보상 (쿨롱) ── error 방향으로 보상 (vel 방향은 수축 필요 시 역방향 힘을 줌)
-  double p_friction = 0.0;
-  if (std::abs(error) > 0.3) {
-    p_friction = pos_ctrl_cfg_.friction_kpa * (error > 0.0 ? 1.0 : -1.0);
-  }
+      p_pid = cfg.kp * error
+            + cfg.ki * state.integral
+            - cfg.kd * vel;   // 미분: 측정값 미분 (setpoint kick 방지)
+    }
 
-  // ── 합산 및 압력 레퍼런스 생성 ──
-  const double delta = p_pid + p_ff + p_friction;
+    // ── 중력 피드포워드 ──
+    // τ = m·g·L·cos(90°-angle) = m·g·L·sin(angle_rad)
+    // actuator_connected_=false: 실제 각도가 고정돼 있으므로 목표각(angle_ref) 기준으로
+    // 계산해야 각도 명령이 실제로 서로 다른 목표압력에 매핑된다.
+    const double ff_angle = actuator_connected_ ? angle : angle_ref;
+    const double angle_rad = ff_angle * M_PI / 180.0;
+    const double tau_gravity = cfg.mass_kg * 9.81
+                              * cfg.link_length_m
+                              * std::sin(angle_rad);          // [N·m]
+    const double p_ff = cfg.kff_gravity * tau_gravity;   // [kPa]
 
-  const double p_pos_unsat = pos_ctrl_cfg_.p_bias_pos_kpa + delta;
-  double p_pos = std::clamp(p_pos_unsat,
-    pos_ctrl_cfg_.p_pos_min_kpa, pos_ctrl_cfg_.p_pos_max_kpa);
+    // ── 마찰 보상 (쿨롱) ── error 방향으로 보상 (vel 방향은 수축 필요 시 역방향 힘을 줌)
+    // 액추에이터 미연결 시에는 실제 움직임이 없으므로 마찰 보상도 의미가 없어 생략.
+    double p_friction = 0.0;
+    if (actuator_connected_ && std::abs(error) > 0.3) {
+      p_friction = cfg.friction_kpa * (error > 0.0 ? 1.0 : -1.0);
+    }
 
-  double p_neg = std::clamp(
-    pos_ctrl_cfg_.p_bias_neg_kpa - delta * pos_ctrl_cfg_.neg_coupling,
-    pos_ctrl_cfg_.p_neg_min_kpa, pos_ctrl_cfg_.p_neg_max_kpa);
+    // ── 합산 및 압력 레퍼런스 생성 ──
+    const double delta = p_pid + p_ff + p_friction;
 
-  // P+ 포화 & 연장 방향 오차 시 음압 독립 구동
-  // neg_coupling은 delta에 비례하므로 P+가 천장(anti-windup으로 delta 동결)에
-  // 걸리면 P-도 같이 멈춤. error>0인 동안 P-를 p_neg_min으로 독립 구동해
-  // 차압을 최대화한다.
-  if (p_pos_unsat > pos_ctrl_cfg_.p_pos_max_kpa && error > 0.0) {
-    p_neg = pos_ctrl_cfg_.p_neg_min_kpa;
-  }
+    const double p_pos_unsat = cfg.p_bias_pos_kpa + delta;
+    double p_pos = std::clamp(p_pos_unsat, cfg.p_pos_min_kpa, cfg.p_pos_max_kpa);
 
-  // 포화 시 적분 되돌리기 (back-calculation anti-windup)
-  // 오차 방향과 같은 방향으로 포화된 경우에만 취소:
-  //   - 연장 필요(error>0)인데 p_pos가 최대에 걸림 → 더 밀어봤자 의미없음
-  //   - 수축 필요(error<0)인데 p_pos가 최소에 걸림 → 중력이 이미 수축 중, 적분은 계속 쌓음
-  const bool sat_same_dir = (p_pos_unsat > pos_ctrl_cfg_.p_pos_max_kpa && error > 0.0) ||
-                            (p_pos_unsat < pos_ctrl_cfg_.p_pos_min_kpa && error < 0.0);
-  if (sat_same_dir && std::abs(pos_ctrl_cfg_.ki) > 1e-9) {
-    pos_ctrl_state_.integral -= error * dt_sec;   // 이번 적분 취소
-  }
+    double p_neg = std::clamp(
+      cfg.p_bias_neg_kpa - delta * cfg.neg_coupling,
+      cfg.p_neg_min_kpa, cfg.p_neg_max_kpa);
 
-  // mpc_ref_kpa_ 에 기록 (MPC 내층이 이 값을 압력 레퍼런스로 사용)
-  {
-    std::lock_guard<std::mutex> lk(mpc_ref_mtx_);
-    const int pg = pos_ctrl_cfg_.pos_gid;
-    const int ng = pos_ctrl_cfg_.neg_gid;
-    if (pg >= 0 && pg < (int)mpc_ref_kpa_.size()) mpc_ref_kpa_[pg] = p_pos;
-    if (ng >= 0 && ng < (int)mpc_ref_kpa_.size()) mpc_ref_kpa_[ng] = p_neg;
+    // P+ 포화 & 연장 방향 오차 시 음압 독립 구동
+    // neg_coupling은 delta에 비례하므로 P+가 천장(anti-windup으로 delta 동결)에
+    // 걸리면 P-도 같이 멈춤. error>0인 동안 P-를 p_neg_min으로 독립 구동해
+    // 차압을 최대화한다.
+    if (p_pos_unsat > cfg.p_pos_max_kpa && error > 0.0) {
+      p_neg = cfg.p_neg_min_kpa;
+    }
+
+    // 포화 시 적분 되돌리기 (back-calculation anti-windup)
+    // 오차 방향과 같은 방향으로 포화된 경우에만 취소:
+    //   - 연장 필요(error>0)인데 p_pos가 최대에 걸림 → 더 밀어봤자 의미없음
+    //   - 수축 필요(error<0)인데 p_pos가 최소에 걸림 → 중력이 이미 수축 중, 적분은 계속 쌓음
+    const bool sat_same_dir = (p_pos_unsat > cfg.p_pos_max_kpa && error > 0.0) ||
+                              (p_pos_unsat < cfg.p_pos_min_kpa && error < 0.0);
+    if (actuator_connected_ && sat_same_dir && std::abs(cfg.ki) > 1e-9) {
+      state.integral -= error * dt_sec;   // 이번 적분 취소
+    }
+
+    // ── 압력 레퍼런스 슬루레이트 제한 ──
+    // p_pos/p_neg가 한 tick에서 크게 점프하면(예: 위치명령 변경) 밸브모델-실제 불일치로
+    // 큰 실압력 스파이크가 발생할 수 있으므로, MPC에 넘기는 레퍼런스 자체를
+    // ref_slew_kpa_per_s 로 제한된 램프로 바꿔 서서히 목표에 도달하게 한다.
+    const double max_step = cfg.ref_slew_kpa_per_s * dt_sec;
+    state.p_pos_ref_filt += std::clamp(p_pos - state.p_pos_ref_filt, -max_step, max_step);
+    state.p_neg_ref_filt += std::clamp(p_neg - state.p_neg_ref_filt, -max_step, max_step);
+    p_pos = state.p_pos_ref_filt;
+    p_neg = state.p_neg_ref_filt;
+
+    // mpc_ref_kpa_ 에 기록 (MPC 내층이 이 값을 압력 레퍼런스로 사용)
+    {
+      std::lock_guard<std::mutex> lk(mpc_ref_mtx_);
+      const int pg = cfg.pos_gid;
+      const int ng = cfg.neg_gid;
+      if (pg >= 0 && pg < (int)mpc_ref_kpa_.size()) mpc_ref_kpa_[pg] = p_pos;
+      if (ng >= 0 && ng < (int)mpc_ref_kpa_.size()) mpc_ref_kpa_[ng] = p_neg;
+    }
+
+    dbg_all.insert(dbg_all.end(), {angle, angle_ref, p_pos, p_neg, p_pid, p_ff, p_friction, vel});
+
+    // 500Hz × 250 = 0.5초마다 출력
+    if (tick_ % 250 == 0) {
+      RCLCPP_INFO(get_logger(),
+        "[PosCtrl axis%d] θ=%.2f°  ref=%.2f°  err=%+.2f°  vel=%+.1fdps | "
+        "pid=%+.1f ff=%.1f fric=%+.1f → P+=%.1f  P-=%.1f kPa",
+        a, angle, angle_ref, error, vel, p_pid, p_ff, p_friction, p_pos, p_neg);
+    }
   }
 
   // 디버그 토픽 발행 (500Hz → 구독 측에서 다운샘플 권장)
-  // [angle, angle_ref, p_pos_ref, p_neg_ref, p_pid, p_ff, p_friction, vel_dps]
+  // 축마다 8개씩 이어붙임: [angle, angle_ref, p_pos_ref, p_neg_ref, p_pid, p_ff, p_friction, vel_dps] × n
   if (pub_pos_dbg_) {
     std_msgs::msg::Float64MultiArray dbg;
-    dbg.data = {angle, angle_ref, p_pos, p_neg, p_pid, p_ff, p_friction, vel};
+    dbg.data = dbg_all;
     pub_pos_dbg_->publish(dbg);
-  }
-
-  // 500Hz × 250 = 0.5초마다 출력
-  if (tick_ % 250 == 0) {
-    RCLCPP_INFO(get_logger(),
-      "[PosCtrl] θ=%.2f°  ref=%.2f°  err=%+.2f°  vel=%+.1fdps | "
-      "pid=%+.1f ff=%.1f fric=%+.1f → P+=%.1f  P-=%.1f kPa",
-      angle, angle_ref, error, vel, p_pid, p_ff, p_friction, p_pos, p_neg);
   }
 }
 

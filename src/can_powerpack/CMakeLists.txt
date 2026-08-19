@@ -113,12 +113,14 @@ install(PROGRAMS
   scripts/dashboard.py
   scripts/can_monitor.py
   scripts/can_control.py
+  scripts/can_test.py
   scripts/log_topics.py
   scripts/self_test_ref_server.py
   scripts/diagnostic_check.py
   scripts/live_control.py
   scripts/pp_monitor.py
   scripts/pp_logger.py
+  scripts/position_ref_client.py
   scripts/run_powerpack.sh
   DESTINATION lib/${PROJECT_NAME}
 )

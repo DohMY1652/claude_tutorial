@@ -64,8 +64,10 @@ private:
   std::vector<std::array<double, 3>> current_snapshot_;     // [bid][0..2], bid 0..18
   std::vector<uint16_t> analog_snapshot_;                   // [0..8] → board 17..25
   std::set<int> active_encoder_boards_;                     // board IDs to read (empty = all)
-  double enc_offset_{1740.0};   // orig_mV at 0 degrees
-  double enc_gain_{0.07570};    // deg/mV = 105/(3127-1740)
+  // 보드별 엔코더 캘리브레이션 (index = board_id, [0]은 미사용). 기본값은 encoder_offset/encoder_gain,
+  // EncoderCalibration.boards.<id> 로 보드별 override 가능.
+  std::array<double, NUM_BOARDS + 1> enc_offset_{};   // orig_mV at 0 degrees
+  std::array<double, NUM_BOARDS + 1> enc_gain_{};     // deg/mV
   std::mutex sensor_mtx_;
 
   // board/sensors  : boards 1..18 pressure (18 values, index 0 = board 1)

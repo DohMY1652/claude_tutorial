@@ -33,7 +33,8 @@ class MonitorNode(Node):
         self._currents = {}
         self._refs     = [101.325] * NUM_CHANNELS
         self._encoders = []
-        # position_dbg: [angle, angle_ref, p_pos, p_neg, p_pid, p_ff, p_friction, vel_dps]
+        # position_dbg: 축마다 8개씩 이어붙임
+        # [angle, angle_ref, p_pos, p_neg, p_pid, p_ff, p_friction, vel_dps] × num_actuators
         self._pos_dbg  = None
 
         ns = NAMESPACE
@@ -112,16 +113,19 @@ def build_display(kpa, currents, refs, encoders, pos_dbg, display_on):
         o += '  (no encoder data)\n'
 
     # ── 위치 제어 상태 (position_dbg 수신 시만 표시) ──
-    # pos_dbg: [angle, angle_ref, p_pos, p_neg, p_pid, p_ff, p_friction, vel_dps]
+    # pos_dbg: 축마다 8개씩 이어붙임 [angle, angle_ref, p_pos, p_neg, p_pid, p_ff, p_friction, vel_dps] × N
     o += SEP + '\n'
     o += ' Position Control\n'
     if pos_dbg and len(pos_dbg) >= 8:
-        angle, angle_ref, p_pos, p_neg, p_pid, p_ff, p_fric, vel = pos_dbg[:8]
-        err = angle_ref - angle
-        o += (f'  Angle : now={angle:6.2f} deg   target={angle_ref:6.2f} deg'
-              f'   err={err:+6.2f} deg   vel={vel:+6.1f} dps\n')
-        o += (f'  Output: P+={p_pos:6.1f} kPa   P-={p_neg:6.1f} kPa'
-              f'   (pid={p_pid:+5.1f}  ff={p_ff:+5.1f}  fric={p_fric:+5.1f})\n')
+        for start in range(0, len(pos_dbg) - len(pos_dbg) % 8, 8):
+            axis = start // 8
+            angle, angle_ref, p_pos, p_neg, p_pid, p_ff, p_fric, vel = pos_dbg[start:start+8]
+            err = angle_ref - angle
+            o += f' [Axis {axis}]\n'
+            o += (f'  Angle : now={angle:6.2f} deg   target={angle_ref:6.2f} deg'
+                  f'   err={err:+6.2f} deg   vel={vel:+6.1f} dps\n')
+            o += (f'  Output: P+={p_pos:6.1f} kPa   P-={p_neg:6.1f} kPa'
+                  f'   (pid={p_pid:+5.1f}  ff={p_ff:+5.1f}  fric={p_fric:+5.1f})\n')
     else:
         o += '  (위치 제어 비활성 또는 데이터 없음 — control_mode=0 이거나 TCP 미수신)\n'
 

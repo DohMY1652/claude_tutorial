@@ -22,13 +22,15 @@ CMD_ID_GRP1 = 0x100
 
 CMD_ID_GRP2 = 0x101
 
+CMD_ID_GRP3 = 0x102  # 보드 18~22 (향후 액추에이터 대비, 임시/미확정 ID)
+
 ESTOP_ID    = 0x000
 
 
 
 # ================= 전역 변수 =================
 
-targets = [[0, 0, 0] for _ in range(18)]
+targets = [[0, 0, 0] for _ in range(23)]
 
 current_mode = 0    # 0:Normal, 1:Debug
 
@@ -106,6 +108,24 @@ def tx_thread_func(ch):
 
 
 
+            # Group 3 (보드 18~22, 향후 액추에이터 대비)
+
+            payload_g3 = b''
+
+            for bid in range(18, 23):
+
+                v1, v2, v3 = targets[bid]
+
+                payload_g3 += struct.pack('<HHH', v1, v2, v3)
+
+            payload_g3 += struct.pack('<BB', current_mode, control_type)
+
+            payload_g3 += b'\x00' * (32 - len(payload_g3))
+
+            ch.write(Frame(id_=CMD_ID_GRP3, data=payload_g3, flags=canlib.MessageFlag.FDF | canlib.MessageFlag.BRS))
+
+
+
             time.sleep(0.05)
 
         except:
@@ -135,6 +155,8 @@ def main():
     print(f"  > ALL 500 0 0   : 전체 보드 제어")
 
     print(f"  > 0             : 긴급 정지 (ESTOP)")
+
+    print(f"  * 보드 1~22 제어 가능 (18~22는 액추에이터 추가 전이라 무반응이 정상)")
 
     print(f" [모드 설정]")
 
@@ -188,7 +210,7 @@ def main():
 
             if user_input == '0':
 
-                targets = [[0, 0, 0] for _ in range(18)]
+                targets = [[0, 0, 0] for _ in range(23)]
 
                 ch.write(Frame(id_=ESTOP_ID, data=b'', flags=canlib.MessageFlag.FDF | canlib.MessageFlag.BRS))
 
@@ -250,7 +272,7 @@ def main():
 
                     control_type = 2
 
-                    targets = [[0, 0, 0] for _ in range(18)]
+                    targets = [[0, 0, 0] for _ in range(23)]
 
                     try:
 
@@ -270,7 +292,7 @@ def main():
 
                     v1, v2, v3 = int(parts[1]), int(parts[2]), int(parts[3])
 
-                    for i in range(1, 18): targets[i] = [v1, v2, v3]
+                    for i in range(1, 23): targets[i] = [v1, v2, v3]
 
                     print(" -> [ALL] Updated")
 

@@ -37,7 +37,7 @@ def generate_launch_description():
 
     monitor = ExecuteProcess(
         cmd=[
-            'gnome-terminal', '--',
+            'gnome-terminal', '--maximize', '--',
             'bash', '-c',
             f'source {setup_bash} && python3 {monitor_path}; '
             f'echo "monitor exited — press Enter to close"; read',

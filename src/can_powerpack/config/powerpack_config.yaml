@@ -4,11 +4,20 @@
 /pack2/can_bridge:
   ros__parameters:
     can_channel: 0
-    num_actuators: 1
+    num_actuators: 1   # 1축만 구동 테스트 (3→1)
     current_mode: 0   # 0=Normal(PID), 1=Debug(PWM direct)
     control_type: 0   # 0=PID, 1=PWM, 2=ID, 3=ZERO
-    encoder_offset: 1740.0   # orig_mV at 0 degrees (after inverting amp recovery)
-    encoder_gain: 0.07570    # deg/mV = 105 / (3127 - 1740)
+    encoder_offset: 1740.0   # orig_mV at 0 degrees (after inverting amp recovery) — 보드별 override 없을 때 기본값
+    encoder_gain: 0.07570    # deg/mV = 105 / (3127 - 1740)                        — 보드별 override 없을 때 기본값
+
+    # 보드별 엔코더 캘리브레이션 override (raw ADC 실측 2점 보정: 0도/90도)
+    # raw_0deg/raw_90deg 값만 입력하면 CanBridge가 offset/gain을 자동 계산함
+    # (angle = (orig_mV - offset) * gain,  orig_mV = (4125 - raw*3300/4095) / 0.825)
+    EncoderCalibration:
+      boards:
+        "17": { raw_0deg: 1200, raw_90deg: 2470 }
+        "18": { raw_0deg: 860,  raw_90deg: 2000 }
+        "19": { raw_0deg: 2115, raw_90deg: 3155 }
 
 # ==========================================
 # Node 2: PP Controller (Control Algorithm)
@@ -26,15 +35,15 @@
     # ──────────────────────────────────────────
     num_total_channels: 12
     num_positive_channels: 6
-    num_actuators: 1    # 액추에이터 수 → 양압/음압/엔코더 보드 자동 활성화
-    sensor_filter_alpha: 1.0
+    num_actuators: 1    # 1축만 구동 테스트 (3→1) — 액추에이터 수 → 양압/음압/엔코더 보드 + 위치제어기 축 자동 활성화
+    sensor_filter_alpha: 0.2   # 1.0→0.2: 액추에이터 미연결 시 라인압 진동 억제용 저역통과 필터
 
     # 액추에이터 연결 여부
     # false: 고정 탱크 볼륨 사용 (actuator/volumes_ml 토픽 무시)
     # true : actuator/volumes_ml 토픽으로 볼륨 업데이트
     actuator_connected: false
-    tank_volume_pos_ml: 750.0   # 양압 채널 탱크 볼륨 [mL]
-    tank_volume_neg_ml: 400.0   # 음압 채널 탱크 볼륨 [mL]
+    tank_volume_pos_ml: 50.0   # 양압 채널 탱크 볼륨 [mL]   750→50 (액추에이터 미연결 시 실제 연결 부피는 튜빙/매니폴드뿐이라 훨씬 작음 — 20260818 과압 스파이크 원인)
+    tank_volume_neg_ml: 50.0   # 음압 채널 탱크 볼륨 [mL]   400→50 (위와 동일 사유)
 
     # 보드 배정:
     #   1~2  : MICRO 양압(board1), 음압(board2)  → 라인압 센서 + PID 밸브
@@ -175,8 +184,8 @@
 
     # 제어 모드 선택
     # 0: 압력 제어 — TCP가 [double pos_kpa, double neg_kpa] 수신 → MPC 직접 구동
-    # 1: 위치 제어 — TCP가 [double angle_ref_deg, double(미사용)] 수신
-    #               → 위치 PID + 중력 FF → 압력 레퍼런스 → MPC
+    # 1: 위치 제어 — TCP가 num_actuators개의 double angle_ref_deg 수신 (축0, 축1, 축2 순)
+    #               → 축별 위치 PID + 중력 FF → 압력 레퍼런스 → MPC
     control_mode: 1
 
     RefTcpServer:
@@ -189,66 +198,120 @@
     # 위치 제어기 (control_mode: 1 일 때 동작)
     # 외층 PID: 각도 오차 [deg] → 압력 보정 [kPa]
     # 내층 MPC: 압력 레퍼런스 → 밸브 PWM  (기존 동일)
+    # 축(axis)마다 하나씩, num_actuators 개수만큼 axis0/axis1/... 로 설정.
+    # 3개 액추에이터 모두 동일 사양이라 PID/FF/바이어스/제한값은 세 축 모두 동일하게 두고
+    # actuator_idx/pos_gid/neg_gid 만 축별로 다르게 지정 (0=board17/gid0/gid6, 1=board18/gid1/gid7, 2=board19/gid2/gid8)
     # ──────────────────────────────────────────
     PositionController:
-      # PID 게인 (각도 → 압력)
-      kp: 0.8              # 비례 [kPa/deg]   0.6→0.8 (고각도 추종 개선)
-      ki: 1.5              # 적분 [kPa/(deg·s)]  0.15→0.2→1.5 (고각도 적분 수렴속도 개선, 20260706 로그 분석)
-      kd: 0.05             # 미분 (측정값 미분) [kPa·s/deg]
+      axis0:
+        # PID 게인 (각도 → 압력)
+        kp: 0.8              # 비례 [kPa/deg]   0.6→0.8 (고각도 추종 개선)
+        ki: 0.3              # 적분 [kPa/(deg·s)]  0.15→0.2→1.5→0.3 (1.5는 45°스텝에서 0.75초만에 적분 클램프 포화 → 0~100° 리밋사이클 진동, board17 액추에이터 손상. 20260809 로그 분석)
+        kd: 0.05             # 미분 (측정값 미분) [kPa·s/deg]
 
-      # 중력 피드포워드
-      # P_ff = kff_gravity × m × g × L × sin(angle_rad)  [kPa]
-      # kff_gravity ≈ 1 / (A_piston × moment_arm) / 1000
-      # A = π×0.025² = 1.963e-3 m²,  moment_arm ≈ 0.05 m  → kff ≈ 10.2 kPa/(N·m)
-      kff_gravity: 3.0     # [kPa per N·m of gravity torque]
-      mass_kg: 5.0         # 부하 질량 [kg]   1.0→5.0 (5kg하중 FF 정상화)
-      link_length_m: 0.2   # 링크 길이 (중력 모멘트 암) [m]
+        # 중력 피드포워드
+        # P_ff = kff_gravity × m × g × L × sin(angle_rad)  [kPa]
+        # kff_gravity ≈ 1 / (A_piston × moment_arm) / 1000
+        # A = π×0.025² = 1.963e-3 m²,  moment_arm ≈ 0.05 m  → kff ≈ 10.2 kPa/(N·m)
+        kff_gravity: 3.0     # [kPa per N·m of gravity torque]
+        mass_kg: 5.0         # 부하 질량 [kg]   1.0→5.0 (5kg하중 FF 정상화)
+        link_length_m: 0.2   # 링크 길이 (중력 모멘트 암) [m]
 
-      # 마찰 보상 (쿨롱 마찰)
-      friction_kpa: 3.0         # 마찰 보상 크기 [kPa]   2.0→3.0 (5kg 마찰 증가)
-      vel_deadband_dps: 0.5     # 속도 데드밴드 [deg/s]: 미만이면 정적마찰 보상
+        # 마찰 보상 (쿨롱 마찰)
+        friction_kpa: 3.0         # 마찰 보상 크기 [kPa]   2.0→3.0 (5kg 마찰 증가)
+        vel_deadband_dps: 0.5     # 속도 데드밴드 [deg/s]: 미만이면 정적마찰 보상
 
-      # 바이어스 (평형점 압력)
-      p_bias_pos_kpa: 105.0    # 양압 챔버 기준압 [kPa abs]
-      p_bias_neg_kpa: 90.0     # 음압 챔버 기준압 [kPa abs] (대기압 이하 = 진공)
+        # 바이어스 (평형점 압력)
+        p_bias_pos_kpa: 105.0    # 양압 챔버 기준압 [kPa abs]
+        p_bias_neg_kpa: 90.0     # 음압 챔버 기준압 [kPa abs] (대기압 이하 = 진공)
 
-      # 음압 커플링: P_neg = p_bias_neg - delta × neg_coupling
-      # 0: 음압 챔버 고정, 1: 완전 차동
-      neg_coupling: 1.0     # delta=64(실측 최대)시 P-=90-64×1.0=26→clamp→27 kPa
+        # 음압 커플링: P_neg = p_bias_neg - delta × neg_coupling
+        # 0: 음압 챔버 고정, 1: 완전 차동
+        neg_coupling: 1.0     # delta=64(실측 최대)시 P-=90-64×1.0=26→clamp→27 kPa
 
-      # 출력 압력 제한
-      p_pos_max_kpa: 185.0     # 양압 최대 [kPa]  180→185 (고각도 도달 허용)
-      p_pos_min_kpa: 101.325   # 양압 최소 (대기압) [kPa]
-      p_neg_max_kpa: 101.325   # 음압 최대 (대기압) [kPa]
-      p_neg_min_kpa: 27.0      # 음압 최소 [kPa] — 에젝터 한계 실측값
+        # 출력 압력 제한
+        p_pos_max_kpa: 185.0     # 양압 최대 [kPa]  180→185 (고각도 도달 허용)
+        p_pos_min_kpa: 101.325   # 양압 최소 (대기압) [kPa]
+        p_neg_max_kpa: 101.325   # 음압 최대 (대기압) [kPa]
+        p_neg_min_kpa: 27.0      # 음압 최소 [kPa] — 에젝터 한계 실측값
 
-      # 액추에이터 / 엔코더 선택
-      actuator_idx: 0    # 엔코더 인덱스 (0 = board17, 1 = board18, ...)
-      pos_gid: 0         # 제어할 양압 채널 global_id
-      neg_gid: 6         # 제어할 음압 채널 global_id
+        # 액추에이터 / 엔코더 선택
+        actuator_idx: 0    # 엔코더 인덱스 (0 = board17, 1 = board18, 2 = board19)
+        pos_gid: 0         # 제어할 양압 채널 global_id
+        neg_gid: 6         # 제어할 음압 채널 global_id
 
-      # 속도 추정 LPF (엔코더 노이즈 억제)
-      vel_filter_alpha: 0.05   # 작을수록 강한 필터 (0 < α ≤ 1)
+        # 속도 추정 LPF (엔코더 노이즈 억제)
+        vel_filter_alpha: 0.05   # 작을수록 강한 필터 (0 < α ≤ 1)
 
-      # TCP 미연결 시 기본 목표 각도
-      default_angle_deg: 0.0
+        # TCP 미연결 시 기본 목표 각도
+        default_angle_deg: 0.0
 
-      # 적분 와인드업 방지: 적분항 최대값 [kPa]
-      # p_pos_max(185) - p_bias_pos(105) - ff_max(29.4@90deg) - friction(3) = 47.6 kPa 여유 내에서 설정
-      integral_limit_kpa: 45.0  # 20→25→45 (90도 근처 필요분 ~32kPa 이상 확보, 안전마진 유지)
+        # 적분 와인드업 방지: 적분항 최대값 [kPa]
+        # p_pos_max(185) - p_bias_pos(105) - ff_max(29.4@90deg) - friction(3) = 47.6 kPa 여유 내에서 설정
+        integral_limit_kpa: 45.0
+
+        # 압력 레퍼런스 슬루레이트 제한 [kPa/s] — 목표압력이 한 번에 점프하지 않도록 제한
+        # (20260818: 각도명령 변경 시 목표압력이 즉시 뛰면서 190kPa 안전한계에서 릴레이 진동 발생 → 완화)
+        ref_slew_kpa_per_s: 3.0
+
+      axis1:
+        kp: 0.8
+        ki: 0.3
+        kd: 0.05
+        kff_gravity: 3.0
+        mass_kg: 5.0
+        link_length_m: 0.2
+        friction_kpa: 3.0
+        vel_deadband_dps: 0.5
+        p_bias_pos_kpa: 105.0
+        p_bias_neg_kpa: 90.0
+        neg_coupling: 1.0
+        p_pos_max_kpa: 185.0
+        p_pos_min_kpa: 101.325
+        p_neg_max_kpa: 101.325
+        p_neg_min_kpa: 27.0
+        actuator_idx: 1    # board18
+        pos_gid: 1         # board6
+        neg_gid: 7         # board12
+        vel_filter_alpha: 0.05
+        default_angle_deg: 0.0
+        integral_limit_kpa: 45.0
+
+      axis2:
+        kp: 0.8
+        ki: 0.3
+        kd: 0.05
+        kff_gravity: 3.0
+        mass_kg: 5.0
+        link_length_m: 0.2
+        friction_kpa: 3.0
+        vel_deadband_dps: 0.5
+        p_bias_pos_kpa: 105.0
+        p_bias_neg_kpa: 90.0
+        neg_coupling: 1.0
+        p_pos_max_kpa: 185.0
+        p_pos_min_kpa: 101.325
+        p_neg_max_kpa: 101.325
+        p_neg_min_kpa: 27.0
+        actuator_idx: 2    # board19
+        pos_gid: 2         # board7
+        neg_gid: 8         # board13
+        vel_filter_alpha: 0.05
+        default_angle_deg: 0.0
+        integral_limit_kpa: 45.0
 
     LinePID:
       pos:
-        kp: 0.5
-        ki: 0.1
-        kd: 0.0
-        ref: 400.0
+        kp: 0.18              # 0.5→0.2→0.08→0.12→0.18: 100~120대 리플 지속 → 목표(155) 근접 위해 추가 상향 (20260818)
+        ki: 0.0                # 0.1→0.02→0.0: 적분에 의한 리밋사이클 소지 자체를 제거 (순수 P+D)
+        kd: 0.05              # 0.0→0.02→0.03→0.05: 감쇠 추가 강화로 리플 억제
+        ref: 155.0      # 400→155: 목표압력 범위(105~134 kPa)에 맞춰 라인압-목표압 차이를 줄여 소개도 구간 과잉유입/릴레이 진동 억제 (20260818)
         pwm_index: 0    # (board 1 - 1)*3 + 0 = 0
 
       neg:
-        kp: 2.0
-        ki: 0.2
-        kd: 0.0
+        kp: 0.8               # 2.0→0.8: 위와 동일한 사유로 하향
+        ki: 0.04              # 0.2→0.04
+        kd: 0.01              # 0.0→0.01
         ref: 30.0         # 50→30: 강한 진공 라인 공급
         pwm_index: 3    # (board 2 - 1)*3 + 0 = 3
 
@@ -269,10 +332,10 @@
       leakage_u_pos: 0.0
       leakage_u_neg: 0.0
 
-      target_time_constant: 1.0
+      target_time_constant: 8.0   # 1.0→4.0→8.0: 2초 릴레이 주기가 이 값에 비례하는지 확인용 실험 (threshold=1.5 유지, 20260818)
 
-      macro_threshold : 10.0   # 17→10: 음압 macro 더 적극 개방
-      actuating_threshold : 2.0
+      macro_threshold : 50.0   # 10→50: 50mL 소부피 단일채널 테스트에선 macro(대유량) 개입 시 과압 스파이크 유발 → 거의 안 열리게 상향 (20260818)
+      actuating_threshold : 1.5   # 2.0→5.0→1.5: 2.4초 릴레이 진동이 데드존-크로싱 기전인지 확인용 실험 (20260818)
 
 
     pressure_safety_limit_kpa: 190.0        # 170→190: p_pos_max=180 이므로 여유 확보

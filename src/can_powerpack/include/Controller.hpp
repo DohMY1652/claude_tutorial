@@ -341,8 +341,9 @@ public:
         int port = 2293;
         int pos_gid = 0;
         int neg_gid = 6;
+        int num_values = 2;   // doubles per TCP message (2 = pressure mode, N = N-axis angle mode)
     };
-    using Callback = std::function<void(double pos_kpa, double neg_kpa)>;
+    using Callback = std::function<void(const std::vector<double>&)>;
 
     RefTcpServer(const Config& cfg, Callback cb);
     ~RefTcpServer();
@@ -392,6 +393,7 @@ private:
 
   int num_positive_channels_{8};
   int num_total_channels_{12};
+  int num_actuators_{1};   // 액추에이터(축) 수 → 압력채널/엔코더/위치제어기 모두 이 값만큼 활성화
 
   int channel_board_offset_{4};   // board_id = gid + channel_board_offset
   int P_pos_board_id_{1};         // board carrying P_line_pos sensor
@@ -518,21 +520,31 @@ private:
     double vel_filter_alpha{0.05};
     double default_angle_deg{0.0};
     double integral_limit_kpa{20.0};
-  } pos_ctrl_cfg_;
+    // 압력 레퍼런스 슬루레이트 제한: 목표압력이 한 번에 점프하지 않도록 tick당 변화폭을 제한
+    // (액추에이터 미연결 압력추종 테스트 중 단차 명령 시 밸브모델-실제 불일치로 190kPa
+    //  안전한계에 계속 부딪히는 릴레이 진동 발생 → 20260818, 레퍼런스 자체를 느리게 변화시켜 방지)
+    double ref_slew_kpa_per_s{3.0};
+  };
 
   struct PositionCtrlState {
     double integral{0.0};
     double prev_angle{0.0};
     double vel_filt{0.0};    // 필터된 각속도 [deg/s]
     bool   initialized{false};
-  } pos_ctrl_state_;
+    double p_pos_ref_filt{101.325};   // 슬루레이트 제한 후 마지막 P+ 레퍼런스 [kPa]
+    double p_neg_ref_filt{101.325};   // 슬루레이트 제한 후 마지막 P- 레퍼런스 [kPa]
+  };
 
-  // TCP에서 수신한 목표 각도 (mpc_ref_mtx_ 로 보호)
-  double target_angle_deg_{0.0};
+  // 축(actuator)별 위치 제어기 설정/상태. 크기 = num_actuators_
+  std::vector<PositionCtrlConfig> pos_ctrl_cfg_;
+  std::vector<PositionCtrlState>  pos_ctrl_state_;
+
+  // TCP에서 수신한 축별 목표 각도 (mpc_ref_mtx_ 로 보호). 크기 = num_actuators_
+  std::vector<double> target_angle_deg_;
   bool   pos_tcp_received_{false};
 
   // 위치 제어 디버그 토픽
-  // data: [angle, angle_ref, p_pos_ref, p_neg_ref, p_pid, p_ff, p_friction, vel_dps]
+  // data: 축마다 8개씩 이어붙임 [angle, angle_ref, p_pos_ref, p_neg_ref, p_pid, p_ff, p_friction, vel_dps] × num_actuators_
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_pos_dbg_;
 
   int log_channel_id_{-1};

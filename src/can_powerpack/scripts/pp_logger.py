@@ -16,8 +16,12 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
 
-NAMESPACE = '/pack2'
-LOG_HZ    = 100.0
+NAMESPACE  = '/pack2'
+LOG_HZ     = 100.0
+NUM_AXES   = 3               # PositionController.axis0~2 (board17~19)
+POS_GIDS   = [0, 1, 2]       # axis별 양압 채널 global_id
+NEG_GIDS   = [6, 7, 8]       # axis별 음압 채널 global_id
+CHANNEL_BOARD_OFFSET = 5     # board_id = gid + CHANNEL_BOARD_OFFSET
 
 
 class PpLogger(Node):
@@ -26,7 +30,7 @@ class PpLogger(Node):
         self._lock = threading.Lock()
 
         # 데이터 버퍼
-        self._pos_dbg  = [0.0] * 8
+        self._pos_dbg  = [0.0] * (8 * NUM_AXES)
         self._sensors  = [101.325] * 25
         self._mpc_refs = [101.325] * 12
         self._encoders = [0.0] * 9
@@ -55,13 +59,15 @@ class PpLogger(Node):
         self._writer = csv.writer(self._file)
         self._rows   = []  # PNG 생성용 메모리 버퍼
 
-        header = [
-            'time_sec',
-            'angle_deg', 'target_deg', 'err_deg', 'vel_dps',
-            'pid_kpa', 'ff_kpa', 'fric_kpa',
-            'p_pos_ref_kpa', 'p_neg_ref_kpa',
-            'p_pos_actual_kpa',
-            'p_neg_actual_kpa',
+        header = ['time_sec']
+        for a in range(NUM_AXES):
+            header += [
+                f'angle_deg_axis{a}', f'target_deg_axis{a}', f'err_deg_axis{a}', f'vel_dps_axis{a}',
+                f'pid_kpa_axis{a}', f'ff_kpa_axis{a}', f'fric_kpa_axis{a}',
+                f'p_pos_ref_kpa_axis{a}', f'p_neg_ref_kpa_axis{a}',
+                f'p_pos_actual_kpa_axis{a}', f'p_neg_actual_kpa_axis{a}',
+            ]
+        header += [
             'p_line_pos_kpa',
             'p_line_neg_kpa',
             'p_macro_pos_kpa',
@@ -77,7 +83,7 @@ class PpLogger(Node):
 
     def _cb_pos_dbg(self, msg):
         with self._lock:
-            n = min(len(msg.data), 8)
+            n = min(len(msg.data), 8 * NUM_AXES)
             self._pos_dbg[:n] = list(msg.data[:n])
 
     def _cb_sensors(self, msg):
@@ -103,24 +109,31 @@ class PpLogger(Node):
             enc = list(self._encoders)
 
         elapsed = (self.get_clock().now().nanoseconds - self._start_ns) / 1e9
-        angle  = pos[0]
-        target = pos[1]
 
-        row = [
-            f'{elapsed:.4f}',
-            f'{angle:.4f}', f'{target:.4f}',
-            f'{target - angle:.4f}', f'{pos[7]:.4f}',
-            f'{pos[4]:.4f}', f'{pos[5]:.4f}', f'{pos[6]:.4f}',
-            f'{pos[2]:.4f}', f'{pos[3]:.4f}',
-            f'{sen[4]:.4f}',
-            f'{sen[10]:.4f}',
+        row = [f'{elapsed:.4f}']
+        axis_angles = []
+        for a in range(NUM_AXES):
+            angle, target, p_pos, p_neg, p_pid, p_ff, p_fric, vel = pos[a*8:(a+1)*8]
+            pos_board_idx = POS_GIDS[a] + CHANNEL_BOARD_OFFSET - 1
+            neg_board_idx = NEG_GIDS[a] + CHANNEL_BOARD_OFFSET - 1
+            row += [
+                f'{angle:.4f}', f'{target:.4f}',
+                f'{target - angle:.4f}', f'{vel:.4f}',
+                f'{p_pid:.4f}', f'{p_ff:.4f}', f'{p_fric:.4f}',
+                f'{p_pos:.4f}', f'{p_neg:.4f}',
+                f'{sen[pos_board_idx]:.4f}',
+                f'{sen[neg_board_idx]:.4f}',
+            ]
+            axis_angles.append((angle, target))
+
+        row += [
             f'{sen[0]:.4f}', f'{sen[1]:.4f}',
             f'{sen[2]:.4f}', f'{sen[3]:.4f}',
         ] + [f'{v:.4f}' for v in ref[:12]] \
           + [f'{enc[i]:.4f}' for i in range(6)]
 
         self._writer.writerow(row)
-        self._rows.append((elapsed, angle, target))
+        self._rows.append((elapsed, axis_angles))
 
     def _save_png(self):
         try:
@@ -129,29 +142,39 @@ class PpLogger(Node):
             import matplotlib.pyplot as plt
             import matplotlib.ticker as ticker
 
-            times   = [r[0] for r in self._rows]
-            angles  = [r[1] for r in self._rows]
-            targets = [r[2] for r in self._rows]
-
+            times = [r[0] for r in self._rows]
             if not times:
                 return
 
-            mean_err = sum(abs(a - t) for a, t in zip(angles, targets)) / len(times)
-            max_err  = max(abs(a - t) for a, t in zip(angles, targets))
+            # 축별 (실제, 목표) 각도 시퀀스
+            per_axis = [[r[1][a] for r in self._rows] for a in range(NUM_AXES)]
+
+            # 다크 서페이스용 categorical 팔레트 (blue/orange/aqua, all-pairs 검증됨)
+            axis_colors = ['#3987e5', '#d95926', '#199e70']
 
             fig, ax = plt.subplots(figsize=(12, 5))
             fig.patch.set_facecolor('#111418')
             ax.set_facecolor('#161b22')
 
-            ax.plot(times, targets, color='#4d94ff', linewidth=1.2,
-                    linestyle='--', label='목표 각도')
-            ax.plot(times, angles,  color='#2dd4a0', linewidth=1.5,
-                    label='실제 각도')
+            err_parts = []
+            for a in range(NUM_AXES):
+                angles  = [ang for ang, _ in per_axis[a]]
+                targets = [tgt for _, tgt in per_axis[a]]
+                color = axis_colors[a % len(axis_colors)]
+
+                ax.plot(times, targets, color=color, linewidth=1.1, linestyle='--',
+                        alpha=0.7, label=f'axis{a} 목표')
+                ax.plot(times, angles, color=color, linewidth=1.6,
+                        label=f'axis{a} 실제')
+
+                mean_err = sum(abs(x - y) for x, y in zip(angles, targets)) / len(times)
+                max_err  = max(abs(x - y) for x, y in zip(angles, targets))
+                err_parts.append(f'axis{a}: mean={mean_err:.2f}° max={max_err:.2f}°')
 
             ax.set_xlabel('Time (s)', color='#64748b', fontsize=10)
             ax.set_ylabel('Angle (deg)', color='#64748b', fontsize=10)
             ax.set_title(
-                f'{self._ts}    mean_err={mean_err:.2f}°  max_err={max_err:.2f}°',
+                f'{self._ts}    ' + '  |  '.join(err_parts),
                 color='#e2e8f0', fontsize=11, pad=10
             )
 
@@ -165,7 +188,7 @@ class PpLogger(Node):
             ax.xaxis.set_major_locator(ticker.MultipleLocator(10))
 
             legend = ax.legend(facecolor='#1e2630', edgecolor='#2a3441',
-                               labelcolor='#e2e8f0', fontsize=9)
+                               labelcolor='#e2e8f0', fontsize=9, ncol=NUM_AXES)
 
             plt.tight_layout()
             fig.savefig(self._png_path, dpi=150, facecolor=fig.get_facecolor())
