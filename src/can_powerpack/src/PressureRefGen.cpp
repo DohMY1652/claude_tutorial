@@ -107,7 +107,6 @@ double PressureRefGen::ejector_flow(double Pch_gauge, const SupplyState& sup,
 // ============================================================================
 void PressureRefGen::build_slew_box(const std::vector<AxisState>& axes, const SupplyState& sup,
                                     Eigen::VectorXd& lb, Eigen::VectorXd& ub,
-                                    Eigen::VectorXd& slewFpos, Eigen::VectorXd& slewFneg,
                                     Eigen::VectorXd& dP_rail_max, Eigen::VectorXd& dN_rail_max) const
 {
   const int N = p_.N;
@@ -148,10 +147,6 @@ void PressureRefGen::build_slew_box(const std::vector<AxisState>& axes, const Su
 
     lb(i) = loP; ub(i) = hiP; lb(N + i) = loN; ub(N + i) = hiN;
 
-    // 빠름 척도 (Jfast 용, w_fast=0 이면 미사용)
-    slewFpos(i) = std::max(dP_up * p_.Apos[(size_t)i], 1e-6);
-    slewFneg(i) = std::max(dN_dn * p_.Aneg[(size_t)i], 1e-6);
-
     // 레일만으로 도달 가능한 변화폭 → Jtank / Jeject 의 기준선
     dP_rail_max(i) = mfill * p_.dt * rt / Vp;
     dN_rail_max(i) = msuck * p_.dt * rt / Vn;
@@ -164,7 +159,6 @@ void PressureRefGen::build_slew_box(const std::vector<AxisState>& axes, const Su
 double PressureRefGen::objective(const Eigen::VectorXd& x, const Eigen::VectorXd& xp,
                                  const std::vector<double>& F_ref, const SupplyState& sup,
                                  const std::vector<AxisState>& /*axes*/,
-                                 const Eigen::VectorXd& slewFpos, const Eigen::VectorXd& slewFneg,
                                  const Eigen::VectorXd& dP_rail_max,
                                  const Eigen::VectorXd& dN_rail_max) const
 {
@@ -174,7 +168,7 @@ double PressureRefGen::objective(const Eigen::VectorXd& x, const Eigen::VectorXd
   double Qscale = valve_capacity(p_.Ppos_sp_max + P_ATM, P_ATM, p_.A_max);
   if (Qscale <= 0.0) Qscale = 1.0;
 
-  double J0 = 0.0, J2 = 0.0, Jfast = 0.0, J4 = 0.0, Jtank = 0.0, Jeject = 0.0;
+  double J0 = 0.0, J2 = 0.0, J4 = 0.0, Jtank = 0.0, Jeject = 0.0;
 
   for (int i = 0; i < N; ++i) {
     const double Pp = x(i), Pn = x(N + i);
@@ -186,20 +180,18 @@ double PressureRefGen::objective(const Eigen::VectorXd& x, const Eigen::VectorXd
     J2 -= (valve_capacity(Ppp + P_ATM, Pp + P_ATM, p_.A_max)
          + valve_capacity(Pn + P_ATM, Pnp + P_ATM, p_.A_max)) / Qscale;
 
-    // Jfast: 느린 채널로 힘을 내면 벌점
-    const double dfpos = std::max(0.0, (Pp - xp(i))      * p_.Apos[(size_t)i]);
-    const double dfneg = std::max(0.0, (xp(N + i) - Pn)  * p_.Aneg[(size_t)i]);
-    Jfast += dfpos / slewFpos(i) + dfneg / slewFneg(i);
-
     // Jtank / Jeject: 레일이 못 대는 초과분에만 벌점
     Jtank  += std::max(0.0, std::max(0.0, Pp - xp(i))     - dP_rail_max(i)) / p_.Pch_pos_max;
     Jeject += std::max(0.0, std::max(0.0, xp(N + i) - Pn) - dN_rail_max(i))
               / std::abs(p_.Pch_neg_min);
   }
-  Jfast /= std::max(1, N);
   J4 = (x - xp).lpNorm<1>() / p_.Pch_pos_max;
 
-  return p_.wtrack * J0 + p_.w_flow * J2 + p_.w_fast * Jfast
+  // Jfast(빠른 쪽 우선)는 원본 2차 검토에서 **추종을 해친다**고 판정되어 제거됐다.
+  // 슬루 박스가 이미 두 챔버의 물리적 능력을 담고 있어, Jtrk 하나만으로도 그 순간
+  // 유리한 챔버를 자동으로 쓴다 (자기균형 인수인계). 가중치를 0 으로 두는 대신
+  // 항 자체를 없애 매 SQP 반복의 수치 기울기 평가에서 완전히 빠지게 했다.
+  return p_.wtrack * J0 + p_.w_flow * J2
        + p_.w_smooth * J4 + p_.w_tank * Jtank + p_.w_eject * Jeject;
 }
 
@@ -219,7 +211,7 @@ PressureRefGen::Result PressureRefGen::step(const std::vector<double>& F_ref_in,
   res.F_achieved.assign((size_t)N, 0.0);
   res.lb_pos.assign((size_t)N, 0.0); res.ub_pos.assign((size_t)N, 0.0);
   res.lb_neg.assign((size_t)N, 0.0); res.ub_neg.assign((size_t)N, 0.0);
-  res.boost_pos.assign((size_t)N, 0.0); res.eject_neg.assign((size_t)N, 0.0);
+  res.starve_pos.assign((size_t)N, 0.0); res.starve_neg.assign((size_t)N, 0.0);
 
   // 목표 힘은 항상 ≥ 0 (이 시스템은 한 방향 힘만 낸다)
   std::vector<double> F_ref((size_t)N, 0.0);
@@ -235,8 +227,8 @@ PressureRefGen::Result PressureRefGen::step(const std::vector<double>& F_ref_in,
   decide_rail_setpoint(F_preview, res.rail_pos_sp, res.rail_neg_sp, res.demand_norm);
 
   // ── 2. 슬루 박스 ───────────────────────────────────────────────────
-  Eigen::VectorXd lb(nx), ub(nx), slewFpos(N), slewFneg(N), dP_rail(N), dN_rail(N);
-  build_slew_box(axes, sup, lb, ub, slewFpos, slewFneg, dP_rail, dN_rail);
+  Eigen::VectorXd lb(nx), ub(nx), dP_rail(N), dN_rail(N);
+  build_slew_box(axes, sup, lb, ub, dP_rail, dN_rail);
 
   Eigen::VectorXd xp(nx);
   for (int i = 0; i < N; ++i) { xp(i) = axes[(size_t)i].P_pos; xp(N + i) = axes[(size_t)i].P_neg; }
@@ -249,7 +241,7 @@ PressureRefGen::Result PressureRefGen::step(const std::vector<double>& F_ref_in,
   Eigen::VectorXd z = xp.cwiseMax(lb).cwiseMin(ub) / XS;
 
   auto Jof = [&](const Eigen::VectorXd& zz) {
-    return objective(zz * XS, xp, F_ref, sup, axes, slewFpos, slewFneg, dP_rail, dN_rail);
+    return objective(zz * XS, xp, F_ref, sup, axes, dP_rail, dN_rail);
   };
 
   // Gauss-Newton Hessian (J0 항만; F 가 x 에 선형이라 상수)
@@ -324,9 +316,12 @@ PressureRefGen::Result PressureRefGen::step(const std::vector<double>& F_ref_in,
     const double msuck  = std::min(ddn, msuck_cap);
     const double meject = std::min(std::max(0.0, ddn - msuck), mej_cap);
 
-    // 축별 부족분 — Controller 의 macro 게이트가 이 값을 본다
-    res.boost_pos[(size_t)i] = mboost;
-    res.eject_neg[(size_t)i] = meject;
+    // 축별 유량 부족률 — Controller 의 macro 게이트가 이 값을 본다.
+    // 분자는 "레일이 못 대는 양"이고 분모는 "이번 스텝 요구량"이므로 무차원이다.
+    // 음압은 meject(이젝터 능력으로 잘린 값)가 아니라 (ddn − msuck) 를 쓴다 —
+    // 이젝터가 꺼져 있어도 부족률이 정직하게 잡혀야 게이트가 열릴 수 있다.
+    res.starve_pos[(size_t)i] = (dup > 1e-12) ? mboost / dup : 0.0;
+    res.starve_neg[(size_t)i] = (ddn > 1e-12) ? std::max(0.0, ddn - msuck) / ddn : 0.0;
 
     res.m_fill += mfill; res.m_boost += mboost;
     res.m_suck += msuck; res.m_eject += meject;

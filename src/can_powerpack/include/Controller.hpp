@@ -150,8 +150,12 @@ public:
     float leakage_u_pos = 0.0f;
     float leakage_u_neg = 0.0f;
     float target_time_constant = 0.2f;
-    float macro_threshold = 30.0f;
-    float actuating_threshold = 5.0f;
+    // macro 를 여는 판정에 쓰는 micro 포화 기준 [%]. 100 = 레일 밸브를 완전히 열었는데도
+    // 요구 유량을 못 낼 때만 macro 를 연다 (임의 임계값이 아니라 밸브 물리 한계).
+    float macro_micro_sat_pct = 100.0f;
+    // 명령 테이퍼 폭 [kPa]. 오차가 이 안으로 들어오면 최종 밸브 명령을 연속적으로
+    // 0 까지 줄인다. 하드 데드밴드를 대체한다 — 이유는 solve() 주석 참조.
+    float cmd_taper_kpa = 3.0f;
     // 13-variable proportional valve model parameters
     float I_MAX{0.30f};
     float A_max{0.2845f};
@@ -180,14 +184,13 @@ public:
   void solve(float dt_ms, std::array<uint16_t, MPC_OUT_DIM>& out3, float current_time_sec);
   const Config& cfg() const { return cfg_; }
 
-  // macro(탱크 부스트 / 이젝터) 경로 개방 허용.
+  // macro(탱크 부스트 / 이젝터) 경로 개방 허용 — 생성기(mode 2)가 매 틱 갱신한다.
   //
-  // 원래 철학은 "transient 에서 유량이 부족해 목표에 빠르게 못 갈 때 macro 로
-  // 부스팅한다" 였고, 그 판정을 |P_ref − P| ≥ macro_threshold 로 근사했다.
-  // control_mode 2 에서는 레퍼런스가 슬루 제한을 받아 채널 오차가 항상 작게
-  // 유지되므로 그 임계값이 구조적으로 발동하지 않는다. 대신 생성기가 축별로
-  // "레일만으로는 이번 스텝 수요를 못 낸다"를 직접 계산하므로 그 판단을 여기로 넘긴다.
-  // (mode 0/1 에서는 아무도 호출하지 않아 기존 임계값 동작이 그대로 유지된다.)
+  // macro 는 "레일만으로는 이번 스텝 수요를 못 낸다"일 때만 열려야 한다. 판정 경로가
+  // 두 개이고 OR 로 결합된다 (반응성이 절약보다 우선이므로 둘 중 하나만 켜져도 연다):
+  //   ① 생성기: 축별 유량 부족률 > macro_gate_frac  (한 스텝 앞을 보는 계획 기반)
+  //   ② MPC 자체: micro 밸브 명령이 포화 (지금 이 순간의 백스톱, mode 0/1 은 이것만)
+  // 둘 다 물리에서 유도되므로 임의로 정하는 kPa 임계값이 필요 없다.
   inline void set_macro_allow(bool allow) { macro_allow_ = allow; }
 
   float current_P_now_       = 101.325f;
@@ -476,8 +479,8 @@ private:
     double leakage_u_pos{0.0};
     double leakage_u_neg{0.0};
     double target_tc{0.2};
-    double macro_threshold{30.0};
-    double actuating_threshold{5.0};
+    double macro_micro_sat_pct{100.0};
+    double cmd_taper_kpa{3.0};
   } mpc_;
 
   std::vector<double> vol_ml_;
@@ -507,39 +510,52 @@ private:
   // ──────────────────────────────────────────
   int control_mode_{0};   // 0: 압력 제어, 1: 위치 제어
 
+  // 축(actuator) 하나의 위치 제어 설정.
+  //
+  // mode 1(휴리스틱)과 mode 2(최적화 생성기)가 같은 구조체를 공유하지만 쓰는 필드가
+  // 다르다. 어느 값이 살아 있는지 yaml 만 보고 알 수 없었으므로 mode 1 전용 게인을
+  // `m1` 하위 구조체로 분리했다. mode 2 는 `m1` 을 전혀 읽지 않는다 — PID 는
+  // TorquePID.axis*, 압력 분배는 PressureRefGen 의 슬루 박스 최적화가 담당한다.
   struct PositionCtrlConfig {
-    // PID 게인
-    double kp{3.0};              // [kPa/deg]
-    double ki{0.05};             // [kPa/(deg·s)]
-    double kd{0.02};             // [kPa·s/deg]
-    // 중력 피드포워드
-    double kff_gravity{10.0};    // [kPa/(N·m)]
+    // ── 공용 (mode 1 / 2) ──────────────────────────────────────────────
+    // 채널 / 엔코더 매핑
+    int    actuator_idx{0};      // 엔코더 인덱스 (0 = board 17)
+    int    pos_gid{0};
+    int    neg_gid{6};
+    // 중력 피드포워드용 부하 (mode 1 은 kPa 로 환산, mode 2 는 N·m 로 직접 사용)
     double mass_kg{1.0};
     double link_length_m{0.2};
-    // 마찰 보상
-    double friction_kpa{2.0};
-    double vel_deadband_dps{0.5};
-    // 바이어스 압력
-    double p_bias_pos_kpa{120.0};
-    double p_bias_neg_kpa{90.0};
-    double neg_coupling{0.5};
-    // 출력 제한
+    // 채널 압력 정격 [kPa abs] — mode 1 은 출력 클램프, mode 2 는 생성기 슬루 박스의
+    // 상/하한으로 쓴다 (Controller 생성자에서 게이지 Pa 로 변환해 주입).
     double p_pos_max_kpa{165.0};
-    double p_pos_min_kpa{101.325};
-    double p_neg_max_kpa{101.325};
     double p_neg_min_kpa{70.0};
-    // 채널 매핑
-    int actuator_idx{0};
-    int pos_gid{0};
-    int neg_gid{6};
-    // 필터 / 초기값
+    // 각속도 추정 LPF / 초기 목표각
     double vel_filter_alpha{0.05};
     double default_angle_deg{0.0};
-    double integral_limit_kpa{20.0};
-    // 압력 레퍼런스 슬루레이트 제한: 목표압력이 한 번에 점프하지 않도록 tick당 변화폭을 제한
-    // (액추에이터 미연결 압력추종 테스트 중 단차 명령 시 밸브모델-실제 불일치로 190kPa
-    //  안전한계에 계속 부딪히는 릴레이 진동 발생 → 20260818, 레퍼런스 자체를 느리게 변화시켜 방지)
-    double ref_slew_kpa_per_s{3.0};
+
+    // ── mode 1 (휴리스틱 위치 제어) 전용 ────────────────────────────────
+    struct Mode1 {
+      // PID 게인 (각도 오차 → 압력 보정)
+      double kp{3.0};              // [kPa/deg]
+      double ki{0.05};             // [kPa/(deg·s)]
+      double kd{0.02};             // [kPa·s/deg]
+      double integral_limit_kpa{20.0};
+      // 중력 FF 환산 계수 [kPa/(N·m)] — mode 2 는 환산이 불필요해 쓰지 않는다
+      double kff_gravity{10.0};
+      // 쿨롱 마찰 보상
+      double friction_kpa{2.0};
+      // 바이어스(평형점) 압력 + 음압 차동 비율
+      double p_bias_pos_kpa{120.0};
+      double p_bias_neg_kpa{90.0};
+      double neg_coupling{0.5};
+      // 출력 제한 중 mode 1 만 쓰는 쪽 (반대쪽 한계는 공용 정격)
+      double p_pos_min_kpa{101.325};
+      double p_neg_max_kpa{101.325};
+      // 압력 레퍼런스 슬루레이트 제한 [kPa/s]. 목표압력이 한 번에 점프하면 밸브모델-실제
+      // 불일치로 안전한계에 부딪히는 릴레이 진동이 난다 (20260818).
+      // mode 2 는 생성기의 슬루 박스가 같은 역할을 물리적으로 하므로 불필요하다.
+      double ref_slew_kpa_per_s{3.0};
+    } m1;
   };
 
   struct PositionCtrlState {
@@ -588,10 +604,10 @@ private:
   std::vector<TorquePid>  tau_pid_;
   std::vector<double>     tau_integ_;
 
-  // macro 게이트 임계 [kg/s]. 생성기의 축별 부족분이 이 값을 넘으면 macro 를 연다.
-  // 수치 노이즈로 밸브가 떨지 않게 하는 데드밴드 역할.
-  double gen_macro_gate_kgps_{5e-5};
-  std::vector<double> gen_boost_gs_, gen_eject_gs_;   // 진단용 [g/s]
+  // macro 게이트 임계 — 생성기의 축별 **유량 부족률** [0,1] 이 이 값을 넘으면 macro 를 연다.
+  // 무차원이라 "레일이 이번 스텝 수요의 몇 %를 못 대면 부스트를 부른다"로 읽힌다.
+  double gen_macro_gate_frac_{0.02};
+  std::vector<double> gen_starve_pos_, gen_starve_neg_;   // 진단용 [%]
 
   // gid → MPC 조회 (macro 게이트 설정용)
   AcadosMpc* mpc_for_gid(int gid) const;

@@ -23,7 +23,7 @@
 //  2. 이젝터는 **구동 중일 때만** 측정값(board 4)을 하류 압력으로 쓴다 — 원본이
 //     `sys.P_ej_meas` 로 권장한 경로다. 꺼져 있으면 측정값이 대기압이라 능력을 0 으로
 //     오판하므로 특성곡선의 잠재력을 쓴다 (슬루 박스는 '열면 얼마나 흐르나'를 묻는
-//     능력 판정이기 때문). 이 구분이 없으면 macro 게이트가 열리지 않는 순환이 생긴다.
+//     능력 판정이기 때문).
 //  3. 챔버 부피는 원본의 고정값(0.75/0.4 L) 대신 각도-부피식 결과를 받는다.
 //     원본 해설서 자신이 0.75 L 은 등가 스트로크 750 mm 라 비현실적이라고 표기했다.
 //  4. fmincon(SQP) 대신 **박스 제약 SQP** — 매 반복 Gauss-Newton 이차모형을 만들어
@@ -81,7 +81,6 @@ public:
     // 목적함수 가중치 (MATLAB 값 그대로)
     double wtrack{100.0};
     double w_flow{0.3};
-    double w_fast{0.0};              // 원본에서 제거된 항 (추종을 해침)
     double w_smooth{0.5};
     double w_tank{15.0};
     double w_eject{25.0};
@@ -118,10 +117,10 @@ public:
     bool   use_ej_meas{true};
     // 이젝터가 지금 구동 중인지 (MacroSwitch 개방 여부).
     //
-    // 중요: 슬루 박스는 "이 밸브를 열면 얼마나 흐를 수 있나"를 계산하는 **능력** 판정이다.
-    // 이젝터가 꺼져 있으면 board 4 측정값은 대기압이므로 측정값을 그대로 쓰면 능력이 0 이
-    // 되고, 그러면 부족분도 0 이 되어 게이트가 영원히 안 열리는 순환에 빠진다.
-    // → 구동 중이면 측정값(실제 성능 반영)을, 꺼져 있으면 특성곡선의 도달 진공(잠재력)을 쓴다.
+    // 슬루 박스는 "이 밸브를 열면 얼마나 흐를 수 있나"를 계산하는 **능력** 판정이다.
+    // 이젝터가 꺼져 있으면 board 4 측정값은 대기압이라 그대로 쓰면 능력을 0 으로 오판한다.
+    // → 구동 중이면 측정값(실제 성능·지연 반영)을, 꺼져 있으면 특성곡선의 도달 진공
+    //   (잠재력)을 쓴다. macro 게이트는 이 값에 의존하지 않는다 (Result::starve_* 참조).
     bool   ej_running{false};
   };
 
@@ -132,11 +131,19 @@ public:
     std::vector<double> lb_pos, ub_pos, lb_neg, ub_neg;   // 슬루 박스 [Pa gauge]
     double rail_pos_sp{0.0}, rail_neg_sp{0.0};  // [Pa gauge]
     double demand_norm{0.0};
-    // 축별 "레일만으로는 이번 스텝 수요를 못 낸다" 부족분 [kg/s].
-    // > 0 이면 그 축은 지금 유량 부족(flow-starved) 이고 macro 경로(탱크 부스트 /
-    // 이젝터)가 필요하다는 뜻이다. Controller 가 이 값으로 macro 밸브를 개방한다.
-    std::vector<double> boost_pos, eject_neg;
-    // 진단 (원본 update_sources 의 usage) — 위 축별 값의 합
+    // 축별 **유량 부족률** [0,1] = (이번 스텝 요구 유량 − 레일이 낼 수 있는 유량) / 요구 유량.
+    // 0 이면 레일만으로 충분하고, 1 이면 전량을 macro(탱크 부스트 / 이젝터)에 의존한다.
+    //
+    // 절대 유량 [kg/s] 대신 비율을 쓰는 이유: 부족분의 절대 크기는 챔버 부피·dt·압력
+    // 스텝 크기에 모두 비례하므로 "0.0015 kg/s 가 큰가"를 사람이 판단할 수 없다.
+    // 비율은 무차원이라 "레일이 수요의 몇 %를 못 대면 macro 를 부른다"로 바로 읽힌다.
+    //
+    // 또한 분자를 (요구 − 레일능력) 으로 두어 **이젝터 능력에 의존하지 않게** 했다.
+    // 이젝터 유량을 분자에 넣으면 "이젝터가 꺼져 있으면 능력 0 → 부족분 0 → 게이트가
+    // 안 열림 → 계속 꺼짐" 순환과, 켜진 뒤 측정값이 반영되며 게이트가 닫히는 채터링이
+    // 생긴다. 부족률은 레일만 보므로 두 문제가 원천적으로 사라진다.
+    std::vector<double> starve_pos, starve_neg;
+    // 진단 (원본 update_sources 의 usage) — 절대 유량 합계 [kg/s]
     double m_fill{0.0}, m_boost{0.0}, m_suck{0.0}, m_eject{0.0}, m_tank_draw{0.0};
     bool   tank_low{false};
     int    sqp_iters{0};
@@ -174,13 +181,11 @@ private:
 
   void build_slew_box(const std::vector<AxisState>& axes, const SupplyState& sup,
                       Eigen::VectorXd& lb, Eigen::VectorXd& ub,
-                      Eigen::VectorXd& slewFpos, Eigen::VectorXd& slewFneg,
                       Eigen::VectorXd& dP_rail_max, Eigen::VectorXd& dN_rail_max) const;
 
   double objective(const Eigen::VectorXd& x, const Eigen::VectorXd& x_prev,
                    const std::vector<double>& F_ref, const SupplyState& sup,
                    const std::vector<AxisState>& axes,
-                   const Eigen::VectorXd& slewFpos, const Eigen::VectorXd& slewFneg,
                    const Eigen::VectorXd& dP_rail_max, const Eigen::VectorXd& dN_rail_max) const;
 
   Params p_;

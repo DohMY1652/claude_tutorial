@@ -423,25 +423,11 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
     return (float)std::clamp(I_req / (double)cfg_.I_MAX * 100.0, 0.0, 100.0);
   };
 
-  // [중요] 에러 계산을 최상단으로 이동
   const float Pref = cfg_.ref_value;
   float err = Pref - P_now;
-  
-  // =========================================================================
-  // [수정] Deadband (Threshold) Check
-  // 에러의 절대값이 설정된 threshold(예: 3.0)보다 작으면 무조건 0 리턴
-  // =========================================================================
-  if (std::abs(err) < cfg_.actuating_threshold) {
-      // 데드밴드 진입 시 적분항 누적 방지 (선택 사항: 0으로 리셋하거나 현상유지)
-      // 여기서는 튀는 것을 방지하기 위해 리셋하지 않고 통과하거나, 
-      // 필요하다면 아래 주석을 해제하세요.
-      // pos_error_integral_ = 0.0f;
-      // neg_error_integral_ = 0.0f;
-      
-      return {0.0f, 0.0f, 0.0f}; // 밸브 닫음
-  }
 
-  // --- 기존 로직 수행 ---
+  // 하드 데드밴드는 여기 있었지만 제거했다 — solve() 의 명령 테이퍼로 대체한다.
+  // (데드밴드는 그 자체가 릴레이라서 밸브 지연과 만나면 리밋사이클을 만든다)
 
   float raw_vol_dot = float((current_vol - prev_vol) / dt_sec);
 
@@ -489,6 +475,17 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   const float ki_at = cfg_.is_positive ? cfg_.pos_ki_atm   : cfg_.neg_ki_atm;
   
   float u_mi_req = 0.f, u_ma_req = 0.f, u_at_req = 0.f;
+
+  // macro 개방 판정. 임의의 kPa 오차 임계값 대신 **레일 경로가 포화했는가**를 본다.
+  //   micro(레일) 명령이 포화 = 레일 밸브를 완전히 열었는데도 요구 유량에 못 미친다
+  //                          = 레일만으로는 부족 → macro 를 열 근거가 물리적으로 성립
+  // 이 규칙이 "적게 쓰되 반응성 우선"을 동시에 만족한다: 포화하지 않으면 절대 안 열고
+  // (최소 사용), 포화하는 즉시 오차 크기와 무관하게 연다 (최대 반응성).
+  // 생성기(mode 2)의 축별 부족률 판정과 OR 로 결합된다.
+  auto macro_open = [this](float u_micro_req) {
+    return macro_allow_.load(std::memory_order_relaxed)
+        || u_micro_req >= cfg_.macro_micro_sat_pct;
+  };
  
   // Feedforward: 역모델로 필요한 u_pct 계산
   const double Q_req = (double)std::abs(m_dot_pressure + m_dot_volume);
@@ -498,10 +495,7 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
       u_mi_req = valve_invert(Q_req, (double)P_micro, (double)P_now, z_micro_)
                  + ki_mi * pos_error_integral_;
       u_at_req = 0.f;
-      // macro 개방 판정: 생성기가 "레일만으로 부족"이라고 알려주면(macro_allow_) 열고,
-      // 아니면 기존 오차 임계값 폴백을 쓴다 (mode 0/1 은 폴백만 동작).
-      u_ma_req = (macro_allow_.load(std::memory_order_relaxed)
-                  || std::abs(err) >= cfg_.macro_threshold)
+      u_ma_req = macro_open(u_mi_req)
                  ? valve_invert(Q_req, (double)P_macro, (double)P_now, z_macro_)
                    + ki_ma * pos_error_integral_
                  : 0.f;
@@ -516,8 +510,7 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
       u_mi_req = valve_invert(Q_req, (double)P_now, (double)P_micro, z_micro_)
                  + ki_mi * neg_error_integral_;
       u_at_req = 0.f;
-      u_ma_req = (macro_allow_.load(std::memory_order_relaxed)
-                  || std::abs(err) >= cfg_.macro_threshold)
+      u_ma_req = macro_open(u_mi_req)
                  ? valve_invert(Q_req, (double)P_now, (double)cfg_.ejector_p_limit, z_macro_)
                    + ki_ma * neg_error_integral_
                  : 0.f;
@@ -652,25 +645,23 @@ void AcadosMpc::solve(float dt_ms,
                       float current_time_sec)
 {
   float P_now   = current_P_now_;
-  
-  // =========================================================================
-  // [수정] Deadband (Threshold) Check - 최상단 배치
-  // 이 부분이 없으면 Feedforward가 0이어도 MPC가 미세한 오차를 줄이려고 동작함
-  // =========================================================================
-  float err = cfg_.ref_value - P_now;
-  if (std::abs(err) < cfg_.actuating_threshold) {
-      // 오차 범위 내에서는 계산하지 않고 0 출력 후 종료
-      out3[0] = 0;
-      out3[1] = 0;
-      out3[2] = 0;
-      
-      // Last u 업데이트 (0으로)
-      last_u3_ = {0.0f, 0.0f, 0.0f};
-      return; 
-  }
+  float err     = cfg_.ref_value - P_now;
 
-  // --- 기존 로직 수행 ---
-  
+  // ── 명령 테이퍼 (하드 데드밴드 대체) ─────────────────────────────────────
+  // 이전에는 |err| < actuating_threshold 면 전 밸브를 0 으로 잘랐다. 그 이유는
+  // 역밸브모델이 **작은 개도를 표현할 수 없기** 때문이다: alpha_shape=3884 이라
+  // sigma=(A_req/A_max)^(1/alpha) 가 A_req→0 에서도 0.993 이라, 요구 유량이 사실상
+  // 0 이어도 u 는 54% 로 튄다 (A_req 1e-12 → u 53.9%, 1e-6 → 61.4%). 즉 이 모델에는
+  // "살짝 열기"가 없고 0 아니면 반쯤 열기뿐이다.
+  //
+  // 그런데 하드 컷은 0 ↔ 54% 사이의 **불연속**을 만들어, 밸브 지연·히스테리시스와
+  // 만나면 데드존을 넘나드는 릴레이 진동을 스스로 유발한다 (막으려던 진동을 만든다).
+  // → 잘라내는 대신 오차에 비례해 최종 명령을 연속적으로 줄인다. err→0 에서 u→0 이
+  //   부드럽게 수렴하므로 불연속이 없고, 목표 근처에서 밸브가 조금만 열린다.
+  //   적분항은 그대로 살아 있어 정상상태 오차는 계속 밀어낸다 (수렴만 느려진다).
+  const float taper = std::clamp(std::abs(err) / std::max(1e-3f, cfg_.cmd_taper_kpa),
+                                 0.0f, 1.0f);
+
   float P_micro     = current_P_micro_;
   float P_macro     = current_P_macro_;
   float P_macro_neg = current_P_macro_neg_;
@@ -678,8 +669,6 @@ void AcadosMpc::solve(float dt_ms,
   float dt_sec = dt_ms / 1000.0f;
   if (dt_sec <= 0.0001f) dt_sec = cfg_.Ts;
 
-  // 위에서 compute_input_reference를 수정했으므로,
-  // 여기서도 threshold 조건이면 {0,0,0}이 리턴됨
   auto uref_arr = compute_input_reference(P_now, P_micro, P_macro, P_macro_neg, dt_sec, current_time_sec);
   Eigen::RowVector3f u_ref(uref_arr[0], uref_arr[1], uref_arr[2]);
 
@@ -708,10 +697,12 @@ void AcadosMpc::solve(float dt_ms,
 
   auto du3 = solve_qp_first_step(Pmat_, qvec_, Acon_, LL_, UL_);
 
+  // 테이퍼는 QP 결과까지 포함한 **최종** 명령에 곱한다. u_ref 만 줄이면 MPC 가 Δu 로
+  // 다시 밀어올려 무력화되기 때문이다.
   std::array<float,3> u0{
-    std::clamp(uref_arr[0] + du3[0], 0.0f, 100.0f),
-    std::clamp(uref_arr[1] + du3[1], 0.0f, 100.0f),
-    std::clamp(uref_arr[2] + du3[2], 0.0f, 100.0f),
+    std::clamp(uref_arr[0] + du3[0], 0.0f, 100.0f) * taper,
+    std::clamp(uref_arr[1] + du3[1], 0.0f, 100.0f) * taper,
+    std::clamp(uref_arr[2] + du3[2], 0.0f, 100.0f) * taper,
   };
   last_u3_ = u0;
 
@@ -784,8 +775,8 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.leakage_u_pos = get_param_or<double>(this, "MPC_parameters.leakage_u_pos", 0.0);
   mpc_.leakage_u_neg = get_param_or<double>(this, "MPC_parameters.leakage_u_neg", 0.0);
   mpc_.target_tc = get_param_or<double>(this, "MPC_parameters.target_time_constant", 0.2);
-  mpc_.macro_threshold = get_param_or<double>(this, "MPC_parameters.macro_threshold", 30.0);
-  mpc_.actuating_threshold = get_param_or<double>(this, "MPC_parameters.actuating_threshold", 5.0);
+  mpc_.macro_micro_sat_pct = get_param_or<double>(this, "MPC_parameters.macro_micro_sat_pct", 100.0);
+  mpc_.cmd_taper_kpa       = get_param_or<double>(this, "MPC_parameters.cmd_taper_kpa",          3.0);
 
 
   default_volume_ml_  = get_param_or<double>(this, "default_volume_ml",    1.0);
@@ -945,38 +936,43 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     const std::string prefix = "PositionController.axis" + std::to_string(a) + ".";
     auto& c = pos_ctrl_cfg_[(size_t)a];
 
-    c.kp                = get_param_or<double>(this, prefix + "kp",               3.0);
-    c.ki                = get_param_or<double>(this, prefix + "ki",               0.05);
-    c.kd                = get_param_or<double>(this, prefix + "kd",               0.02);
-    c.kff_gravity       = get_param_or<double>(this, prefix + "kff_gravity",      10.0);
-    c.mass_kg           = get_param_or<double>(this, prefix + "mass_kg",          1.0);
-    c.link_length_m      = get_param_or<double>(this, prefix + "link_length_m",    0.2);
-    c.friction_kpa       = get_param_or<double>(this, prefix + "friction_kpa",     2.0);
-    c.vel_deadband_dps   = get_param_or<double>(this, prefix + "vel_deadband_dps", 0.5);
-    c.p_bias_pos_kpa     = get_param_or<double>(this, prefix + "p_bias_pos_kpa",  120.0);
-    c.p_bias_neg_kpa     = get_param_or<double>(this, prefix + "p_bias_neg_kpa",  90.0);
-    c.neg_coupling       = get_param_or<double>(this, prefix + "neg_coupling",     0.5);
-    c.p_pos_max_kpa      = get_param_or<double>(this, prefix + "p_pos_max_kpa",   165.0);
-    c.p_pos_min_kpa      = get_param_or<double>(this, prefix + "p_pos_min_kpa",   101.325);
-    c.p_neg_max_kpa      = get_param_or<double>(this, prefix + "p_neg_max_kpa",   101.325);
-    c.p_neg_min_kpa      = get_param_or<double>(this, prefix + "p_neg_min_kpa",   70.0);
-    c.actuator_idx       = get_param_or<int>   (this, prefix + "actuator_idx",    a);
-    c.pos_gid            = get_param_or<int>   (this, prefix + "pos_gid",         a);
-    c.neg_gid            = get_param_or<int>   (this, prefix + "neg_gid",         num_positive_channels_ + a);
-    c.vel_filter_alpha   = get_param_or<double>(this, prefix + "vel_filter_alpha",0.05);
-    c.default_angle_deg  = get_param_or<double>(this, prefix + "default_angle_deg",0.0);
-    c.integral_limit_kpa = get_param_or<double>(this, prefix + "integral_limit_kpa",20.0);
-    c.ref_slew_kpa_per_s  = get_param_or<double>(this, prefix + "ref_slew_kpa_per_s", 3.0);
+    // 공용 (mode 1 / 2)
+    c.actuator_idx      = get_param_or<int>   (this, prefix + "actuator_idx",      a);
+    c.pos_gid           = get_param_or<int>   (this, prefix + "pos_gid",           a);
+    c.neg_gid           = get_param_or<int>   (this, prefix + "neg_gid",           num_positive_channels_ + a);
+    c.mass_kg           = get_param_or<double>(this, prefix + "mass_kg",           1.0);
+    c.link_length_m     = get_param_or<double>(this, prefix + "link_length_m",     0.2);
+    c.p_pos_max_kpa     = get_param_or<double>(this, prefix + "p_pos_max_kpa",     165.0);
+    c.p_neg_min_kpa     = get_param_or<double>(this, prefix + "p_neg_min_kpa",     70.0);
+    c.vel_filter_alpha  = get_param_or<double>(this, prefix + "vel_filter_alpha",  0.05);
+    c.default_angle_deg = get_param_or<double>(this, prefix + "default_angle_deg", 0.0);
+
+    // mode 1 전용 (control_mode 2 에서는 읽히지 않는다)
+    auto& h = c.m1;
+    h.kp                 = get_param_or<double>(this, prefix + "mode1.kp",                 3.0);
+    h.ki                 = get_param_or<double>(this, prefix + "mode1.ki",                 0.05);
+    h.kd                 = get_param_or<double>(this, prefix + "mode1.kd",                 0.02);
+    h.integral_limit_kpa = get_param_or<double>(this, prefix + "mode1.integral_limit_kpa", 20.0);
+    h.kff_gravity        = get_param_or<double>(this, prefix + "mode1.kff_gravity",         10.0);
+    h.friction_kpa       = get_param_or<double>(this, prefix + "mode1.friction_kpa",        2.0);
+    h.p_bias_pos_kpa     = get_param_or<double>(this, prefix + "mode1.p_bias_pos_kpa",     120.0);
+    h.p_bias_neg_kpa     = get_param_or<double>(this, prefix + "mode1.p_bias_neg_kpa",      90.0);
+    h.neg_coupling       = get_param_or<double>(this, prefix + "mode1.neg_coupling",         0.5);
+    h.p_pos_min_kpa      = get_param_or<double>(this, prefix + "mode1.p_pos_min_kpa",      101.325);
+    h.p_neg_max_kpa      = get_param_or<double>(this, prefix + "mode1.p_neg_max_kpa",      101.325);
+    h.ref_slew_kpa_per_s = get_param_or<double>(this, prefix + "mode1.ref_slew_kpa_per_s",   3.0);
 
     target_angle_deg_[(size_t)a] = c.default_angle_deg;
 
     RCLCPP_INFO(get_logger(),
-      "[PosCtrl axis%d] PID: kp=%.2f ki=%.3f kd=%.3f | kff_gravity=%.1f  m=%.1fkg  L=%.3fm",
-      a, c.kp, c.ki, c.kd, c.kff_gravity, c.mass_kg, c.link_length_m);
-    RCLCPP_INFO(get_logger(),
-      "[PosCtrl axis%d] Limits: P+=[%.1f,%.1f]  P-=[%.1f,%.1f] kPa | gid: pos=%d neg=%d enc=%d",
-      a, c.p_pos_min_kpa, c.p_pos_max_kpa, c.p_neg_min_kpa, c.p_neg_max_kpa,
+      "[PosCtrl axis%d] 정격 P+≤%.1f / P-≥%.1f kPa | m=%.1fkg L=%.3fm | gid: pos=%d neg=%d enc=%d",
+      a, c.p_pos_max_kpa, c.p_neg_min_kpa, c.mass_kg, c.link_length_m,
       c.pos_gid, c.neg_gid, c.actuator_idx);
+    if (control_mode_ == 1)
+      RCLCPP_INFO(get_logger(),
+        "[PosCtrl axis%d] mode1 PID: kp=%.2f ki=%.3f kd=%.3f | kff=%.1f | bias P+=%.1f P-=%.1f",
+        a, c.m1.kp, c.m1.ki, c.m1.kd, c.m1.kff_gravity,
+        c.m1.p_bias_pos_kpa, c.m1.p_bias_neg_kpa);
   }
 
   // ──────────────────────────────────────────
@@ -1000,9 +996,9 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   gen_use_ej_meas_  = get_param_or<bool>(this, "PressureRefGen.use_ejector_measurement", true);
   gen_pos_ref_kpa_.assign(num_actuators_, sensor_.kpa_atm());
   gen_neg_ref_kpa_.assign(num_actuators_, sensor_.kpa_atm());
-  gen_boost_gs_.assign(num_actuators_, 0.0);
-  gen_eject_gs_.assign(num_actuators_, 0.0);
-  gen_macro_gate_kgps_ = get_param_or<double>(this, "PressureRefGen.macro_gate_kgps", 5e-5);
+  gen_starve_pos_.assign(num_actuators_, 0.0);
+  gen_starve_neg_.assign(num_actuators_, 0.0);
+  gen_macro_gate_frac_ = get_param_or<double>(this, "PressureRefGen.macro_gate_frac", 0.02);
 
   tau_pid_.assign(num_actuators_, TorquePid{});
   tau_integ_.assign(num_actuators_, 0.0);
@@ -1047,7 +1043,6 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
 
     gp.wtrack   = get_param_or<double>(this, "PressureRefGen.weights.track",  100.0);
     gp.w_flow   = get_param_or<double>(this, "PressureRefGen.weights.flow",     0.3);
-    gp.w_fast   = get_param_or<double>(this, "PressureRefGen.weights.fast",     0.0);
     gp.w_smooth = get_param_or<double>(this, "PressureRefGen.weights.smooth",   0.5);
     gp.w_tank   = get_param_or<double>(this, "PressureRefGen.weights.tank",    15.0);
     gp.w_eject  = get_param_or<double>(this, "PressureRefGen.weights.eject",   25.0);
@@ -1236,8 +1231,8 @@ void Controller::build_mpcs() {
       cfg.leakage_u_neg = (float)mpc_.leakage_u_neg;
 
       cfg.target_time_constant = (float)mpc_.target_tc;
-      cfg.macro_threshold      = (float)mpc_.macro_threshold;
-      cfg.actuating_threshold  = (float)mpc_.actuating_threshold;
+      cfg.macro_micro_sat_pct  = (float)mpc_.macro_micro_sat_pct;
+      cfg.cmd_taper_kpa        = (float)mpc_.cmd_taper_kpa;
 
       auto mpc_obj = std::make_unique<AcadosMpc>(cfg);
       int nv = cfg.n_u * cfg.NP; 
@@ -1659,8 +1654,8 @@ void Controller::run_position_control(double dt_sec)
       state.prev_angle    = angle;
       state.vel_filt      = 0.0;
       state.integral      = 0.0;
-      state.p_pos_ref_filt = cfg.p_bias_pos_kpa;
-      state.p_neg_ref_filt = cfg.p_bias_neg_kpa;
+      state.p_pos_ref_filt = cfg.m1.p_bias_pos_kpa;
+      state.p_neg_ref_filt = cfg.m1.p_bias_neg_kpa;
       state.initialized   = true;
       dbg_all.insert(dbg_all.end(), {angle, angle_ref, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0});
       continue;
@@ -1690,14 +1685,14 @@ void Controller::run_position_control(double dt_sec)
       }
       // 적분 (와인드업 방지: 포화 전 클램핑)
       state.integral += error * dt_sec;
-      const double integ_limit = (std::abs(cfg.ki) > 1e-9)
-                                 ? cfg.integral_limit_kpa / cfg.ki
+      const double integ_limit = (std::abs(cfg.m1.ki) > 1e-9)
+                                 ? cfg.m1.integral_limit_kpa / cfg.m1.ki
                                  : 0.0;
       state.integral = std::clamp(state.integral, -integ_limit, integ_limit);
 
-      p_pid = cfg.kp * error
-            + cfg.ki * state.integral
-            - cfg.kd * vel;   // 미분: 측정값 미분 (setpoint kick 방지)
+      p_pid = cfg.m1.kp * error
+            + cfg.m1.ki * state.integral
+            - cfg.m1.kd * vel;   // 미분: 측정값 미분 (setpoint kick 방지)
     }
 
     // ── 중력 피드포워드 ──
@@ -1709,24 +1704,24 @@ void Controller::run_position_control(double dt_sec)
     const double tau_gravity = cfg.mass_kg * 9.81
                               * cfg.link_length_m
                               * std::sin(angle_rad);          // [N·m]
-    const double p_ff = cfg.kff_gravity * tau_gravity;   // [kPa]
+    const double p_ff = cfg.m1.kff_gravity * tau_gravity;   // [kPa]
 
     // ── 마찰 보상 (쿨롱) ── error 방향으로 보상 (vel 방향은 수축 필요 시 역방향 힘을 줌)
     // 액추에이터 미연결 시에는 실제 움직임이 없으므로 마찰 보상도 의미가 없어 생략.
     double p_friction = 0.0;
     if (actuator_connected_ && std::abs(error) > 0.3) {
-      p_friction = cfg.friction_kpa * (error > 0.0 ? 1.0 : -1.0);
+      p_friction = cfg.m1.friction_kpa * (error > 0.0 ? 1.0 : -1.0);
     }
 
     // ── 합산 및 압력 레퍼런스 생성 ──
     const double delta = p_pid + p_ff + p_friction;
 
-    const double p_pos_unsat = cfg.p_bias_pos_kpa + delta;
-    double p_pos = std::clamp(p_pos_unsat, cfg.p_pos_min_kpa, cfg.p_pos_max_kpa);
+    const double p_pos_unsat = cfg.m1.p_bias_pos_kpa + delta;
+    double p_pos = std::clamp(p_pos_unsat, cfg.m1.p_pos_min_kpa, cfg.p_pos_max_kpa);
 
     double p_neg = std::clamp(
-      cfg.p_bias_neg_kpa - delta * cfg.neg_coupling,
-      cfg.p_neg_min_kpa, cfg.p_neg_max_kpa);
+      cfg.m1.p_bias_neg_kpa - delta * cfg.m1.neg_coupling,
+      cfg.p_neg_min_kpa, cfg.m1.p_neg_max_kpa);
 
     // P+ 포화 & 연장 방향 오차 시 음압 독립 구동
     // neg_coupling은 delta에 비례하므로 P+가 천장(anti-windup으로 delta 동결)에
@@ -1741,8 +1736,8 @@ void Controller::run_position_control(double dt_sec)
     //   - 연장 필요(error>0)인데 p_pos가 최대에 걸림 → 더 밀어봤자 의미없음
     //   - 수축 필요(error<0)인데 p_pos가 최소에 걸림 → 중력이 이미 수축 중, 적분은 계속 쌓음
     const bool sat_same_dir = (p_pos_unsat > cfg.p_pos_max_kpa && error > 0.0) ||
-                              (p_pos_unsat < cfg.p_pos_min_kpa && error < 0.0);
-    if (actuator_connected_ && sat_same_dir && std::abs(cfg.ki) > 1e-9) {
+                              (p_pos_unsat < cfg.m1.p_pos_min_kpa && error < 0.0);
+    if (actuator_connected_ && sat_same_dir && std::abs(cfg.m1.ki) > 1e-9) {
       state.integral -= error * dt_sec;   // 이번 적분 취소
     }
 
@@ -1750,7 +1745,7 @@ void Controller::run_position_control(double dt_sec)
     // p_pos/p_neg가 한 tick에서 크게 점프하면(예: 위치명령 변경) 밸브모델-실제 불일치로
     // 큰 실압력 스파이크가 발생할 수 있으므로, MPC에 넘기는 레퍼런스 자체를
     // ref_slew_kpa_per_s 로 제한된 램프로 바꿔 서서히 목표에 도달하게 한다.
-    const double max_step = cfg.ref_slew_kpa_per_s * dt_sec;
+    const double max_step = cfg.m1.ref_slew_kpa_per_s * dt_sec;
     state.p_pos_ref_filt += std::clamp(p_pos - state.p_pos_ref_filt, -max_step, max_step);
     state.p_neg_ref_filt += std::clamp(p_neg - state.p_neg_ref_filt, -max_step, max_step);
     p_pos = state.p_pos_ref_filt;
@@ -1920,19 +1915,19 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     gen_rail_neg_sp_kpa_ = to_abs_kpa(r.rail_neg_sp);
     gen_has_result_ = true;
 
-    // ── macro 게이트: 생성기의 축별 "유량 부족" 판정으로 구동 ─────────────
+    // ── macro 게이트: 생성기의 축별 유량 부족률로 구동 ────────────────────
     // 원래 철학(transient 에서 유량이 부족해 목표에 빠르게 못 갈 때 부스팅)을
-    // 오차 임계값 대신 생성기의 부족분으로 판정한다. 슬루 박스가 이미 부스트/이젝터
-    // 능력을 포함해 레퍼런스를 만들었으므로, 부족분 > 0 은 "그 능력을 쓸 계획"이라는 뜻이다.
-    // 이렇게 하면 계획과 실제 밸브 동작이 일치한다.
+    // 오차 임계값 대신 "레일이 이번 스텝 수요를 감당하는가"로 판정한다. 슬루 박스가
+    // 이미 부스트/이젝터 능력을 포함해 레퍼런스를 만들었으므로, 부족률 > 0 은
+    // "그 능력을 쓸 계획"이라는 뜻이고 이렇게 하면 계획과 밸브 동작이 일치한다.
+    // MPC 쪽 micro 포화 판정과 OR 로 결합된다 (AcadosMpc::set_macro_allow 주석 참조).
     for (int a = 0; a < N; ++a) {
       const auto& cfg = pos_ctrl_cfg_[(size_t)a];
-      const bool boost_needed = r.boost_pos[(size_t)a] > gen_macro_gate_kgps_;
-      const bool eject_needed = r.eject_neg[(size_t)a] > gen_macro_gate_kgps_;
-      if (auto* m = mpc_for_gid(cfg.pos_gid)) m->set_macro_allow(boost_needed);
-      if (auto* m = mpc_for_gid(cfg.neg_gid)) m->set_macro_allow(eject_needed);
-      gen_boost_gs_[(size_t)a] = r.boost_pos[(size_t)a] * 1e3;
-      gen_eject_gs_[(size_t)a] = r.eject_neg[(size_t)a] * 1e3;
+      const double sp = r.starve_pos[(size_t)a], sn = r.starve_neg[(size_t)a];
+      if (auto* m = mpc_for_gid(cfg.pos_gid)) m->set_macro_allow(sp > gen_macro_gate_frac_);
+      if (auto* m = mpc_for_gid(cfg.neg_gid)) m->set_macro_allow(sn > gen_macro_gate_frac_);
+      gen_starve_pos_[(size_t)a] = sp * 100.0;
+      gen_starve_neg_[(size_t)a] = sn * 100.0;
     }
 
     // ── 3. 적응 레일 셋포인트를 LinePID 에 넘긴다 ────────────────────
@@ -1954,8 +1949,8 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
         m.data.push_back(to_abs_kpa(r.lb_pos[(size_t)a]));
         m.data.push_back(to_abs_kpa(r.lb_neg[(size_t)a]));       // 슬루 하한 P⁻
         m.data.push_back(to_abs_kpa(r.ub_neg[(size_t)a]));
-        m.data.push_back(gen_boost_gs_[(size_t)a]);              // 탱크 부스트 부족분 [g/s]
-        m.data.push_back(gen_eject_gs_[(size_t)a]);              // 이젝터 부족분 [g/s]
+        m.data.push_back(gen_starve_pos_[(size_t)a]);             // 양압 유량 부족률 [%]
+        m.data.push_back(gen_starve_neg_[(size_t)a]);             // 음압 유량 부족률 [%]
       }
       m.data.push_back(gen_rail_pos_sp_kpa_);
       m.data.push_back(gen_rail_neg_sp_kpa_);
@@ -1970,16 +1965,16 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
       RCLCPP_INFO(get_logger(),
         "[RefGen] θ=%.2f→%.2f°  τ=%.2f/%.2f N·m (pid %.2f ff %.2f) | "
         "P⁺=%.1f[%.1f~%.1f] P⁻=%.1f[%.1f~%.1f] | rail SP %.1f/%.1f | "
-        "tank %.0f%s boost %.2f ej %.2f g/s [%s%s] it=%d",
+        "tank %.0f%s starve %.0f/%.0f%% [%s%s] it=%d",
         dbg_angle[0], dbg_angle_ref[0], r.F_achieved[0] * reel_m, tau_ref[0],
         dbg_tau_pid[0], dbg_tau_ff[0],
         gen_pos_ref_kpa_[0], to_abs_kpa(r.lb_pos[0]), to_abs_kpa(r.ub_pos[0]),
         gen_neg_ref_kpa_[0], to_abs_kpa(r.lb_neg[0]), to_abs_kpa(r.ub_neg[0]),
         gen_rail_pos_sp_kpa_, gen_rail_neg_sp_kpa_,
         filt_out_[P_macro_board_id_ - 1], r.tank_low ? " LOW" : "",
-        r.m_boost * 1e3, r.m_eject * 1e3,
-        r.boost_pos[0] > gen_macro_gate_kgps_ ? "B" : "-",
-        r.eject_neg[0] > gen_macro_gate_kgps_ ? "E" : "-",
+        gen_starve_pos_[0], gen_starve_neg_[0],
+        r.starve_pos[0] > gen_macro_gate_frac_ ? "B" : "-",
+        r.starve_neg[0] > gen_macro_gate_frac_ ? "E" : "-",
         r.sqp_iters);
     }
   }

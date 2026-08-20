@@ -310,29 +310,36 @@
 
       tank_stop_kpa: 450.0       # 이하로 떨어지면 tank_low 플래그 (교체/정지 판단)
 
-      # macro(탱크 부스트 / 이젝터) 게이트 임계 [kg/s]
+      # macro(탱크 부스트 / 이젝터) 게이트 임계 — **무차원 유량 부족률** [0,1]
       #
-      # 원래 macro 는 "transient 에서 유량이 부족해 목표 압력/위치에 빠르게 못 갈 때
-      # 빠르게 부스팅한다"는 철학이었고, 그 판정을 MPC 안에서 |P_ref − P| ≥
-      # macro_threshold(50 kPa) 로 근사했다. 그런데 control_mode 2 는 레퍼런스가
-      # 슬루 제한을 받아 채널 오차가 항상 몇 kPa 로 작게 유지되므로 그 임계값이
-      # 구조적으로 발동하지 않는다 (실측: 임계값을 15 로 낮춰도 board 4 는 계속 대기압).
+      # macro 는 "레일만으로는 이번 스텝 수요를 못 낸다"일 때만 열려야 한다. 판정 경로가
+      # 두 개이고 OR 로 결합된다 (반응성이 절약보다 우선이므로 하나만 켜져도 연다):
+      #   ① 여기 — 생성기가 축별로 계산하는 부족률
+      #        부족률 = (요구 유량 − 레일이 낼 수 있는 유량) / 요구 유량
+      #   ② MPC_parameters.macro_micro_sat_pct — micro 밸브 명령 포화
       #
-      # 대신 생성기가 축별로 같은 판정을 직접 계산한다:
-      #   부족분 = max(0, 이번 스텝 필요 유량 − 레일만으로 낼 수 있는 유량)
-      # 이 값이 아래 임계를 넘으면 그 축의 macro 밸브를 연다. 슬루 박스가 이미
-      # 부스트/이젝터 능력을 포함해 레퍼런스를 만들었으므로, 부족분 > 0 은
-      # "그 능력을 쓸 계획"이라는 뜻이고 이렇게 하면 계획과 밸브 동작이 일치한다.
-      # 값은 밸브가 수치 노이즈로 떨지 않게 하는 데드밴드다 (5e-5 kg/s = 0.05 g/s).
-      macro_gate_kgps: 0.0015
+      # 왜 절대 유량 [kg/s] 이 아니라 비율인가:
+      #   부족분의 절대 크기는 챔버 부피·dt·압력 스텝 크기에 모두 비례한다. 그래서
+      #   "0.0015 kg/s 가 큰 값인가"를 사람이 판단할 근거가 없고, 축 각도가 바뀌어
+      #   챔버 부피가 변하면 같은 값이 다른 뜻이 된다. 비율은 무차원이라
+      #   "레일이 수요의 몇 %를 못 대면 부스트를 부른다"로 바로 읽고 정할 수 있다.
+      #
+      # 왜 이전 |P_ref − P| ≥ macro_threshold 규칙을 버렸는가:
+      #   control_mode 2 는 레퍼런스가 슬루 제한을 받아 채널 오차가 항상 몇 kPa 로 작게
+      #   유지되므로 그 임계값이 구조적으로 발동하지 않는다 (실측: 15 로 낮춰도 board 4
+      #   는 계속 대기압). 그리고 오차 크기는 "유량이 부족한가"와 직접 관계가 없다.
+      #
+      # 값 선택: 반응성 우선이므로 낮게 둔다. 0.02 = 레일이 수요의 2% 라도 못 대면 연다.
+      # 0 이 아닌 이유는 수치 노이즈로 밸브가 떨지 않게 하는 데드밴드뿐이다.
+      macro_gate_frac: 0.02
 
       # 목적함수 가중치 — 원본 값 그대로
-      # J_fast(빠른 쪽 우선)와 scarcity(잔량 반비례 증폭)는 원본 2차 검토에서
-      # 추종을 해친다고 판정되어 제거된 항이다. fast 는 0 을 유지할 것.
+      # J_fast(빠른 쪽 우선)와 scarcity(잔량 반비례 증폭)는 원본 2차 검토에서 추종을
+      # 해친다고 판정된 항이다. 가중치 0 으로 두는 대신 **코드에서 항 자체를 제거**했다
+      # (매 SQP 반복의 수치 기울기 평가에서 빠진다). 되살릴 일이 없으므로 키도 없다.
       weights:
         track: 100.0             # 토크 소프트 추종 (지배적)
         flow: 0.3                # 총 가용유량 최대화 (반응 여지 확보)
-        fast: 0.0                # 제거된 항 — 켜면 포화 시 추종이 나빠진다
         smooth: 0.5              # 압력 급변 억제
         tank: 15.0               # 탱크 부스트 사용 벌점 (레일 초과분에만)
         eject: 25.0              # 이젝터 사용 벌점 (탱크를 더 빨리 소모)
@@ -344,184 +351,198 @@
       neg_gid: 6         # 음압 채널 global_id (board 11) [압력모드 전용]
 
     # ──────────────────────────────────────────
-    # 위치 제어기 (control_mode: 1 일 때 동작)
-    # 외층 PID: 각도 오차 [deg] → 압력 보정 [kPa]
-    # 내층 MPC: 압력 레퍼런스 → 밸브 PWM  (기존 동일)
-    # 축(axis)마다 하나씩, num_actuators 개수만큼 axis0/axis1/... 로 설정.
-    # 3개 액추에이터 모두 동일 사양이라 PID/FF/바이어스/제한값은 세 축 모두 동일하게 두고
-    # actuator_idx/pos_gid/neg_gid 만 축별로 다르게 지정 (0=board17/gid0/gid6, 1=board18/gid1/gid7, 2=board19/gid2/gid8)
+    # 위치 제어기 (축별 설정, num_actuators 개수만큼 axis0/axis1/... )
+    #
+    # 두 모드가 이 섹션을 공유하지만 **읽는 필드가 다르다**:
+    #   공용 (mode 1, 2) : 채널/엔코더 매핑, 부하(mass·link), 채널 압력 정격, 속도 LPF
+    #   mode1: 하위 블록 : 휴리스틱 위치 제어(외층 PID → bias ± delta) 전용 게인
+    #
+    # control_mode 2 는 `mode1:` 블록을 **전혀 읽지 않는다**. 그쪽에서 PID 는
+    # TorquePID.axis* 가, 양압/음압 분배는 PressureRefGen 의 슬루 박스 최적화가,
+    # 레퍼런스 슬루 제한은 그 박스가 물리적으로 담당한다.
+    #
+    # 6축 모두 동일 사양이므로 값은 같고 actuator_idx/pos_gid/neg_gid 만 다르다.
+    #
+    # 공용 정격의 의미:
+    #   p_pos_max_kpa / p_neg_min_kpa 는 채널(액추에이터) 압력 정격이다.
+    #   mode 1 은 출력 클램프로, mode 2 는 axis0 값을 게이지로 변환해 생성기 슬루
+    #   박스의 상/하한으로 쓴다 (현재 185 / 27 kPa abs = +83.7 / −74.3 kPa gauge).
     # ──────────────────────────────────────────
     PositionController:
       axis0:
-        # PID 게인 (각도 → 압력)
-        kp: 0.8              # 비례 [kPa/deg]   0.6→0.8 (고각도 추종 개선)
-        ki: 0.3              # 적분 [kPa/(deg·s)]  0.15→0.2→1.5→0.3 (1.5는 45°스텝에서 0.75초만에 적분 클램프 포화 → 0~100° 리밋사이클 진동, board17 액추에이터 손상. 20260809 로그 분석)
-        kd: 0.05             # 미분 (측정값 미분) [kPa·s/deg]
-
-        # 중력 피드포워드
-        # P_ff = kff_gravity × m × g × L × sin(angle_rad)  [kPa]   ← mode 1 전용
-        # control_mode 2 는 이 상수를 쓰지 않는다: 중력 FF 를 토크(N·m)로 직접 쓰므로
-        # 환산이 불필요하다. 물리적으로 맞는 값은 1/(A·reel)/1000
-        #   A = π×0.025² = 1.9635e-3 m², reel = 0.025 m → kff = 20.4 kPa/(N·m)
-        # 아래 3.0 은 그 1/6.8 이라 mode 1 은 90°에서 중력의 29% 만 보상했다.
-        kff_gravity: 3.0     # [kPa per N·m of gravity torque]  (mode 1 전용)
-        mass_kg: 5.0         # 부하 질량 [kg]   1.0→5.0 (5kg하중 FF 정상화)
-        link_length_m: 0.15   # 0.2→0.15: 실측 링크 150 mm (중력토크 9.81→7.36 N·m)   # 링크 길이 (중력 모멘트 암) [m]
-
-        # 마찰 보상 (쿨롱 마찰)
-        friction_kpa: 3.0         # 마찰 보상 크기 [kPa]   2.0→3.0 (5kg 마찰 증가)
-        vel_deadband_dps: 0.5     # 속도 데드밴드 [deg/s]: 미만이면 정적마찰 보상
-
-        # 바이어스 (평형점 압력)
-        p_bias_pos_kpa: 105.0    # 양압 챔버 기준압 [kPa abs]
-        p_bias_neg_kpa: 90.0     # 음압 챔버 기준압 [kPa abs] (대기압 이하 = 진공)
-
-        # 음압 커플링: P_neg = p_bias_neg - delta × neg_coupling
-        # 0: 음압 챔버 고정, 1: 완전 차동
-        neg_coupling: 1.0     # delta=64(실측 최대)시 P-=90-64×1.0=26→clamp→27 kPa
-
-        # 출력 압력 제한
-        p_pos_max_kpa: 185.0     # 양압 최대 [kPa]  180→185 (고각도 도달 허용)
-        p_pos_min_kpa: 101.325   # 양압 최소 (대기압) [kPa]
-        p_neg_max_kpa: 101.325   # 음압 최대 (대기압) [kPa]
-        p_neg_min_kpa: 27.0      # 음압 최소 [kPa] — 에젝터 한계 실측값
-
-        # 액추에이터 / 엔코더 선택
-        actuator_idx: 0    # 엔코더 인덱스 (0 = board17, 1 = board18, 2 = board19)
-        pos_gid: 0         # 제어할 양압 채널 global_id
-        neg_gid: 6         # 제어할 음압 채널 global_id
-
-        # 속도 추정 LPF (엔코더 노이즈 억제). 작을수록 강한 필터 (0 < α ≤ 1)
+        # ── 공용 (mode 1 / 2) ──
+        mass_kg: 5.0          # 부하 질량 [kg]   1.0→5.0 (5kg하중 FF 정상화)
+        link_length_m: 0.15   # 0.2→0.15: 실측 링크 150 mm (중력토크 9.81→7.36 N·m)
+        p_pos_max_kpa: 185.0  # 양압 정격 [kPa abs]  180→185 (고각도 도달 허용)
+        p_neg_min_kpa: 27.0   # 음압 정격 [kPa abs] — 이젝터 한계 실측값
+        # 속도 추정 LPF (작을수록 강한 필터, 0 < α ≤ 1).
         # 0.05 → 0.3: 강한 필터는 속도 지연을 만들어 kd 를 무력화한다. alpha 0.05 에서는
         # kd 를 8배 올려도 오버슈트가 안 줄었고, 0.3 에서 kd=0.04 와 함께 2.5° → 1.0°.
         # 엔코더 양자화(≈0.08°) 때문에 더 올리면 속도 노이즈가 커진다.
         vel_filter_alpha: 0.3
+        default_angle_deg: 0.0   # TCP 미연결 시 기본 목표 각도
+        actuator_idx: 0    # 엔코더 인덱스 (board17)
+        pos_gid: 0         # 양압 채널 (board5)
+        neg_gid: 6         # 음압 채널 (board11)
 
-        # TCP 미연결 시 기본 목표 각도
-        default_angle_deg: 0.0
-
-        # 적분 와인드업 방지: 적분항 최대값 [kPa]
-        # p_pos_max(185) - p_bias_pos(105) - ff_max(29.4@90deg) - friction(3) = 47.6 kPa 여유 내에서 설정
-        integral_limit_kpa: 45.0
-
-        # 압력 레퍼런스 슬루레이트 제한 [kPa/s] — 목표압력이 한 번에 점프하지 않도록 제한
-        # (20260818: 각도명령 변경 시 목표압력이 즉시 뛰면서 190kPa 안전한계에서 릴레이 진동 발생 → 완화)
-        ref_slew_kpa_per_s: 3.0
+        # ── mode 1 전용 (휴리스틱). control_mode 2 에서는 읽히지 않는다. ──
+        mode1:
+          kp: 0.8              # 비례 [kPa/deg]   0.6→0.8 (고각도 추종 개선)
+          # 적분 [kPa/(deg·s)]  0.15→0.2→1.5→0.3
+          # (1.5 는 45° 스텝에서 0.75 초만에 적분 클램프 포화 → 0~100° 리밋사이클 진동,
+          #  board17 액추에이터 손상. 20260809 로그 분석)
+          ki: 0.3
+          kd: 0.05             # 미분(측정값 미분) [kPa·s/deg]
+          # 적분 와인드업 방지: 적분항 최대 기여 [kPa]
+          # p_pos_max(185) − p_bias_pos(105) − ff_max(29.4@90°) − friction(3) = 47.6 여유 내
+          integral_limit_kpa: 45.0
+          # 중력 FF 환산: P_ff = kff_gravity × m·g·L·sin(angle) [kPa]
+          # 물리적으로 맞는 값은 1/(A·reel)/1000 = 20.4 kPa/(N·m) 이고, 아래 3.0 은
+          # 그 1/6.8 이라 mode 1 은 90°에서 중력의 29% 만 보상한다.
+          # (mode 2 는 중력 FF 를 토크 N·m 로 직접 쓰므로 이 환산이 아예 불필요하다)
+          kff_gravity: 3.0
+          friction_kpa: 3.0    # 쿨롱 마찰 보상 [kPa]   2.0→3.0 (5kg 마찰 증가)
+          p_bias_pos_kpa: 105.0   # 양압 평형점 [kPa abs]
+          p_bias_neg_kpa: 90.0    # 음압 평형점 [kPa abs] (대기압 이하 = 진공)
+          # 음압 커플링: P_neg = p_bias_neg − delta × neg_coupling
+          # 0 = 음압 고정, 1 = 완전 차동. delta=64(실측 최대) → 90−64 = 26 → clamp 27
+          neg_coupling: 1.0
+          p_pos_min_kpa: 101.325  # 양압 하한 (대기압)
+          p_neg_max_kpa: 101.325  # 음압 상한 (대기압)
+          # 압력 레퍼런스 슬루레이트 [kPa/s] — 목표압력 점프 방지
+          # (20260818: 각도명령 변경 시 목표압력이 즉시 뛰며 190 kPa 안전한계에서 릴레이 진동)
+          ref_slew_kpa_per_s: 3.0
 
       axis1:
-        kp: 0.8
-        ki: 0.3
-        kd: 0.05
-        kff_gravity: 3.0
+        # 공용 — enc/pos/neg = board18 / board6  / board12
         mass_kg: 5.0
-        link_length_m: 0.15   # 0.2→0.15: 실측 링크 150 mm (중력토크 9.81→7.36 N·m)
-        friction_kpa: 3.0
-        vel_deadband_dps: 0.5
-        p_bias_pos_kpa: 105.0
-        p_bias_neg_kpa: 90.0
-        neg_coupling: 1.0
+        link_length_m: 0.15
         p_pos_max_kpa: 185.0
-        p_pos_min_kpa: 101.325
-        p_neg_max_kpa: 101.325
         p_neg_min_kpa: 27.0
-        actuator_idx: 1    # board18
-        pos_gid: 1         # board6
-        neg_gid: 7         # board12
         vel_filter_alpha: 0.3
         default_angle_deg: 0.0
-        integral_limit_kpa: 45.0
+        actuator_idx: 1
+        pos_gid: 1
+        neg_gid: 7
+        # mode 1 전용
+        mode1:
+          kp: 0.8
+          ki: 0.3
+          kd: 0.05
+          integral_limit_kpa: 45.0
+          kff_gravity: 3.0
+          friction_kpa: 3.0
+          p_bias_pos_kpa: 105.0
+          p_bias_neg_kpa: 90.0
+          neg_coupling: 1.0
+          p_pos_min_kpa: 101.325
+          p_neg_max_kpa: 101.325
+          ref_slew_kpa_per_s: 3.0
 
       axis2:
-        kp: 0.8
-        ki: 0.3
-        kd: 0.05
-        kff_gravity: 3.0
+        # 공용 — enc/pos/neg = board19 / board7  / board13
         mass_kg: 5.0
-        link_length_m: 0.15   # 0.2→0.15: 실측 링크 150 mm (중력토크 9.81→7.36 N·m)
-        friction_kpa: 3.0
-        vel_deadband_dps: 0.5
-        p_bias_pos_kpa: 105.0
-        p_bias_neg_kpa: 90.0
-        neg_coupling: 1.0
+        link_length_m: 0.15
         p_pos_max_kpa: 185.0
-        p_pos_min_kpa: 101.325
-        p_neg_max_kpa: 101.325
         p_neg_min_kpa: 27.0
-        actuator_idx: 2    # board19
-        pos_gid: 2         # board7
-        neg_gid: 8         # board13
         vel_filter_alpha: 0.3
         default_angle_deg: 0.0
-        integral_limit_kpa: 45.0
+        actuator_idx: 2
+        pos_gid: 2
+        neg_gid: 8
+        # mode 1 전용
+        mode1:
+          kp: 0.8
+          ki: 0.3
+          kd: 0.05
+          integral_limit_kpa: 45.0
+          kff_gravity: 3.0
+          friction_kpa: 3.0
+          p_bias_pos_kpa: 105.0
+          p_bias_neg_kpa: 90.0
+          neg_coupling: 1.0
+          p_pos_min_kpa: 101.325
+          p_neg_max_kpa: 101.325
+          ref_slew_kpa_per_s: 3.0
 
       axis3:
-        kp: 0.8
-        ki: 0.3
-        kd: 0.05
-        kff_gravity: 3.0
+        # 공용 — enc/pos/neg = board20 / board8  / board14
         mass_kg: 5.0
-        link_length_m: 0.15   # 0.2→0.15: 실측 링크 150 mm (중력토크 9.81→7.36 N·m)
-        friction_kpa: 3.0
-        vel_deadband_dps: 0.5
-        p_bias_pos_kpa: 105.0
-        p_bias_neg_kpa: 90.0
-        neg_coupling: 1.0
+        link_length_m: 0.15
         p_pos_max_kpa: 185.0
-        p_pos_min_kpa: 101.325
-        p_neg_max_kpa: 101.325
         p_neg_min_kpa: 27.0
-        actuator_idx: 3    # board20
-        pos_gid: 3         # board8
-        neg_gid: 9         # board14
         vel_filter_alpha: 0.3
         default_angle_deg: 0.0
-        integral_limit_kpa: 45.0
+        actuator_idx: 3
+        pos_gid: 3
+        neg_gid: 9
+        # mode 1 전용
+        mode1:
+          kp: 0.8
+          ki: 0.3
+          kd: 0.05
+          integral_limit_kpa: 45.0
+          kff_gravity: 3.0
+          friction_kpa: 3.0
+          p_bias_pos_kpa: 105.0
+          p_bias_neg_kpa: 90.0
+          neg_coupling: 1.0
+          p_pos_min_kpa: 101.325
+          p_neg_max_kpa: 101.325
+          ref_slew_kpa_per_s: 3.0
 
       axis4:
-        kp: 0.8
-        ki: 0.3
-        kd: 0.05
-        kff_gravity: 3.0
+        # 공용 — enc/pos/neg = board21 / board9  / board15
         mass_kg: 5.0
-        link_length_m: 0.15   # 0.2→0.15: 실측 링크 150 mm (중력토크 9.81→7.36 N·m)
-        friction_kpa: 3.0
-        vel_deadband_dps: 0.5
-        p_bias_pos_kpa: 105.0
-        p_bias_neg_kpa: 90.0
-        neg_coupling: 1.0
+        link_length_m: 0.15
         p_pos_max_kpa: 185.0
-        p_pos_min_kpa: 101.325
-        p_neg_max_kpa: 101.325
         p_neg_min_kpa: 27.0
-        actuator_idx: 4    # board21
-        pos_gid: 4         # board9
-        neg_gid: 10         # board15
         vel_filter_alpha: 0.3
         default_angle_deg: 0.0
-        integral_limit_kpa: 45.0
+        actuator_idx: 4
+        pos_gid: 4
+        neg_gid: 10
+        # mode 1 전용
+        mode1:
+          kp: 0.8
+          ki: 0.3
+          kd: 0.05
+          integral_limit_kpa: 45.0
+          kff_gravity: 3.0
+          friction_kpa: 3.0
+          p_bias_pos_kpa: 105.0
+          p_bias_neg_kpa: 90.0
+          neg_coupling: 1.0
+          p_pos_min_kpa: 101.325
+          p_neg_max_kpa: 101.325
+          ref_slew_kpa_per_s: 3.0
 
       axis5:
-        kp: 0.8
-        ki: 0.3
-        kd: 0.05
-        kff_gravity: 3.0
+        # 공용 — enc/pos/neg = board22 / board10 / board16
         mass_kg: 5.0
-        link_length_m: 0.15   # 0.2→0.15: 실측 링크 150 mm (중력토크 9.81→7.36 N·m)
-        friction_kpa: 3.0
-        vel_deadband_dps: 0.5
-        p_bias_pos_kpa: 105.0
-        p_bias_neg_kpa: 90.0
-        neg_coupling: 1.0
+        link_length_m: 0.15
         p_pos_max_kpa: 185.0
-        p_pos_min_kpa: 101.325
-        p_neg_max_kpa: 101.325
         p_neg_min_kpa: 27.0
-        actuator_idx: 5    # board22
-        pos_gid: 5         # board10
-        neg_gid: 11         # board16
         vel_filter_alpha: 0.3
         default_angle_deg: 0.0
-        integral_limit_kpa: 45.0
+        actuator_idx: 5
+        pos_gid: 5
+        neg_gid: 11
+        # mode 1 전용
+        mode1:
+          kp: 0.8
+          ki: 0.3
+          kd: 0.05
+          integral_limit_kpa: 45.0
+          kff_gravity: 3.0
+          friction_kpa: 3.0
+          p_bias_pos_kpa: 105.0
+          p_bias_neg_kpa: 90.0
+          neg_coupling: 1.0
+          p_pos_min_kpa: 101.325
+          p_neg_max_kpa: 101.325
+          ref_slew_kpa_per_s: 3.0
+
 
     LinePID:
       pos:
@@ -573,8 +594,30 @@
       # 2.5° → 3.4° 로 커져 0.5 를 택했다.
       target_time_constant: 0.5
 
-      macro_threshold : 50.0   # 10→50: 50mL 소부피 단일채널 테스트에선 macro(대유량) 개입 시 과압 스파이크 유발 → 거의 안 열리게 상향 (20260818)
-      actuating_threshold : 1.5   # 2.0→5.0→1.5: 2.4초 릴레이 진동이 데드존-크로싱 기전인지 확인용 실험 (20260818)
+      # macro 개방 판정: micro(레일) 밸브 명령이 이 %를 넘으면 "레일 포화 = 레일만으로
+      # 부족" 으로 보고 macro 를 연다. 임의의 kPa 오차 임계값(구 macro_threshold)을
+      # 대체한다 — 오차 크기는 유량 부족과 직접 관계가 없고, 슬루 제한된 레퍼런스에서는
+      # 발동조차 하지 않았다. 100 = 밸브 물리 한계이므로 사람이 정할 값이 아니다.
+      # 이 규칙이 "적게 쓰되 반응성 우선"을 동시에 만족한다: 포화 전에는 절대 안 열고,
+      # 포화하는 즉시 오차 크기와 무관하게 연다.
+      macro_micro_sat_pct : 100.0
+
+      # 명령 테이퍼 폭 [kPa]. 오차가 이 안으로 들어오면 최종 밸브 명령을 |err|/폭 배로
+      # 연속 감쇠시킨다. 구 actuating_threshold(하드 데드밴드)를 대체한다.
+      #
+      # 데드밴드가 필요했던 진짜 이유: 역밸브모델이 **작은 개도를 표현할 수 없다**.
+      # alpha_shape=3884 이라 sigma=(A_req/A_max)^(1/alpha) 가 A_req→0 에서도 0.993 이고,
+      # 요구 유량이 사실상 0 이어도 u 가 54% 로 튄다 (A_req 1e-12 → 53.9%, 1e-6 → 61.4%).
+      # 즉 이 모델에는 "살짝 열기"가 없고 0 아니면 반쯤 열기뿐이다.
+      #
+      # 그런데 하드 컷은 0 ↔ 54% 의 불연속을 만들어, 밸브 지연·히스테리시스와 만나면
+      # 데드존을 넘나드는 릴레이 진동을 스스로 유발한다 — 막으려던 진동을 만드는 구조다.
+      # 연속 테이퍼는 err→0 에서 u→0 이 부드럽게 수렴하므로 불연속이 없다. 적분항은
+      # 그대로 살아 있어 정상상태 오차는 계속 밀어낸다 (수렴만 느려진다).
+      #
+      # 값 선택: 목표 근처에서 "부드럽게 붙는" 폭. 크면 정착이 느려지고, 작으면 다시
+      # 불연속에 가까워진다. 3.0 은 구 데드밴드(1.5)의 2배 폭으로 시작점을 잡은 값이다.
+      cmd_taper_kpa : 3.0
 
 
     pressure_safety_limit_kpa: 190.0        # 170→190: p_pos_max=180 이므로 여유 확보
