@@ -20,8 +20,10 @@
 //  1. `update_sources()` 는 레일·탱크 압력을 적분하지만, 실기는 boards 1~4 로 네
 //     공급원 압력을 전부 측정한다. 따라서 적분을 하지 않고 측정값을 그대로 받고,
 //     원본의 수요 분해(레일 담당 / 탱크 부스트 초과분)만 진단용으로 계산한다.
-//  2. 이젝터도 측정값(board 4)을 하류 압력으로 쓴다 — 원본이 `sys.P_ej_meas` 로
-//     권장한 경로이고, 특성곡선 추정보다 정확하다. 측정이 없으면 특성곡선으로 폴백.
+//  2. 이젝터는 **구동 중일 때만** 측정값(board 4)을 하류 압력으로 쓴다 — 원본이
+//     `sys.P_ej_meas` 로 권장한 경로다. 꺼져 있으면 측정값이 대기압이라 능력을 0 으로
+//     오판하므로 특성곡선의 잠재력을 쓴다 (슬루 박스는 '열면 얼마나 흐르나'를 묻는
+//     능력 판정이기 때문). 이 구분이 없으면 macro 게이트가 열리지 않는 순환이 생긴다.
 //  3. 챔버 부피는 원본의 고정값(0.75/0.4 L) 대신 각도-부피식 결과를 받는다.
 //     원본 해설서 자신이 0.75 L 은 등가 스트로크 750 mm 라 비현실적이라고 표기했다.
 //  4. fmincon(SQP) 대신 **박스 제약 SQP** — 매 반복 Gauss-Newton 이차모형을 만들어
@@ -112,8 +114,15 @@ public:
     double P_rail_pos{0.0};   // board 1 [Pa gauge]
     double P_rail_neg{0.0};   // board 2
     double P_tank{700e3};     // board 3
-    double P_ej{0.0};         // board 4 — 측정 음압. use_ej_meas 가 false 면 무시
+    double P_ej{0.0};         // board 4 — 측정 음압
     bool   use_ej_meas{true};
+    // 이젝터가 지금 구동 중인지 (MacroSwitch 개방 여부).
+    //
+    // 중요: 슬루 박스는 "이 밸브를 열면 얼마나 흐를 수 있나"를 계산하는 **능력** 판정이다.
+    // 이젝터가 꺼져 있으면 board 4 측정값은 대기압이므로 측정값을 그대로 쓰면 능력이 0 이
+    // 되고, 그러면 부족분도 0 이 되어 게이트가 영원히 안 열리는 순환에 빠진다.
+    // → 구동 중이면 측정값(실제 성능 반영)을, 꺼져 있으면 특성곡선의 도달 진공(잠재력)을 쓴다.
+    bool   ej_running{false};
   };
 
   // ── 출력 ──────────────────────────────────────────────────────────────
@@ -123,7 +132,11 @@ public:
     std::vector<double> lb_pos, ub_pos, lb_neg, ub_neg;   // 슬루 박스 [Pa gauge]
     double rail_pos_sp{0.0}, rail_neg_sp{0.0};  // [Pa gauge]
     double demand_norm{0.0};
-    // 진단 (원본 update_sources 의 usage)
+    // 축별 "레일만으로는 이번 스텝 수요를 못 낸다" 부족분 [kg/s].
+    // > 0 이면 그 축은 지금 유량 부족(flow-starved) 이고 macro 경로(탱크 부스트 /
+    // 이젝터)가 필요하다는 뜻이다. Controller 가 이 값으로 macro 밸브를 개방한다.
+    std::vector<double> boost_pos, eject_neg;
+    // 진단 (원본 update_sources 의 usage) — 위 축별 값의 합
     double m_fill{0.0}, m_boost{0.0}, m_suck{0.0}, m_eject{0.0}, m_tank_draw{0.0};
     bool   tank_low{false};
     int    sqp_iters{0};

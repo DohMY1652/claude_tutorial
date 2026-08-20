@@ -96,6 +96,9 @@ VirtualPowerpack::VirtualPowerpack(const rclcpp::NodeOptions& opts)
   pump_geom_.omega  = gpd(this, "Virtual.pump.rpm", 3000.0) * 2.0 * M_PI / 60.0;
   pump_geom_.Npis   = gp<int>(this, "Virtual.pump.n_piston", 2);
 
+  ej_floor_kpa_ = pneu::EjectorCurve::reachable_kpa_abs(
+      gpd(this, "Virtual.tank.regulated_kpa_gauge", 700.0));
+
   // 압축탱크
   tank_volume_m3_      = gpd(this, "Virtual.tank.volume_ml",   213.0) * 1e-6;
   tank_charge_kpa_abs_ = gpd(this, "Virtual.tank.charge_kpa",  30000.0);
@@ -479,18 +482,27 @@ void VirtualPowerpack::integrate(const std::array<double, PWM_TOTAL>& pwm, doubl
     ej_consume_lpm_   = pneu::EjectorCurve::consume_lpm(drive_g);
     ej_reach_kpa_abs_ = pneu::EjectorCurve::reachable_kpa_abs(drive_g);
 
-    // 도달 진공까지의 오리피스 유량을 정격 흡입량으로 제한 (정압 싱크 가정의 과대평가 방지)
+    // 도달 진공까지의 오리피스 유량을 정격 흡입량으로 제한 (정압 싱크 가정의 과대평가 방지).
+    // 카탈로그 흡입량은 표준 LPM 이므로 이 파일의 내부 유량 단위로 환산해서 비교한다.
+    constexpr double STD2INT = pneu::STD_LPM_TO_KGPS / LPM_TO_KGPS;
     const double f_orif = step_valve(u_sw, P_line_macro_neg_kpa_, ej_reach_kpa_abs_,
                                      line_valve_params_, valves_[slot_or_zero(s)], dt_sub);
-    const double f_suction = std::min(f_orif, ej_suction_lpm_);
+    const double f_suction = std::min(f_orif, ej_suction_lpm_ * STD2INT);
     const double f_leak = line_leak_macro_neg_ * std::max(0.0, P_atm_kpa_ - P_line_macro_neg_kpa_);
     P_line_macro_neg_kpa_ += dt_sub * pressure_derivative(
         P_line_macro_neg_kpa_, line_macro_neg_fill + f_leak - f_suction,
         V_line_macro_neg_ml_ * 1e-6, 0.0);
-    P_line_macro_neg_kpa_ = std::clamp(P_line_macro_neg_kpa_, ej_reach_kpa_abs_, 110.0);
+    // 하한은 **최대 구동 시** 도달 진공으로 고정한다. 순간 도달진공(ej_reach_kpa_abs_)을
+    // 하한으로 쓰면 MacroSwitch 가 꺼지는 틱마다 그 값이 대기압이 되어 라인이 강제로
+    // 대기압까지 되돌아간다 — 이젝터가 꺼져도 진공은 유지되어야 하고, 복귀는 누설과
+    // 채널 유입으로만 일어나야 한다. (이 버그 때문에 board 4 가 계속 101.3 에 붙어 있었다)
+    P_line_macro_neg_kpa_ = std::clamp(P_line_macro_neg_kpa_, ej_floor_kpa_, 110.0);
 
-    // 이젝터 구동은 탱크 공기를 먹는다 — 음압을 쓰면 양압 자원도 줄어드는 결합
-    tank_mass_kg_ = std::max(0.0, tank_mass_kg_ - ej_consume_lpm_ * LPM_TO_KGPS * dt_sub);
+    // 이젝터 구동은 탱크 공기를 먹는다 — 음압을 쓰면 양압 자원도 줄어드는 결합.
+    // 소비량도 카탈로그 표준 LPM 이므로 표준 환산 상수를 쓴다 (경험적 LPM_TO_KGPS 를
+    // 쓰면 10.7배 빨리 말라 76 g 탱크가 6초에 바닥난다).
+    tank_mass_kg_ = std::max(0.0,
+        tank_mass_kg_ - ej_consume_lpm_ * pneu::STD_LPM_TO_KGPS * dt_sub);
 
     valve_flow_lpm_[slot_or_zero(s)] = f_suction;
     valve_u_pct_[slot_or_zero(s)]    = u_sw;

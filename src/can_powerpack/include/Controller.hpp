@@ -180,6 +180,16 @@ public:
   void solve(float dt_ms, std::array<uint16_t, MPC_OUT_DIM>& out3, float current_time_sec);
   const Config& cfg() const { return cfg_; }
 
+  // macro(탱크 부스트 / 이젝터) 경로 개방 허용.
+  //
+  // 원래 철학은 "transient 에서 유량이 부족해 목표에 빠르게 못 갈 때 macro 로
+  // 부스팅한다" 였고, 그 판정을 |P_ref − P| ≥ macro_threshold 로 근사했다.
+  // control_mode 2 에서는 레퍼런스가 슬루 제한을 받아 채널 오차가 항상 작게
+  // 유지되므로 그 임계값이 구조적으로 발동하지 않는다. 대신 생성기가 축별로
+  // "레일만으로는 이번 스텝 수요를 못 낸다"를 직접 계산하므로 그 판단을 여기로 넘긴다.
+  // (mode 0/1 에서는 아무도 호출하지 않아 기존 임계값 동작이 그대로 유지된다.)
+  inline void set_macro_allow(bool allow) { macro_allow_ = allow; }
+
   float current_P_now_       = 101.325f;
   float current_P_micro_     = 101.325f;
   float current_P_macro_     = 101.325f;
@@ -192,6 +202,7 @@ private:
   double z_atm_{0.0},   prev_I_atm_{0.0};
   double z_macro_{0.0}, prev_I_macro_{0.0};
   int    dir_micro_{0},  dir_atm_{0},  dir_macro_{0};
+  std::atomic<bool> macro_allow_{false};   // 생성기가 매 틱 갱신 (mode 2)
   std::array<float,3> compute_input_reference(float P_now, float P_micro, float P_macro, float P_macro_neg, float dt_sec, float current_time_sec);
   void build_mpc_qp(const std::vector<float>& A_seq, const std::vector<Eigen::RowVector3f>& B_seq, float P_now, const std::vector<float>& P_ref, Eigen::MatrixXf& P, Eigen::VectorXf& q, Eigen::MatrixXf& A_con, Eigen::VectorXf& LL, Eigen::VectorXf& UL);
   std::array<float,3> solve_qp_first_step(const Eigen::MatrixXf& P, const Eigen::VectorXf& q, const Eigen::MatrixXf& A_con, const Eigen::VectorXf& LL, const Eigen::VectorXf& UL);
@@ -576,6 +587,14 @@ private:
   };
   std::vector<TorquePid>  tau_pid_;
   std::vector<double>     tau_integ_;
+
+  // macro 게이트 임계 [kg/s]. 생성기의 축별 부족분이 이 값을 넘으면 macro 를 연다.
+  // 수치 노이즈로 밸브가 떨지 않게 하는 데드밴드 역할.
+  double gen_macro_gate_kgps_{5e-5};
+  std::vector<double> gen_boost_gs_, gen_eject_gs_;   // 진단용 [g/s]
+
+  // gid → MPC 조회 (macro 게이트 설정용)
+  AcadosMpc* mpc_for_gid(int gid) const;
 
   // 생성기 결과 ZOH (생성기 주기 사이 유지)
   std::vector<double> gen_pos_ref_kpa_, gen_neg_ref_kpa_;

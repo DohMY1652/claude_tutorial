@@ -83,7 +83,9 @@ void PressureRefGen::decide_rail_setpoint(const std::vector<std::vector<double>>
 double PressureRefGen::ejector_flow(double Pch_gauge, const SupplyState& sup,
                                     double* P_ej_out) const
 {
-  if (sup.use_ej_meas) {
+  // 구동 중이면 측정값을 쓴다 (실제 성능·지연이 반영된 가장 정확한 값).
+  // 꺼져 있으면 측정값은 대기압이라 능력을 0 으로 오판하므로 특성곡선의 잠재력을 쓴다.
+  if (sup.use_ej_meas && sup.ej_running) {
     if (P_ej_out) *P_ej_out = sup.P_ej;
     return valve_phys_kgps(Pch_gauge + P_ATM, sup.P_ej + P_ATM, p_.A_eject);
   }
@@ -217,6 +219,7 @@ PressureRefGen::Result PressureRefGen::step(const std::vector<double>& F_ref_in,
   res.F_achieved.assign((size_t)N, 0.0);
   res.lb_pos.assign((size_t)N, 0.0); res.ub_pos.assign((size_t)N, 0.0);
   res.lb_neg.assign((size_t)N, 0.0); res.ub_neg.assign((size_t)N, 0.0);
+  res.boost_pos.assign((size_t)N, 0.0); res.eject_neg.assign((size_t)N, 0.0);
 
   // 목표 힘은 항상 ≥ 0 (이 시스템은 한 방향 힘만 낸다)
   std::vector<double> F_ref((size_t)N, 0.0);
@@ -320,6 +323,10 @@ PressureRefGen::Result PressureRefGen::step(const std::vector<double>& F_ref_in,
     const double mej_cap   = ejector_flow(a.P_neg, sup);
     const double msuck  = std::min(ddn, msuck_cap);
     const double meject = std::min(std::max(0.0, ddn - msuck), mej_cap);
+
+    // 축별 부족분 — Controller 의 macro 게이트가 이 값을 본다
+    res.boost_pos[(size_t)i] = mboost;
+    res.eject_neg[(size_t)i] = meject;
 
     res.m_fill += mfill; res.m_boost += mboost;
     res.m_suck += msuck; res.m_eject += meject;

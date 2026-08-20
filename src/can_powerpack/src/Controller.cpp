@@ -498,7 +498,10 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
       u_mi_req = valve_invert(Q_req, (double)P_micro, (double)P_now, z_micro_)
                  + ki_mi * pos_error_integral_;
       u_at_req = 0.f;
-      u_ma_req = (std::abs(err) >= cfg_.macro_threshold)
+      // macro 개방 판정: 생성기가 "레일만으로 부족"이라고 알려주면(macro_allow_) 열고,
+      // 아니면 기존 오차 임계값 폴백을 쓴다 (mode 0/1 은 폴백만 동작).
+      u_ma_req = (macro_allow_.load(std::memory_order_relaxed)
+                  || std::abs(err) >= cfg_.macro_threshold)
                  ? valve_invert(Q_req, (double)P_macro, (double)P_now, z_macro_)
                    + ki_ma * pos_error_integral_
                  : 0.f;
@@ -513,7 +516,8 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
       u_mi_req = valve_invert(Q_req, (double)P_now, (double)P_micro, z_micro_)
                  + ki_mi * neg_error_integral_;
       u_at_req = 0.f;
-      u_ma_req = (std::abs(err) >= cfg_.macro_threshold)
+      u_ma_req = (macro_allow_.load(std::memory_order_relaxed)
+                  || std::abs(err) >= cfg_.macro_threshold)
                  ? valve_invert(Q_req, (double)P_now, (double)cfg_.ejector_p_limit, z_macro_)
                    + ki_ma * neg_error_integral_
                  : 0.f;
@@ -996,6 +1000,9 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   gen_use_ej_meas_  = get_param_or<bool>(this, "PressureRefGen.use_ejector_measurement", true);
   gen_pos_ref_kpa_.assign(num_actuators_, sensor_.kpa_atm());
   gen_neg_ref_kpa_.assign(num_actuators_, sensor_.kpa_atm());
+  gen_boost_gs_.assign(num_actuators_, 0.0);
+  gen_eject_gs_.assign(num_actuators_, 0.0);
+  gen_macro_gate_kgps_ = get_param_or<double>(this, "PressureRefGen.macro_gate_kgps", 5e-5);
 
   tau_pid_.assign(num_actuators_, TorquePid{});
   tau_integ_.assign(num_actuators_, 0.0);
@@ -1881,6 +1888,9 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     sup.P_tank     = to_gauge_pa(filt_out_[P_macro_board_id_ - 1]);
     sup.P_ej       = to_gauge_pa(filt_out_[P_macro_neg_board_id_ - 1]);
     sup.use_ej_meas = gen_use_ej_meas_;
+    // MacroSwitch(board4 v1) 개방 여부 = 이젝터 구동 중
+    sup.ej_running  = (macro_switch_pwm_index_ >= 0 && macro_switch_pwm_index_ < PWM_TOTAL)
+                      ? (zoh_[(size_t)macro_switch_pwm_index_] > 0) : false;
 
     // 축 상태: 챔버 압력 + 부피 + 부피 변화율
     std::vector<PressureRefGen::AxisState> axes((size_t)N);
@@ -1910,6 +1920,21 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     gen_rail_neg_sp_kpa_ = to_abs_kpa(r.rail_neg_sp);
     gen_has_result_ = true;
 
+    // ── macro 게이트: 생성기의 축별 "유량 부족" 판정으로 구동 ─────────────
+    // 원래 철학(transient 에서 유량이 부족해 목표에 빠르게 못 갈 때 부스팅)을
+    // 오차 임계값 대신 생성기의 부족분으로 판정한다. 슬루 박스가 이미 부스트/이젝터
+    // 능력을 포함해 레퍼런스를 만들었으므로, 부족분 > 0 은 "그 능력을 쓸 계획"이라는 뜻이다.
+    // 이렇게 하면 계획과 실제 밸브 동작이 일치한다.
+    for (int a = 0; a < N; ++a) {
+      const auto& cfg = pos_ctrl_cfg_[(size_t)a];
+      const bool boost_needed = r.boost_pos[(size_t)a] > gen_macro_gate_kgps_;
+      const bool eject_needed = r.eject_neg[(size_t)a] > gen_macro_gate_kgps_;
+      if (auto* m = mpc_for_gid(cfg.pos_gid)) m->set_macro_allow(boost_needed);
+      if (auto* m = mpc_for_gid(cfg.neg_gid)) m->set_macro_allow(eject_needed);
+      gen_boost_gs_[(size_t)a] = r.boost_pos[(size_t)a] * 1e3;
+      gen_eject_gs_[(size_t)a] = r.eject_neg[(size_t)a] * 1e3;
+    }
+
     // ── 3. 적응 레일 셋포인트를 LinePID 에 넘긴다 ────────────────────
     pid_pos_.ref = gen_rail_pos_sp_kpa_;
     pid_neg_.ref = gen_rail_neg_sp_kpa_;
@@ -1917,7 +1942,7 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     // 디버그 토픽: 축마다 10개 + 말미 공용 6개
     if (pub_refgen_dbg_) {
       std_msgs::msg::Float64MultiArray m;
-      m.data.reserve((size_t)N * 10 + 6);
+      m.data.reserve((size_t)N * 12 + 6);
       for (int a = 0; a < N; ++a) {
         m.data.push_back(dbg_angle[(size_t)a]);
         m.data.push_back(dbg_angle_ref[(size_t)a]);
@@ -1929,6 +1954,8 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
         m.data.push_back(to_abs_kpa(r.lb_pos[(size_t)a]));
         m.data.push_back(to_abs_kpa(r.lb_neg[(size_t)a]));       // 슬루 하한 P⁻
         m.data.push_back(to_abs_kpa(r.ub_neg[(size_t)a]));
+        m.data.push_back(gen_boost_gs_[(size_t)a]);              // 탱크 부스트 부족분 [g/s]
+        m.data.push_back(gen_eject_gs_[(size_t)a]);              // 이젝터 부족분 [g/s]
       }
       m.data.push_back(gen_rail_pos_sp_kpa_);
       m.data.push_back(gen_rail_neg_sp_kpa_);
@@ -1943,14 +1970,17 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
       RCLCPP_INFO(get_logger(),
         "[RefGen] θ=%.2f→%.2f°  τ=%.2f/%.2f N·m (pid %.2f ff %.2f) | "
         "P⁺=%.1f[%.1f~%.1f] P⁻=%.1f[%.1f~%.1f] | rail SP %.1f/%.1f | "
-        "tank %.0f%s boost %.2f ej %.2f g/s  it=%d",
+        "tank %.0f%s boost %.2f ej %.2f g/s [%s%s] it=%d",
         dbg_angle[0], dbg_angle_ref[0], r.F_achieved[0] * reel_m, tau_ref[0],
         dbg_tau_pid[0], dbg_tau_ff[0],
         gen_pos_ref_kpa_[0], to_abs_kpa(r.lb_pos[0]), to_abs_kpa(r.ub_pos[0]),
         gen_neg_ref_kpa_[0], to_abs_kpa(r.lb_neg[0]), to_abs_kpa(r.ub_neg[0]),
         gen_rail_pos_sp_kpa_, gen_rail_neg_sp_kpa_,
         filt_out_[P_macro_board_id_ - 1], r.tank_low ? " LOW" : "",
-        r.m_boost * 1e3, r.m_eject * 1e3, r.sqp_iters);
+        r.m_boost * 1e3, r.m_eject * 1e3,
+        r.boost_pos[0] > gen_macro_gate_kgps_ ? "B" : "-",
+        r.eject_neg[0] > gen_macro_gate_kgps_ ? "E" : "-",
+        r.sqp_iters);
     }
   }
 
@@ -1965,6 +1995,12 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
         mpc_ref_kpa_[(size_t)cfg.neg_gid] = gen_neg_ref_kpa_[(size_t)a];
     }
   }
+}
+
+AcadosMpc* Controller::mpc_for_gid(int gid) const {
+  for (const auto& m : mpcs_)
+    if (m && m->cfg().global_id == gid) return m.get();
+  return nullptr;
 }
 
 void Controller::inner_loop_1khz(float /*dt_ms*/) {

@@ -196,7 +196,8 @@ private:
   // 구동압은 board 4 v1(MacroSwitch)이 열렸을 때의 탱크 레귤레이터 출력.
   double ej_suction_lpm_{0.0};             // 진단용
   double ej_consume_lpm_{0.0};
-  double ej_reach_kpa_abs_{101.325};
+  double ej_reach_kpa_abs_{101.325};    // 현재 구동압에서의 도달 진공
+  double ej_floor_kpa_{11.325};         // 최대 구동 시 도달 진공 = 수치 하한
 
   double ejector_limit_kpa_{11.325};    // 음압 채널 압력 하한 (수치 가드)
   double V_line_pos_ml_{500.0};
