@@ -163,6 +163,10 @@ install(PROGRAMS
   scripts/pp_monitor.py
   scripts/pp_logger.py
   scripts/position_ref_client.py
+  scripts/valve_fit_model.py
+  scripts/valve_fit_record.py
+  scripts/valve_fit_solve.py
+  scripts/valve_fit_selftest.py
   scripts/run_powerpack.sh
   DESTINATION lib/${PROJECT_NAME}
 )
