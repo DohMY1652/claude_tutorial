@@ -153,9 +153,12 @@ public:
     // macro 를 여는 판정에 쓰는 micro 포화 기준 [%]. 100 = 레일 밸브를 완전히 열었는데도
     // 요구 유량을 못 낼 때만 macro 를 연다 (임의 임계값이 아니라 밸브 물리 한계).
     float macro_micro_sat_pct = 100.0f;
-    // 명령 테이퍼 폭 [kPa]. 오차가 이 안으로 들어오면 최종 밸브 명령을 연속적으로
-    // 0 까지 줄인다. 하드 데드밴드를 대체한다 — 이유는 solve() 주석 참조.
+    // 명령 테이퍼 폭 [kPa]. 오차가 이 안으로 들어오면 **크래킹 임계 위쪽 여유분**을
+    // 연속적으로 줄인다. 하드 데드밴드를 대체한다 — 이유는 solve() 주석 참조.
     float cmd_taper_kpa = 3.0f;
+    // "닫힘"으로 볼 유효면적 비율 (A_eff / A_max). 이 면적에 해당하는 전류가 크래킹
+    // 임계이고, 그 이하에서는 솔레노이드 자기력이 스풀을 못 들어 유량이 0 이다.
+    float valve_crack_area_frac = 1e-6f;
     // 13-variable proportional valve model parameters
     float I_MAX{0.30f};
     float A_max{0.2845f};
@@ -205,6 +208,9 @@ private:
   double z_atm_{0.0},   prev_I_atm_{0.0};
   double z_macro_{0.0}, prev_I_macro_{0.0};
   int    dir_micro_{0},  dir_atm_{0},  dir_macro_{0};
+  // 밸브별 크래킹 임계 [%] — compute_input_reference 가 매 틱 현재 Pin/z 로 갱신한다.
+  // 순서는 last_u3_ 와 동일: [0]=micro, [1]=macro, [2]=atm.
+  std::array<float,3> u_crack_{0.f, 0.f, 0.f};
   std::atomic<bool> macro_allow_{false};   // 생성기가 매 틱 갱신 (mode 2)
   std::array<float,3> compute_input_reference(float P_now, float P_micro, float P_macro, float P_macro_neg, float dt_sec, float current_time_sec);
   void build_mpc_qp(const std::vector<float>& A_seq, const std::vector<Eigen::RowVector3f>& B_seq, float P_now, const std::vector<float>& P_ref, Eigen::MatrixXf& P, Eigen::VectorXf& q, Eigen::MatrixXf& A_con, Eigen::VectorXf& LL, Eigen::VectorXf& UL);
@@ -481,6 +487,7 @@ private:
     double target_tc{0.2};
     double macro_micro_sat_pct{100.0};
     double cmd_taper_kpa{3.0};
+    double valve_crack_area_frac{1e-6};
   } mpc_;
 
   std::vector<double> vol_ml_;

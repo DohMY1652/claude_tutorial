@@ -408,19 +408,32 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
       std::pow(Pr, 2.0/kappa) - std::pow(Pr, (kappa+1.0)/kappa)));
   };
 
-  // Inverse valve model: given required Q [LPM], P_in, P_out, z → u_pct [0,100]
-  auto valve_invert = [&](double Q_req, double Pin, double Pout, double z_val) -> float {
-    if (Q_req <= 0.0) return 0.0f;
-    const double phi = get_phi_ff(Pin, Pout);
-    if (phi < 1e-9) return 0.0f;
-    const double Area_req = Q_req / (Pin * phi);
-    const double A_max_d  = (double)cfg_.A_max;
-    const double alpha_d  = (double)cfg_.alpha_shape;
+  // 유효면적 → 필요 전류[%] 역산. 순방향 모델
+  //   F_net = I + C_z·z + C_p·Pin − C_k ,  A_eff = A_max·sigmoid(k·F_net)^alpha
+  // 을 그대로 뒤집은 것이다. C_p·Pin 항 때문에 **상류 압력이 높으면 필요 전류가 낮아진다**
+  // (압력이 스풀을 밀어 올려 자기력을 돕는다).
+  auto u_of_area = [&](double Area_req, double Pin, double z_val) -> float {
+    const double A_max_d = (double)cfg_.A_max;
+    const double alpha_d = (double)cfg_.alpha_shape;
     if (Area_req >= A_max_d) return 100.0f;
     const double sigma = std::pow(std::clamp(Area_req / A_max_d, 1e-9, 1.0-1e-9), 1.0/alpha_d);
     const double F_req = std::log(sigma / (1.0 - sigma)) / (double)cfg_.k_shape;
     const double I_req = F_req - (double)cfg_.C_z * z_val - (double)cfg_.C_p * Pin + (double)cfg_.C_k;
     return (float)std::clamp(I_req / (double)cfg_.I_MAX * 100.0, 0.0, 100.0);
+  };
+
+  // Inverse valve model: given required Q [LPM], P_in, P_out, z → u_pct [0,100]
+  auto valve_invert = [&](double Q_req, double Pin, double Pout, double z_val) -> float {
+    if (Q_req <= 0.0) return 0.0f;
+    const double phi = get_phi_ff(Pin, Pout);
+    if (phi < 1e-9) return 0.0f;
+    return u_of_area(Q_req / (Pin * phi), Pin, z_val);
+  };
+
+  // 크래킹 임계 [%] — 이 명령 이하에서는 스풀이 들리지 않아 유량이 0 이다.
+  // 실측(50% 부근)과 일치한다: 351 kPa abs 레일에서 이 모델은 약 52% 를 준다.
+  auto u_crack = [&](double Pin, double z_val) {
+    return u_of_area((double)cfg_.valve_crack_area_frac * (double)cfg_.A_max, Pin, z_val);
   };
 
   const float Pref = cfg_.ref_value;
@@ -491,6 +504,10 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   const double Q_req = (double)std::abs(m_dot_pressure + m_dot_volume);
 
   if (cfg_.is_positive) {
+    // 양압 채널: micro=레일→챔버, macro=탱크→챔버, atm=챔버→대기
+    u_crack_ = { u_crack((double)P_micro, z_micro_),
+                 u_crack((double)P_macro, z_macro_),
+                 u_crack((double)P_now,   z_atm_) };
     if ((m_dot_pressure + m_dot_volume) > 0.f) {
       u_mi_req = valve_invert(Q_req, (double)P_micro, (double)P_now, z_micro_)
                  + ki_mi * pos_error_integral_;
@@ -506,6 +523,10 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
                  + ki_at * std::abs(pos_error_integral_);
     }
   } else {
+    // 음압 채널: micro=챔버→음압레일, macro=챔버→이젝터, atm=대기→챔버
+    u_crack_ = { u_crack((double)P_now,     z_micro_),
+                 u_crack((double)P_now,     z_macro_),
+                 u_crack((double)P_abs_atm, z_atm_) };
     if ((m_dot_pressure + m_dot_volume) < 0.f) {
       u_mi_req = valve_invert(Q_req, (double)P_now, (double)P_micro, z_micro_)
                  + ki_mi * neg_error_integral_;
@@ -648,17 +669,22 @@ void AcadosMpc::solve(float dt_ms,
   float err     = cfg_.ref_value - P_now;
 
   // ── 명령 테이퍼 (하드 데드밴드 대체) ─────────────────────────────────────
-  // 이전에는 |err| < actuating_threshold 면 전 밸브를 0 으로 잘랐다. 그 이유는
-  // 역밸브모델이 **작은 개도를 표현할 수 없기** 때문이다: alpha_shape=3884 이라
-  // sigma=(A_req/A_max)^(1/alpha) 가 A_req→0 에서도 0.993 이라, 요구 유량이 사실상
-  // 0 이어도 u 는 54% 로 튄다 (A_req 1e-12 → u 53.9%, 1e-6 → 61.4%). 즉 이 모델에는
-  // "살짝 열기"가 없고 0 아니면 반쯤 열기뿐이다.
+  // 이 밸브는 **크래킹 임계**가 있다: 솔레노이드 자기력이 스프링/압력을 이겨 스풀을
+  // 들어올려야 흐르기 시작하므로, 그 전류(≈50%, 상류 압력에 따라 변동) 아래에서는
+  // 유량이 0 이다. 13-variable 모델이 이걸 C_p·Pin 항과 alpha_shape 로 재현한다
+  // (실측 ≈50%, 모델은 351 kPa abs 레일에서 ≈52%).
   //
-  // 그런데 하드 컷은 0 ↔ 54% 사이의 **불연속**을 만들어, 밸브 지연·히스테리시스와
-  // 만나면 데드존을 넘나드는 릴레이 진동을 스스로 유발한다 (막으려던 진동을 만든다).
-  // → 잘라내는 대신 오차에 비례해 최종 명령을 연속적으로 줄인다. err→0 에서 u→0 이
-  //   부드럽게 수렴하므로 불연속이 없고, 목표 근처에서 밸브가 조금만 열린다.
-  //   적분항은 그대로 살아 있어 정상상태 오차는 계속 밀어낸다 (수렴만 느려진다).
+  // 따라서 "개도를 줄인다"는 것은 u 를 0 쪽으로 줄이는 게 아니라 **크래킹 임계 위쪽
+  // 여유분**을 줄이는 것이다. u 를 그냥 0 쪽으로 스케일하면 임계 아래로 떨어져
+  // 유량이 급절되므로, 연속 테이퍼가 아니라 데드밴드를 다시 만드는 셈이 된다.
+  //   u_out = u_crack + (u_req − u_crack) · taper      (u_req > u_crack 일 때)
+  // err→0 에서 u_out → u_crack 이고 그 점의 유량이 0 이므로 **유량이 연속**이다.
+  // 명령을 u_crack 에서 0 으로 떨어뜨리는 것도 유량 기준으로는 무동작이라 안전하다.
+  //
+  // 하드 데드밴드를 버린 이유: |err| 로 명령을 잘라내면 그 경계에서 유량이 0 ↔ 큰 값
+  // 으로 튀어, 밸브 지연·히스테리시스와 만나면 데드존을 넘나드는 릴레이 진동을 스스로
+  // 유발한다. 위 방식은 경계에서 유량이 0 에서 출발하므로 그 기전이 없다.
+  // 적분항은 살아 있어 정상상태 오차는 계속 밀어낸다 (수렴만 느려진다).
   const float taper = std::clamp(std::abs(err) / std::max(1e-3f, cfg_.cmd_taper_kpa),
                                  0.0f, 1.0f);
 
@@ -697,12 +723,15 @@ void AcadosMpc::solve(float dt_ms,
 
   auto du3 = solve_qp_first_step(Pmat_, qvec_, Acon_, LL_, UL_);
 
-  // 테이퍼는 QP 결과까지 포함한 **최종** 명령에 곱한다. u_ref 만 줄이면 MPC 가 Δu 로
+  // 테이퍼는 QP 결과까지 포함한 **최종** 명령에 적용한다. u_ref 만 줄이면 MPC 가 Δu 로
   // 다시 밀어올려 무력화되기 때문이다.
+  auto taper_above_crack = [taper](float u, float u_c) {
+    return (u <= u_c) ? 0.0f : u_c + (u - u_c) * taper;
+  };
   std::array<float,3> u0{
-    std::clamp(uref_arr[0] + du3[0], 0.0f, 100.0f) * taper,
-    std::clamp(uref_arr[1] + du3[1], 0.0f, 100.0f) * taper,
-    std::clamp(uref_arr[2] + du3[2], 0.0f, 100.0f) * taper,
+    taper_above_crack(std::clamp(uref_arr[0] + du3[0], 0.0f, 100.0f), u_crack_[0]),
+    taper_above_crack(std::clamp(uref_arr[1] + du3[1], 0.0f, 100.0f), u_crack_[1]),
+    taper_above_crack(std::clamp(uref_arr[2] + du3[2], 0.0f, 100.0f), u_crack_[2]),
   };
   last_u3_ = u0;
 
@@ -777,6 +806,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.target_tc = get_param_or<double>(this, "MPC_parameters.target_time_constant", 0.2);
   mpc_.macro_micro_sat_pct = get_param_or<double>(this, "MPC_parameters.macro_micro_sat_pct", 100.0);
   mpc_.cmd_taper_kpa       = get_param_or<double>(this, "MPC_parameters.cmd_taper_kpa",          3.0);
+  mpc_.valve_crack_area_frac = get_param_or<double>(this, "MPC_parameters.valve_crack_area_frac", 1e-6);
 
 
   default_volume_ml_  = get_param_or<double>(this, "default_volume_ml",    1.0);
@@ -1233,6 +1263,7 @@ void Controller::build_mpcs() {
       cfg.target_time_constant = (float)mpc_.target_tc;
       cfg.macro_micro_sat_pct  = (float)mpc_.macro_micro_sat_pct;
       cfg.cmd_taper_kpa        = (float)mpc_.cmd_taper_kpa;
+      cfg.valve_crack_area_frac = (float)mpc_.valve_crack_area_frac;
 
       auto mpc_obj = std::make_unique<AcadosMpc>(cfg);
       int nv = cfg.n_u * cfg.NP; 
