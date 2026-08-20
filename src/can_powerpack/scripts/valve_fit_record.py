@@ -166,6 +166,14 @@ class Recorder(Node):
             self._pwm[idx] = int(round(max(0.0, min(100.0, pct)) * PCT_TO_PWM))
         self.flush()
 
+    def brake(self, board_id, target_valve, neutral_valve):
+        """대상밸브 폐쇄 + 중립밸브 전개를 한 번의 발행으로. 닫힘 꼬리 유량을 제동한다."""
+        base = (board_id - 1) * PWM_PER_BOARD
+        with self._lock:
+            self._pwm[base + VALVE_IDX[target_valve]] = 0
+            self._pwm[base + VALVE_IDX[neutral_valve]] = 4095
+        self.flush()
+
     def close_channel(self, board_id):
         with self._lock:
             base = (board_id - 1) * PWM_PER_BOARD
@@ -241,8 +249,21 @@ class Recorder(Node):
         self.get_logger().error(f'[TRIP] {why} — 중립밸브 전개, 중단')
 
     # ── 유틸 ──────────────────────────────────────────────────────────────
-    def zero_offsets(self, boards, seconds=0.5):
-        """전 채널 대기 개방 상태에서 offset 재취득 (Controller 의 기동 0점 보정과 동일)."""
+    def vent_all(self, gids, seconds=3.0):
+        """0점 보정 전에 전 대상 채널을 대기압으로 되돌린다."""
+        self.safe_state(gids)
+        time.sleep(seconds)
+        self.all_zero()
+        time.sleep(0.3)
+
+    def zero_offsets(self, boards, seconds=0.5, tol_kpa=8.0):
+        """대기 개방 상태에서 offset 재취득 (Controller 의 기동 0점 보정과 동일).
+
+        **반드시 검증한다.** 압력이 남은 상태로 보정하면 그 값이 전부 오프셋으로 흡수돼
+        이후 모든 측정이 그만큼 치우치고, 과압 트립 기준도 같이 틀어진다 (실측: 챔버에
+        51 kPa 가 남은 채 보정해 트립이 잘못 발동했다). yaml 값과의 차이를 kPa 로 환산해
+        허용 범위를 넘으면 예외를 던진다.
+        """
         acc = {b: [] for b in boards}
         t_end = time.time() + seconds
         while time.time() < t_end:
@@ -250,10 +271,27 @@ class Recorder(Node):
                 for b in boards:
                     acc[b].append(self._sens_mv[b - 1])
             time.sleep(0.005)
+
+        bad = []
+        new = {}
         for b in boards:
-            if acc[b]:
-                self._offset[b] = sum(acc[b]) / len(acc[b])
-        return {b: round(self._offset[b], 1) for b in boards}
+            if not acc[b]:
+                continue
+            mv = sum(acc[b]) / len(acc[b])
+            yaml_off, gain = self.calib.get(b, (mv, 0.0))
+            drift = abs(mv - yaml_off) * abs(gain)      # kPa 등가
+            new[b] = (mv, drift)
+            if drift > tol_kpa:
+                bad.append(f'board {b}: {drift:.1f} kPa 상당 (mV {mv:.0f} vs yaml {yaml_off:.0f})')
+        if bad:
+            raise SystemExit(
+                '0점 보정값이 yaml 과 너무 다르다 — 라인/챔버에 압력이 남아 있을 가능성이 높다.\n  '
+                + '\n  '.join(bad)
+                + f'\n허용치는 {tol_kpa:.0f} kPa 다. 전 채널을 대기로 배기한 뒤 다시 시작할 것 '
+                  '(--zero-tol-kpa 로 조정 가능, --no-zero 로 yaml 값 그대로 사용).')
+        for b, (mv, _) in new.items():
+            self._offset[b] = mv
+        return {b: f'{mv:.0f}mV(Δ{d:.1f}kPa)' for b, (mv, d) in new.items()}
 
     def line_stable(self, board, target_kpa, seconds, tol):
         """라인압 감시 — 제어하지 않는다. 지정값 근처에서 안정한지만 판정."""
@@ -271,28 +309,46 @@ class Recorder(Node):
 # ══════════════════════════════════════════════════════════════════════════
 # 스윕 시퀀스
 # ══════════════════════════════════════════════════════════════════════════
-def wait_settle(node, board, timeout, eps_kpa_s, stable_for=0.2, poll=0.01):
-    """|dP/dt| 가 eps 이하로 stable_for 초 유지되거나 timeout 까지 대기."""
+def wait_hold(node, board, timeout, eps_kpa_s, ceiling=None, floor=None,
+              lead_s=0.0, stable_for=0.2, poll=0.01):
+    """|dP/dt| 가 eps 이하로 stable_for 초 유지되거나, 압력 상/하한에 닿거나, timeout 까지 대기.
+
+    압력 한계가 필요한 이유: 인가 라인압(예 250 kPa)이 채널 정격(185)과 과압 트립(190)보다
+    높으므로, 충전 밸브를 열어 두면 반드시 한계를 넘는다. 각 레벨의 **상승 구간**만 쓰고
+    한계 전에 멈추는 것이 안전하고, 유량이 0 으로 수렴하는 꼬리는 정보가 적으니 손해도 없다.
+
+    **예측 정지가 필수다.** 밸브를 닫아도 2차 동특성(wn≈40 rad/s) 때문에 유량이 수십 ms
+    꼬리를 남긴다. 계측에서 700 kPa/s 로 차오를 때 상한 175 에서 닫아도 193 까지 올라갔다.
+    그래서 현재 압력이 아니라 **lead_s 초 뒤 예상 압력**으로 판정하고, 멈출 때는 호출부가
+    중립밸브를 즉시 열어 제동한다.
+
+    반환: 'settled' | 'limit' | 'timeout' | 'tripped'
+    """
     t_end = time.time() + timeout
     prev_p, prev_t = node.kpa(board), time.time()
     calm_since = None
+    rate_signed = 0.0
     while time.time() < t_end:
         if node.tripped:
-            return False
+            return 'tripped'
         time.sleep(poll)
         now, p = time.time(), node.kpa(board)
         dt = now - prev_t
-        if dt <= 0:
-            continue
-        rate = abs(p - prev_p) / dt
-        prev_p, prev_t = p, now
-        if rate <= eps_kpa_s:
+        if dt > 0:
+            rate_signed = (p - prev_p) / dt
+            prev_p, prev_t = p, now
+        p_lead = p + rate_signed * lead_s
+        if ceiling is not None and max(p, p_lead) >= ceiling:
+            return 'limit'
+        if floor is not None and min(p, p_lead) <= floor:
+            return 'limit'
+        if abs(rate_signed) <= eps_kpa_s:
             calm_since = calm_since or now
             if now - calm_since >= stable_for:
-                return True
+                return 'settled'
         else:
             calm_since = None
-    return True
+    return 'timeout'
 
 
 def to_neutral(node, gid, args, mode):
@@ -301,18 +357,25 @@ def to_neutral(node, gid, args, mode):
     node.tag.update(phase='reset', valve=mode['neutral'], level=100.0, sweep='-')
     node.set_valve(board, mode['target'], 0.0)
     node.set_valve(board, mode['neutral'], 100.0)
-    wait_settle(node, board, args.reset_timeout, args.settle_eps)
+    wait_hold(node, board, args.reset_timeout, args.settle_eps)
     node.set_valve(board, mode['neutral'], 0.0)
     time.sleep(0.15)
 
 
 def charge_full(node, gid, args, mode):
-    """대상 밸브를 100% 로 열어 챔버를 라인압 쪽으로 채운다 (중립밸브 스윕 준비)."""
+    """중립밸브 스윕 준비 — 대상 밸브로 챔버를 라인압 쪽으로 채운다.
+
+    100% 로 열지 않는다. 계측상 완전개방에서는 700 kPa/s 로 차올라 정밀 정지가 불가능하고
+    (밸브 닫힘 꼬리만으로 20 kPa 를 넘긴다), 여기서 필요한 건 "중립밸브가 흘릴 수 있을 만큼
+    챔버를 높여 두는 것"뿐이라 속도가 이득이 없다. 스윕 상한보다 더 낮은 곳에서 멈춰
+    닫힘 꼬리까지 여유를 둔다.
+    """
     board = gid + args.board_offset
-    node.tag.update(phase='charge', valve=mode['target'], level=100.0, sweep='-')
+    node.tag.update(phase='charge', valve=mode['target'], level=args.charge_level, sweep='-')
     node.set_valve(board, mode['neutral'], 0.0)
-    node.set_valve(board, mode['target'], 100.0)
-    wait_settle(node, board, args.charge_timeout, args.settle_eps)
+    node.set_valve(board, mode['target'], args.charge_level)
+    wait_hold(node, board, args.charge_timeout, args.settle_eps,
+              ceiling=args.charge_ceiling, floor=args.charge_floor, lead_s=args.stop_lead)
     node.set_valve(board, mode['target'], 0.0)
     time.sleep(0.15)
 
@@ -332,8 +395,15 @@ def sweep_valve(node, gid, args, mode, valve, prep):
                 return False
             node.tag.update(phase='sweep', valve=valve, level=float(lv), sweep=direction)
             node.set_valve(board, valve, float(lv))
-            wait_settle(node, board, args.level_hold, args.settle_eps)
-            node.set_valve(board, valve, 0.0)
+            # 대상 밸브(라인→챔버)는 압력 한계에서 멈춘다. 중립 밸브는 대기 방향이라 무해.
+            lim = dict(ceiling=args.ceiling, floor=args.floor, lead_s=args.stop_lead) \
+                if valve == mode['target'] else {}
+            why = wait_hold(node, board, args.level_hold, args.settle_eps, **lim)
+            if why == 'limit':
+                # 대상밸브 폐쇄 + 중립밸브 개방을 한 번의 발행으로 — 꼬리 유량을 즉시 제동한다
+                node.brake(board, valve, mode['neutral'])
+            else:
+                node.set_valve(board, valve, 0.0)
             time.sleep(0.1)
     return True
 
@@ -398,15 +468,36 @@ def main():
     ap.add_argument('--reset-timeout', type=float, default=4.0)
     ap.add_argument('--charge-timeout', type=float, default=6.0)
     ap.add_argument('--settle-eps', type=float, default=2.0, help='정착 판정 |dP/dt| [kPa/s]')
-    ap.add_argument('--trip-hi-kpa', type=float, default=190.0)
-    ap.add_argument('--trip-lo-kpa', type=float, default=20.0)
+    ap.add_argument('--trip-hi-kpa', type=float, default=190.0,
+                    help='과압 트립 [kPa abs]. pressure_safety_limit_kpa 와 같은 값.')
+    ap.add_argument('--trip-lo-kpa', type=float, default=20.0, help='과진공 트립 [kPa abs]')
+    ap.add_argument('--ceiling-margin', type=float, default=25.0,
+                    help='트립 대비 여유. 스윕은 trip_hi − 이 값에서 멈춘다.')
+    ap.add_argument('--floor-margin', type=float, default=8.0)
+    ap.add_argument('--charge-level', type=float, default=75.0,
+                    help='중립밸브 스윕 전 충전 개도 [%%]. 100 은 너무 빨라 정밀 정지가 안 된다.')
+    ap.add_argument('--charge-headroom', type=float, default=25.0,
+                    help='충전은 스윕 상한보다 이만큼 더 안쪽에서 멈춘다 [kPa]')
+    ap.add_argument('--stop-lead', type=float, default=0.10,
+                    help='예측 정지 선행 시간 [s]. 밸브 닫힘 꼬리(wn≈40 rad/s → ~50 ms)보다 크게.')
     ap.add_argument('--line-tol-kpa', type=float, default=10.0)
     ap.add_argument('--dry-run', action='store_true',
                     help='밸브 명령을 발행하지 않고 시퀀스·기록·안전 경로만 확인')
     ap.add_argument('--publish-in-dry-run', action='store_true',
                     help='dry-run 이지만 명령은 발행 (virtual_powerpack 검증용)')
     ap.add_argument('--skip-line-check', action='store_true')
+    ap.add_argument('--no-zero', action='store_true', help='0점 보정 생략, yaml offset 사용')
+    ap.add_argument('--zero-tol-kpa', type=float, default=8.0,
+                    help='0점 보정값이 yaml 과 이 이상 다르면 중단 (압력 잔류 감지)')
+    ap.add_argument('--vent-seconds', type=float, default=3.0,
+                    help='0점 보정 전 대기압 복귀 시간')
     args = ap.parse_args()
+
+    # 스윕 정지 한계 — 트립보다 안쪽에서 멈춘다
+    args.ceiling = args.trip_hi_kpa - args.ceiling_margin
+    args.floor = args.trip_lo_kpa + args.floor_margin
+    args.charge_ceiling = args.ceiling - args.charge_headroom
+    args.charge_floor = args.floor + args.charge_headroom
 
     cfg = args.config
     if cfg is None:
@@ -435,9 +526,14 @@ def main():
     print(f'채널   : {gids}   (board {[g + args.board_offset for g in gids]})')
     print(f'인가   : board {mode["line_board"]} @ {args.line_kpa:.1f} kPa abs (외부 레귤레이터, 수동)')
     print(f'대상   : {mode["target"]} + {mode["neutral"]}    추가 부피 {args.extra_volume_ml:.0f} mL')
+    print(f'한계   : 스윕 정지 {args.ceiling:.1f} / {args.floor:.1f}, '
+          f'충전 정지 {args.charge_ceiling:.1f} / {args.charge_floor:.1f}, '
+          f'트립 {args.trip_hi_kpa:.1f} / {args.trip_lo_kpa:.1f} kPa abs')
     print(f'출력   : {outdir}')
     print(f'설정   : {cfg}  (네임스페이스 키 {ns_key})')
-    if args.dry_run:
+    if args.dry_run and args.publish_in_dry_run:
+        print('*** DRY RUN (명령 발행) — virtual_powerpack 리허설용 ***')
+    elif args.dry_run:
         print('*** DRY RUN — 밸브 명령을 발행하지 않는다 ***')
     print('=' * 72)
 
@@ -465,20 +561,32 @@ def main():
         if not node._cur_seen:
             raise SystemExit('board/currents 가 오지 않는다 — 전류 실측이 모델 입력이라 필수다')
 
-        # pp_controller 충돌 검사
+        # pp_controller 충돌 검사 — 우리 자신의 발행자는 제외해야 한다
+        topic = f'/{args.ns}/board/pwm_cmd'
+        others = []
         try:
-            npub = node.count_publishers(f'/{args.ns}/board/pwm_cmd')
-            if npub > 0:
-                raise SystemExit(
-                    f'board/pwm_cmd 에 이미 발행자가 {npub}개 있다 (pp_controller?). '
-                    '중재가 없어 명령이 덮어써진다 — 종료하고 다시 시도할 것.')
+            for info in node.get_publishers_info_by_topic(topic):
+                if info.node_name != node.get_name():
+                    others.append(f'{info.node_namespace}/{info.node_name}')
         except AttributeError:
-            print('  (count_publishers 미지원 — 충돌 검사 생략)')
+            try:
+                if node.count_publishers(topic) > 1:      # 1 = 우리 자신
+                    others.append('(이름 확인 불가)')
+            except AttributeError:
+                print('  (발행자 조회 미지원 — 충돌 검사 생략)')
+        if others:
+            raise SystemExit(
+                f'board/pwm_cmd 에 다른 발행자가 있다: {others}. 중재가 없어 명령이 '
+                '500 Hz 로 덮어써진다 — pp_controller 를 종료하고 다시 시도할 것.')
 
-        boards = [gid + args.board_offset for gid in gids] + \
-                 [BOARD_LINE_POS, BOARD_LINE_NEG, BOARD_MACRO, BOARD_MACRO_NEG]
-        print('0점 보정 (전 채널 대기 개방 상태여야 한다)...')
-        print(f'  offset = {node.zero_offsets(sorted(set(boards)))}')
+        boards = sorted(set([gid + args.board_offset for gid in gids]))
+        if args.no_zero:
+            print('0점 보정 생략 — yaml offset 사용')
+        else:
+            print('대기압 복귀 중 (전 채널 v2 개방)...')
+            node.vent_all(gids, args.vent_seconds)
+            print('0점 보정...')
+            print(f'  {node.zero_offsets(boards, tol_kpa=args.zero_tol_kpa)}')
 
         for i, gid in enumerate(gids):
             board = gid + args.board_offset
