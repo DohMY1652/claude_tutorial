@@ -647,13 +647,26 @@ std::array<float,3> AcadosMpc::solve_qp_first_step(const Eigen::MatrixXf& P,
       return {u(0), u(1), u(2)};
   }
 
-  // QP Solver (A_con 미사용 — 단순 바운드 구조)
+  // QP Solver (A_con 미사용 — 단순 바운드 구조).
+  // hot start 실패는 래퍼가 같은 틱에 cold start 로 복구하므로 여기까지 오지 않는다.
   bool success = qp_->solve(P, q, LL, UL, solution_);
+
+  // 진단: 5000 호출(500 Hz 에서 10 s)마다, 비정상일 때만 보고한다.
+  if (++qp_stat_tick_ >= 5000) {
+      qp_stat_tick_ = 0;
+      const auto st = qp_->take_stats();
+      const double hot = st.calls ? 100.0 * (double)st.hot_fail  / (double)st.calls : 0.0;
+      const double hard= st.calls ? 100.0 * (double)st.hard_fail / (double)st.calls : 0.0;
+      if (hot > 1.0 || st.hard_fail > 0)
+          RCLCPP_WARN(rclcpp::get_logger("AcadosMpc"),
+            "gid=%d QP: hot-start 실패 %.1f%% (cold 로 복구), 완전 실패 %.2f%% / %ld 호출",
+            cfg_.global_id, hot, hard, (long)st.calls);
+  }
 
   if (!success) {
       if (qp_fail_count_++ == 0) {
           RCLCPP_WARN(rclcpp::get_logger("AcadosMpc"),
-                      "QP solve failed (gid=%d), outputting zero.", cfg_.global_id);
+                      "QP solve failed (gid=%d) — hot/cold 모두 실패, Δu=0.", cfg_.global_id);
       }
       return {0.0f, 0.0f, 0.0f};
   }
@@ -1079,6 +1092,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     gp.max_iter = get_param_or<int>   (this, "PressureRefGen.sqp_max_iter",     12);
 
     gp.Cd = get_param_or<double>(this, "PressureRefGen.Cd", 0.8);
+    gp.valve_open_eta = get_param_or<double>(this, "PressureRefGen.valve_open_eta", 1.0);
     gp.set_orifices(
       get_param_or<double>(this, "PressureRefGen.orifice_mm.fill",   2.3),
       get_param_or<double>(this, "PressureRefGen.orifice_mm.vent",   4.0),
@@ -1090,8 +1104,9 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     refgen_ = std::make_unique<PressureRefGen>(gp);
     RCLCPP_INFO(get_logger(),
       "PressureRefGen: N=%d, dt=%.0f ms, 정격 P⁺≤%.1f kPa / P⁻≥%.1f kPa (gauge), "
-      "F_max=%.1f N → τ_max=%.2f N·m",
+      "Cd=%.2f eta=%.2f, F_max=%.1f N → τ_max=%.2f N·m",
       gp.N, gp.dt * 1e3, gp.Pch_pos_max / 1e3, gp.Pch_neg_min / 1e3,
+      gp.Cd, gp.valve_open_eta,
       gp.Pch_pos_max * A_m2 + std::abs(gp.Pch_neg_min) * A_m2,
       (gp.Pch_pos_max + std::abs(gp.Pch_neg_min)) * A_m2 * reel_radius_mm_ * 1e-3);
 

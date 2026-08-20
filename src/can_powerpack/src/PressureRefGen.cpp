@@ -22,9 +22,11 @@ void PressureRefGen::Params::set_orifices(double d_fill_mm, double d_vent_mm,
                                          double d_boost_mm, double d_suck_mm,
                                          double d_admit_mm, double d_eject_mm)
 {
+  // 기하 면적 × Cd(방출계수) × eta(한 스텝 평균 개도).
+  // eta 를 빼면 슬루 박스가 완전 개방을 가정해 낙관적이 된다.
   auto A = [this](double d_mm) {
     const double d = d_mm * 1e-3;
-    return Cd * M_PI * d * d / 4.0;
+    return Cd * valve_open_eta * M_PI * d * d / 4.0;
   };
   A_fill  = A(d_fill_mm);
   A_vent  = A(d_vent_mm);

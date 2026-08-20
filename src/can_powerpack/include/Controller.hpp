@@ -55,7 +55,7 @@ static constexpr int MPC_PHASES     = 1;   // 500Hz / 1 = 500Hz per channel (par
 static constexpr int MPC_TOTAL      = 24;   // max channel capacity
 static constexpr int MPC_OUT_DIM    = 3;
 
-// QP Solver Wrapper
+// QP Solver Wrapper (박스 제약 전용 — A_con 미사용)
 class QP {
 public:
     QP(int nv, int nc) : solver_(nv, nc) {
@@ -73,34 +73,63 @@ public:
         Eigen::VectorXd lbd = lb.cast<double>();
         Eigen::VectorXd ubd = ub.cast<double>();
 
-        qpOASES::returnValue ret;
-        if (!initialized_) {
-            // cold start: 첫 호출 또는 이전 실패 후 재시작
-            int nWSR = 100;
-            ret = solver_.init(Hd.data(), gd.data(), nullptr,
-                               lbd.data(), ubd.data(), nullptr, nullptr, nWSR);
-            initialized_ = (ret == qpOASES::SUCCESSFUL_RETURN);
-        } else {
-            // hot start: 이전 active set 재사용, WSR 대폭 절감
-            int nWSR = 10;
-            ret = solver_.hotstart(Hd.data(), gd.data(), nullptr,
-                                   lbd.data(), ubd.data(), nullptr, nullptr, nWSR);
-            if (ret != qpOASES::SUCCESSFUL_RETURN) initialized_ = false;
-        }
-
-        if (ret == qpOASES::SUCCESSFUL_RETURN) {
-            Eigen::VectorXd sol(H.rows());
+        auto extract = [&](int nrows) {
+            Eigen::VectorXd sol(nrows);
             solver_.getPrimalSolution(sol.data());
             solution = sol.cast<float>();
-            return true;
+        };
+
+        ++n_calls_;
+
+        // hot start 를 먼저 시도하고, 실패하면 **같은 틱에서** cold start 로 재시도한다.
+        //
+        // 예전에는 hot start 실패를 그대로 반환해 그 틱의 Δu 를 버렸다 (그 채널의 MPC 가
+        // 그 틱만 피드포워드로 퇴화하고, 다음 틱에나 cold start 로 복구). 그런데 이 MPC 는
+        // 매 틱 수치 야코비안으로 A·B 를 다시 만들고 u_ref 가 바뀌면 박스 경계(LL/UL)도
+        // 전부 바뀌므로, active set 이 크게 달라져 hot start 가 실패하는 것은 **정상**이다.
+        // 버릴 이유가 없고, 실패한 틱을 버리는 쪽이 오히려 제어를 간헐적으로 열어버린다.
+        if (initialized_) {
+            int nWSR = HOT_WSR;
+            if (solver_.hotstart(Hd.data(), gd.data(), nullptr,
+                                 lbd.data(), ubd.data(), nullptr, nullptr, nWSR)
+                == qpOASES::SUCCESSFUL_RETURN) {
+                extract((int)H.rows());
+                return true;
+            }
+            initialized_ = false;
+            ++n_hot_fail_;
         }
+
+        int nWSR = COLD_WSR;
+        initialized_ = (solver_.init(Hd.data(), gd.data(), nullptr,
+                                     lbd.data(), ubd.data(), nullptr, nullptr, nWSR)
+                        == qpOASES::SUCCESSFUL_RETURN);
+        if (initialized_) { extract((int)H.rows()); return true; }
+
+        ++n_hard_fail_;
         return false;
     }
 
+    // 진단용 (건강하면 둘 다 0 에 가깝다). hot start 실패는 cold start 로 즉시 복구되어
+    // 성능에 드러나지 않으므로 계측 없이는 보이지 않는다.
+    struct Stats { int64_t calls, hot_fail, hard_fail; };
+    Stats take_stats() {
+        Stats s{n_calls_, n_hot_fail_, n_hard_fail_};
+        n_calls_ = n_hot_fail_ = n_hard_fail_ = 0;
+        return s;
+    }
+
 private:
+    // hot start 는 직전 active set 을 재사용하므로 적은 반복으로 끝나야 정상이지만,
+    // 매 틱 재선형화 때문에 10 회로는 자주 부족했다 (실측 실패율 참조). cold start 는
+    // 처음부터 푸는 경로라 넉넉히 준다.
+    static constexpr int HOT_WSR  = 30;
+    static constexpr int COLD_WSR = 100;
+
     qpOASES::SQProblem solver_;
     qpOASES::Options options_;
     bool initialized_{false};
+    int64_t n_calls_{0}, n_hot_fail_{0}, n_hard_fail_{0};
 };
 
 class ThreadPool {
@@ -234,6 +263,7 @@ private:
   const size_t vol_dot_window_size_ = 5;
 
   int qp_fail_count_{0};
+  int qp_stat_tick_{0};
 
   Eigen::MatrixXf S_bar_, T_bar_;
   Eigen::VectorXf x0_mpc_, Xref_mpc_, qtmp_, solution_;

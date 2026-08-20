@@ -86,8 +86,13 @@ public:
     double w_eject{25.0};
     double A_max{0.284504};          // valve_capacity 상대단위 계수
 
-    // 물리 오리피스 유효면적 [m²] (Cd 포함)
+    // 물리 오리피스 유효면적 [m²] (Cd·eta 포함)
     double Cd{0.8};
+    // 한 스텝 평균 개도 계수 eta ∈ (0,1]. 슬루 박스는 "밸브를 열면 이번 스텝에 얼마나
+    // 갈 수 있나"를 묻는데, 기하 오리피스 면적을 그대로 쓰면 **완전 개방**을 가정하게 된다.
+    // 실제 비례밸브는 지령 100% 에서도 자기 최대 개도의 일부만 열리므로 그만큼 깎는다.
+    // 근거와 값 선택은 config 의 valve_open_eta 주석 참조.
+    double valve_open_eta{1.0};
     double A_fill{0}, A_vent{0}, A_boost{0};
     double A_suck{0}, A_admit{0}, A_eject{0};
 
