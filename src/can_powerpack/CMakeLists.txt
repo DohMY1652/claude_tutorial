@@ -167,6 +167,10 @@ install(PROGRAMS
   scripts/valve_fit_record.py
   scripts/valve_fit_solve.py
   scripts/valve_fit_selftest.py
+  scripts/pump_fit_model.py
+  scripts/pump_fit_record.py
+  scripts/pump_fit_solve.py
+  scripts/pump_fit_selftest.py
   scripts/run_powerpack.sh
   DESTINATION lib/${PROJECT_NAME}
 )

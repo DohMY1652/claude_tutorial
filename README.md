@@ -339,6 +339,99 @@ A_eff = A_max · sigmoid(k_shape·(I + C_p·P − C_k))^alpha_shape
 
 ---
 
+## 4b. 펌프 파라미터 피팅 도구
+
+`PumpGeom` 10개 필드가 전부 **예전 펌프 값**이다. 물리적으로도 이상하다 — 소기량이 924 LPM
+인데 실측 토출이 ~1.1 g/s(≈0.9 L/s)라 체적효율 6%이고, `Cb_out`이 1.46 mm²뿐이라 유량이
+전적으로 토출 체크밸브에 막혀 있다.
+
+| 스크립트 | 역할 |
+|---|---|
+| `pump_fit_model.py` | `pump_piston_avg`/`PumpTable` Python 포팅 + 피팅. 단독 실행하면 포팅 검증 |
+| `pump_fit_record.py` | 레일 실험 구동 + 기록 (rclpy). 인덱스 0·3 만 구동 |
+| `pump_fit_solve.py` | 부피·누설 → 유량 맵 → 능력경계 → 피팅 → yaml/report/플롯 |
+| `pump_fit_selftest.py` | 하드웨어 없는 자기검증 |
+
+### 핵심 아이디어 — 라인 밸브 모델이 필요 없다
+
+레일은 **대기 창구가 정확히 두 개뿐인 닫힌 회로**다 (board1 v1 = 양압→대기, board2 v1 =
+대기→음압). board 3(탱크)·board 4(이젝터)는 레일에 영향을 주지 못하고, 채널 v1(micro)만
+레일에 붙으므로 채널 PWM을 전부 0으로 두면 끊긴다. 따라서 **두 밸브를 닫으면** 밸브 유량이
+0이 되고 부피만으로 펌프 유량이 나온다:
+
+```
+ṁ_pump = +V⁺/(R·T)·dP⁺/dt + leak⁺(P⁺)      (양압 레일)
+       = −V⁻/(R·T)·dP⁻/dt + leak⁻(P⁻)      (음압 레일)
+```
+
+두 식이 질량보존으로 같아야 하므로 **매 측정점에서 교차검증**이 된다.
+
+### 3단계
+
+| 단계 | 펌프 | 내용 |
+|---|---|---|
+| `leak` | **OFF** | 양 밸브 폐쇄 감쇠 → 지수 시상수 τ. ΔV 회차의 τ 비가 `(V+ΔV)/V` 이므로 부피와 누설이 함께 풀린다 (펌프 무관) |
+| `map` | ON | (relief, admit) 격자에서 정착 → 양 밸브 짧게 폐쇄 → 두 레일 dP/dt → `ṁ_pump` |
+| `frontier` | ON | admit으로 P⁻를 목표에 잡고 relief를 닫아 P⁺를 스톨까지 램프 → **능력경계 직접 측정** |
+
+`leak`은 3회 기록한다 — ①맨몸 ②ΔV를 양압 레일에 ③ΔV를 음압 레일에.
+
+```bash
+cd src/can_powerpack
+python3 scripts/pump_fit_selftest.py                              # 실기 전 필수
+python3 scripts/pump_fit_record.py --phase leak
+python3 scripts/pump_fit_record.py --phase leak --extra-volume-ml 250 --extra-volume-rail pos
+python3 scripts/pump_fit_record.py --phase leak --extra-volume-ml 250 --extra-volume-rail neg
+python3 scripts/pump_fit_record.py --phase map
+python3 scripts/pump_fit_record.py --phase frontier --ppos-ceiling 500
+python3 scripts/pump_fit_solve.py results_pump/<디렉터리> --crank-m 0.02
+```
+
+### 안전 — 밸브 피팅과 정반대다
+
+`valve_fit_record.py`는 안전 상태가 "v2 개방"이지만, 펌프 실험은 **양 밸브 전개**가 안전
+상태다. 펌프가 도는 동안 relief(board1 v1)를 닫으면 양압 레일이 무한정 올라간다.
+**"전 밸브 0"은 위험하다.** 종료·예외·Ctrl-C 모두 양 밸브를 열어 두 레일을 대기압으로
+되돌린 뒤 0으로 간다. 양압 상한/음압 하한 예측 정지도 들어 있다.
+
+> 참고: 밸브 피팅(`valve_fit_record.py`)은 **펌프를 분리하고 외부 공급원**을 쓰는 전제다.
+> 그 스크립트는 board1 v1을 0(폐쇄)으로 고정하므로, 펌프를 돌린 상태로 쓰면 안 된다.
+
+### 무엇을 믿을 수 있나 — 신뢰도 순서
+
+자기검증으로 확인한 것 (합성 데이터):
+
+| 산출물 | 정확도 | 신뢰도 |
+|---|---|---|
+| 레일 부피 · 누설 | **0.0 ~ 0.1%** | 높음 — 이중 부피법이 펌프와 무관 |
+| 측정 유량 맵 (84점, P⁺ 2~443 / P⁻ −90~−6 kPa) | 중앙 오차 **0.7%** | 높음 |
+| 측정 능력경계 (`ṁ_pump = leak⁺` 균형) | 중앙 불일치 **1.3%** | 높음 |
+| 기하 피팅의 능력경계 | 회차마다 13% ~ 발산 | **낮음 — 쓰지 말 것** |
+
+**5-파라미터 슬라이더-크랭크는 유량 데이터로 다중 모드다.** 측정 범위 안의 유량을 잘
+맞추면서도 데드헤드(측정 범위 **밖** 외삽)가 크게 틀어진다 — 맵 RMS 19%로 맞추면서 압축비가
+469까지 올라가 경계가 1200 kPa로 튀는 해가 나왔다. 그래서 `pump_params.yaml`은
+**측정 테이블을 1차 산출물**로 싣는다:
+
+- `PressureRefGen.pump_frontier_measured` — 컨트롤러가 쓰는 유일한 출력(`cap_ppos`)
+- `Virtual.pump_map_measured` — 시뮬 `flow_out`용 측정 점들
+- `pump: {...}` — 기하 피팅 산물, **참고용**
+
+정확히 필요한 만큼만 판정하면 된다: 생성기의 `pos_sp_max_kpa`가 250 kPa gauge이므로
+**능력경계가 250 위/아래인지만 갈라도** 컨트롤러 동작에는 충분하다.
+
+### 알아둘 것
+
+- **RPM은 유량 맵 전체에 비례한다.** 압력 리플 FFT로 추정을 시도하지만, CanBridge LPF
+  (코너 ≈18 Hz)가 100 Hz를 크게 감쇠시키고 board1 분해능이 0.25 kPa/LSB로 거칠어
+  **best-effort**다. 태코미터 실측이 가능하면 그쪽이 낫다.
+- **크랭크 반경 `r`은 피팅하지 않는다** — 소기량과 곱으로만 나타나 따로 갈리지 않으므로
+  실측값으로 고정하고 `--crank-m`으로 넘긴다.
+- 피팅 좌표는 기하 8개가 아니라 `(V_swept, V_dead, A_out, A_in, l/r)`로 재매개화했다.
+  유량은 소기량에, 데드헤드는 압축비(`V_dead`)에 걸려 물리적으로 분리돼 있다.
+
+---
+
 ## 5. 실측이 필요한 파라미터
 
 전체 인벤토리는 별도 문서로 정리했다 — 각 항목의 현재 값, 무엇을 정하는지, 어떻게 측정하는지.

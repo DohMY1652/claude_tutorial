@@ -1093,6 +1093,20 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
 
     gp.Cd = get_param_or<double>(this, "PressureRefGen.Cd", 0.8);
     gp.valve_open_eta = get_param_or<double>(this, "PressureRefGen.valve_open_eta", 1.0);
+
+    // 펌프 기하 — 키 이름을 시뮬(Virtual.pump.*)과 같게 맞춰 pump_params.yaml 하나로
+    // 두 소비자를 동시에 갱신할 수 있게 한다. 이 블록이 없으면 생성기는 PistonPump.hpp
+    // 하드코딩(예전 펌프)을 쓰고, 시뮬만 yaml 을 따라 **아무 경고 없이 어긋난다**.
+    gp.pump.delta  = get_param_or<double>(this, "PressureRefGen.pump.delta_m",         gp.pump.delta);
+    gp.pump.r      = get_param_or<double>(this, "PressureRefGen.pump.crank_m",         gp.pump.r);
+    gp.pump.l      = get_param_or<double>(this, "PressureRefGen.pump.rod_m",           gp.pump.l);
+    gp.pump.Spis   = get_param_or<double>(this, "PressureRefGen.pump.piston_area_m2",  gp.pump.Spis);
+    gp.pump.Cb_out = get_param_or<double>(this, "PressureRefGen.pump.cb_out_m2",       gp.pump.Cb_out);
+    gp.pump.Cb_in  = get_param_or<double>(this, "PressureRefGen.pump.cb_in_m2",        gp.pump.Cb_in);
+    gp.pump.Npis   = get_param_or<int>   (this, "PressureRefGen.pump.n_piston",        gp.pump.Npis);
+    gp.pump.omega  = get_param_or<double>(this, "PressureRefGen.pump.rpm",
+                                          gp.pump.omega * 60.0 / (2.0 * M_PI)) * 2.0 * M_PI / 60.0;
+    gp.pump_grid_n = get_param_or<int>(this, "PressureRefGen.pump_grid_n", gp.pump_grid_n);
     gp.set_orifices(
       get_param_or<double>(this, "PressureRefGen.orifice_mm.fill",   2.3),
       get_param_or<double>(this, "PressureRefGen.orifice_mm.vent",   4.0),
@@ -1110,6 +1124,15 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
       gp.Pch_pos_max * A_m2 + std::abs(gp.Pch_neg_min) * A_m2,
       (gp.Pch_pos_max + std::abs(gp.Pch_neg_min)) * A_m2 * reel_radius_mm_ * 1e-3);
 
+    RCLCPP_INFO(get_logger(),
+      "펌프 기하: delta=%.4f m r=%.4f l=%.4f Spis=%.4e Cb_out=%.3e Cb_in=%.3e "
+      "rpm=%.0f Npis=%d  (소기량 %.2f mL, 사구간 %.3f mL, 압축비 %.1f)",
+      gp.pump.delta, gp.pump.r, gp.pump.l, gp.pump.Spis, gp.pump.Cb_out, gp.pump.Cb_in,
+      gp.pump.omega * 60.0 / (2.0 * M_PI), gp.pump.Npis,
+      gp.pump.Spis * 2.0 * gp.pump.r * 1e6,
+      gp.pump.Spis * (gp.pump.delta - 2.0 * gp.pump.r) * 1e6,
+      (gp.pump.delta - 2.0 * gp.pump.r) > 1e-9
+        ? gp.pump.delta / (gp.pump.delta - 2.0 * gp.pump.r) : -1.0);
     RCLCPP_INFO(get_logger(), "펌프 능력 테이블 계산 중...");
     const auto t0 = std::chrono::steady_clock::now();
     refgen_->build_pump_table();

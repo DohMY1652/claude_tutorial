@@ -53,6 +53,10 @@ def _launch_setup(context, *_args, **_kwargs):
     pkg_share = get_package_share_directory('can_powerpack')
     ctrl_cfg = os.path.join(pkg_share, 'config', 'powerpack_config.yaml')
     virt_cfg = os.path.join(pkg_share, 'config', 'virtual_powerpack.yaml')
+    # 머신 생성 파라미터 파일들 — 있으면 손으로 쓴 설정 **뒤에** 병합해 덮어쓴다
+    fitted = [os.path.join(pkg_share, 'config', n)
+              for n in ('valve_params.yaml', 'pump_params.yaml')]
+    fitted = [f for f in fitted if os.path.exists(f)]
 
     actuator_connected = LaunchConfiguration('actuator_connected').perform(context) == 'true'
     show_monitor = LaunchConfiguration('monitor').perform(context) == 'true'
@@ -63,6 +67,8 @@ def _launch_setup(context, *_args, **_kwargs):
     sim_params.update(_load_params(ctrl_cfg, f'/{NAMESPACE}/pp_controller'))
     sim_params.update(_load_params(ctrl_cfg, f'/{NAMESPACE}/can_bridge'))
     sim_params.update(_load_params(virt_cfg, f'/{NAMESPACE}/can_bridge'))
+    for f in fitted:
+        sim_params.update(_load_params(f, f'/{NAMESPACE}/can_bridge'))
     sim_params['actuator_connected'] = actuator_connected
 
     ctrl_overrides = {'actuator_connected': actuator_connected}
@@ -84,7 +90,7 @@ def _launch_setup(context, *_args, **_kwargs):
         name='pp_controller',
         namespace=NAMESPACE,
         output='screen',
-        parameters=[ctrl_cfg, ctrl_overrides],
+        parameters=[ctrl_cfg, *fitted, ctrl_overrides],
     )
 
     actions = [virtual_system, controller]
