@@ -61,6 +61,8 @@ def _launch_setup(context, *_args, **_kwargs):
     actuator_connected = LaunchConfiguration('actuator_connected').perform(context) == 'true'
     show_monitor = LaunchConfiguration('monitor').perform(context) == 'true'
     control_mode_str = LaunchConfiguration('control_mode').perform(context)
+    solver_str = LaunchConfiguration('solver').perform(context)
+    overrides_str = LaunchConfiguration('overrides').perform(context)
 
     # 가상 시스템 파라미터: controller 설정 → can_bridge 설정 → sim 물리 설정 순으로 덮어쓰기
     sim_params = {}
@@ -74,6 +76,18 @@ def _launch_setup(context, *_args, **_kwargs):
     ctrl_overrides = {'actuator_connected': actuator_connected}
     if control_mode_str:
         ctrl_overrides['control_mode'] = int(control_mode_str)
+    if solver_str:
+        # 같은 빌드로 qp/mppi 를 A/B 하기 위한 오버라이드. 하네스가 비결정론적이라
+        # 빌드를 바꿔 비교하면 원인 분리가 안 된다.
+        ctrl_overrides['MPC_parameters.solver'] = solver_str
+    for item in filter(None, (x.strip() for x in overrides_str.split(','))):
+        # 'a.b=1.5' 형태. 튜닝 스윕을 같은 빌드로 돌리기 위한 통로다.
+        k, _, v = item.partition('=')
+        try:
+            ctrl_overrides[k.strip()] = int(v) if v.strip().lstrip('-').isdigit() else float(v)
+        except ValueError:
+            ctrl_overrides[k.strip()] = v.strip() in ('true', 'True') if v.strip() in (
+                'true', 'True', 'false', 'False') else v.strip()
 
     virtual_system = Node(
         package='can_powerpack',
@@ -118,6 +132,13 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'control_mode', default_value='',
             description='비우면 yaml 값 사용. 0=압력, 1=위치(휴리스틱), 2=위치(최적화 생성기).'),
+        DeclareLaunchArgument(
+            'solver', default_value='',
+            description="비우면 yaml 값 사용. 'qp' 또는 'mppi'. 채널 MPC 의 솔버를 고른다."),
+        DeclareLaunchArgument(
+            'overrides', default_value='',
+            description="쉼표로 구분한 파라미터 오버라이드. 예: "
+                        "'MPC_parameters.mppi_w_effort=0.5,MPC_parameters.mppi_lambda=0.5'"),
         DeclareLaunchArgument(
             'monitor', default_value='false',
             description='true: pp_monitor.py 를 별도 터미널로 띄운다 (gnome-terminal 필요).'),

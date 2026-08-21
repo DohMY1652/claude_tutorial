@@ -31,6 +31,7 @@ include_directories(include)
 add_executable(pp_controller
   src/Controller.cpp
   src/PressureRefGen.cpp
+  src/Mppi.cpp
   src/controller_main.cpp
 )
 

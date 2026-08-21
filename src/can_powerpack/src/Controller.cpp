@@ -242,6 +242,56 @@ AcadosMpc::AcadosMpc(const Config& cfg) : cfg_(cfg) {
       vol_dot_buffer_.push_back(0.0f);
   }
 
+  // ── MPPI 경로 구성 ─────────────────────────────────────────────────────
+  if (cfg_.use_mppi) {
+    mppi_plant_.I_MAX       = cfg_.I_MAX;
+    mppi_plant_.A_max       = cfg_.A_max;
+    mppi_plant_.k_shape     = cfg_.k_shape;
+    mppi_plant_.C_k         = cfg_.C_k;
+    mppi_plant_.C_p         = cfg_.C_p;
+    mppi_plant_.C_z         = cfg_.C_z;
+    mppi_plant_.alpha_shape = cfg_.alpha_shape;
+    mppi_plant_.A_bw        = cfg_.A_bw;
+    mppi_plant_.beta_bw     = cfg_.beta_bw;
+    mppi_plant_.gamma_bw    = cfg_.gamma_bw;
+    mppi_plant_.wn_up       = cfg_.wn_up;
+    mppi_plant_.zeta_up     = cfg_.zeta_up;
+    mppi_plant_.wn_down     = cfg_.wn_down;
+    mppi_plant_.zeta_down   = cfg_.zeta_down;
+    mppi_plant_.is_positive     = cfg_.is_positive;
+    mppi_plant_.ejector_p_limit = cfg_.ejector_p_limit;
+    mppi_plant_.leakage_u       = cfg_.is_positive ? cfg_.leakage_u_pos : cfg_.leakage_u_neg;
+    mppi_plant_.crack_area_frac = cfg_.valve_crack_area_frac;
+    mppi_plant_.cmd_taper_kpa   = cfg_.cmd_taper_kpa;
+    mppi_plant_.finalize();
+
+    mppi::Params pr;
+    pr.K        = cfg_.mppi_samples;
+    pr.NP       = cfg_.NP;
+    pr.Ts       = cfg_.Ts;
+    pr.substeps = cfg_.mppi_substeps;
+    pr.lambda   = cfg_.mppi_lambda;
+    pr.sigma_pct  = cfg_.mppi_sigma_pct;
+    pr.sigma_explore_pct = cfg_.mppi_sigma_explore_pct;
+    pr.explore_frac      = cfg_.mppi_explore_frac;
+    pr.noise_beta = cfg_.mppi_noise_beta;
+    // 음수면 기존 Q_value/R_value 를 잇는다. 다만 QP 는 원 단위(kPa², %²)로 썼고
+    // MPPI 는 정규화 오차²/이탈² 이므로 절대 크기의 의미는 다르다 — 비율만 잇는다.
+    pr.w_track  = (cfg_.mppi_w_track  >= 0.f) ? cfg_.mppi_w_track  : cfg_.Q_value;
+    pr.w_effort = (cfg_.mppi_w_effort >= 0.f) ? cfg_.mppi_w_effort : cfg_.R_value;
+    pr.w_du     = cfg_.mppi_w_du;
+    pr.track_scale_kpa = cfg_.mppi_track_scale_kpa;
+    pr.terminal_mult   = cfg_.mppi_terminal_mult;
+    // MPPI 는 QP 의 ±30 을 쓰지 않는다. uref≈0 에서 ±30 이면 크래킹 임계(≈52%)에
+    // 도달조차 못 해 전 샘플이 같은 궤적이 되고 선택이 사라진다.
+    pr.du_min = -cfg_.mppi_du_limit_pct;
+    pr.du_max = +cfg_.mppi_du_limit_pct;
+    pr.taper_in_rollout = cfg_.mppi_taper_in_rollout;
+
+    // 시드는 채널마다 다르되 **고정**이다. 하네스가 이미 비결정론적이므로
+    // (README 0절) 솔버까지 매 실행 달라지면 원인 분리가 불가능해진다.
+    mppi_ = std::make_unique<mppi::Solver>(mppi_plant_, pr, (uint32_t)(0x9E37u + cfg_.global_id));
+  }
 }
 
 
@@ -455,6 +505,7 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   }
   
   float vol_dot = sum_vol_dot / (float)vol_dot_buffer_.size();
+  vol_dot_est_ = vol_dot;          // MPPI 롤아웃의 외생 입력으로 재사용
 
   float target_time_constant = cfg_.target_time_constant;
   if (target_time_constant <= 0.001f) target_time_constant = 0.2f;
@@ -713,28 +764,86 @@ void AcadosMpc::solve(float dt_ms,
 
   std::fill(P_ref_.begin(), P_ref_.end(), cfg_.ref_value);
 
-  update_linearization(cfg_.ref_value, u_ref);
+  // ── 외생 입력 (두 솔버 경로가 공유) ─────────────────────────────────────
+  mppi::Exogenous ex;
+  ex.P_micro = P_micro;
+  ex.P_macro = P_macro;          // 음압 채널은 이젝터(p_limit)를 쓰므로 사용되지 않는다
+  ex.P_atm   = current_P_atm_;
+  ex.V0      = cfg_.volume_m3;
+  ex.Vdot    = vol_dot_est_;
+  ex.P_ref   = cfg_.ref_value;
+  // 피드포워드가 겨냥하는 것과 **같은** 접근 궤적을 MPPI 의 스테이지 레퍼런스로 준다.
+  ex.tau_ref = (cfg_.mppi_ref_tau_s > 0.f) ? cfg_.mppi_ref_tau_s
+                                           : cfg_.target_time_constant;
+  ex.P0      = P_now;
 
-  const int Nu = cfg_.n_u * cfg_.NP;
-  Pmat_.setZero(Nu, Nu);
-  qvec_.setZero(Nu);
-  Acon_.setZero(Nu, Nu);
-  LL_.setZero(Nu);
-  UL_.setZero(Nu);
+  std::array<float,3> du3{0.f, 0.f, 0.f};
 
-  build_mpc_qp(A_seq_, B_seq_, P_now, P_ref_, Pmat_, qvec_, Acon_, LL_, UL_);
+  if (mppi_) {
+    // ── MPPI: 선형화 없이 비선형 롤아웃으로 보정 Δu 를 낸다 ───────────────
+    // 초기 상태 = 측정 압력 + 밸브 내부 상태 추정. z/prevI/dir 은
+    // compute_input_reference 가 방금 갱신한 값을 단일 출처로 복사한다
+    // (여기서 또 갱신하면 히스테리시스가 틱마다 두 번 전진한다).
+    mppi::ChannelState x0;
+    x0.P = P_now;
+    const double  zs[3]  = { z_micro_,      z_macro_,      z_atm_      };
+    const double  pis[3] = { prev_I_micro_, prev_I_macro_, prev_I_atm_ };
+    const int     dis[3] = { dir_micro_,    dir_macro_,    dir_atm_    };
+    for (int j = 0; j < 3; ++j) {
+      x0.v[(size_t)j].q     = plant_est_.v[(size_t)j].q;
+      x0.v[(size_t)j].qd    = plant_est_.v[(size_t)j].qd;
+      x0.v[(size_t)j].z     = (float)zs[j];
+      x0.v[(size_t)j].prevI = (float)pis[j];
+      x0.v[(size_t)j].dir   = dis[j];
+    }
+    du3 = mppi_->solve(x0, ex, uref_arr);
 
-  for (int i = 0; i < cfg_.NP; ++i) {
-      for (int j = 0; j < 3; ++j) { 
-          int idx = i * 3 + j;
-          float u_current_ref = uref_arr[j]; 
-          
-          LL_(idx) = std::max(-u_current_ref, cfg_.du_min); 
-          UL_(idx) = std::min(100.0f - u_current_ref, cfg_.du_max);
-      }
+    // 진단: QP 경로와 같은 주기(500 Hz 에서 10 s)로, 실시간 예산과 가중 붕괴를 본다.
+    if (++mppi_stat_tick_ >= 5000) {
+        mppi_stat_tick_ = 0;
+        const auto st = mppi_->take_stats();
+        if (st.calls) {
+            const double avg_us = st.sum_us / (double)st.calls;
+            const double eff    = st.sum_eff / (double)st.calls;
+            const double sat    = 100.0 * (double)st.sat_first / (double)st.calls;
+            // eff 가 1 에 붙으면 가중치가 한 샘플로 붕괴해 탐색이 죽은 것이고,
+            // K 에 붙으면 균일 평균이라 선택이 없는 것이다. lambda 로 조정한다.
+            RCLCPP_INFO(rclcpp::get_logger("Mppi"),
+              "gid=%d MPPI: %.0f us 평균 / %.0f us 최대 (틱 예산 대비), "
+              "유효샘플 %.1f/%d, Jmin %.4f, 초과 %.4f, 이상치배율 %.1f, "
+              "첫스텝 포화 %.1f%%, 평평 %.1f%%",
+              cfg_.global_id, avg_us, (double)st.max_us, eff,
+              mppi_->params().K, st.sum_cost / (double)st.calls,
+              st.sum_spread / (double)st.calls,
+              st.sum_outlier / (double)st.calls, sat,
+              100.0 * (double)st.flat / (double)st.calls);
+        }
+    }
+  } else {
+    // ── 기존 경로: 선형화 → 응축 QP → qpOASES ────────────────────────────
+    update_linearization(cfg_.ref_value, u_ref);
+
+    const int Nu = cfg_.n_u * cfg_.NP;
+    Pmat_.setZero(Nu, Nu);
+    qvec_.setZero(Nu);
+    Acon_.setZero(Nu, Nu);
+    LL_.setZero(Nu);
+    UL_.setZero(Nu);
+
+    build_mpc_qp(A_seq_, B_seq_, P_now, P_ref_, Pmat_, qvec_, Acon_, LL_, UL_);
+
+    for (int i = 0; i < cfg_.NP; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            int idx = i * 3 + j;
+            float u_current_ref = uref_arr[j];
+
+            LL_(idx) = std::max(-u_current_ref, cfg_.du_min);
+            UL_(idx) = std::min(100.0f - u_current_ref, cfg_.du_max);
+        }
+    }
+
+    du3 = solve_qp_first_step(Pmat_, qvec_, Acon_, LL_, UL_);
   }
-
-  auto du3 = solve_qp_first_step(Pmat_, qvec_, Acon_, LL_, UL_);
 
   // 테이퍼는 QP 결과까지 포함한 **최종** 명령에 적용한다. u_ref 만 줄이면 MPC 가 Δu 로
   // 다시 밀어올려 무력화되기 때문이다.
@@ -747,6 +856,16 @@ void AcadosMpc::solve(float dt_ms,
     taper_above_crack(std::clamp(uref_arr[2] + du3[2], 0.0f, 100.0f), u_crack_[2]),
   };
   last_u3_ = u0;
+
+  // 밸브 내부 상태(q, qd) 추정을 **실제 인가 명령 + 측정 압력**으로 한 틱 전진시킨다.
+  // 다음 틱 롤아웃의 초기값이 된다. z 는 단일 출처(z_*)를 쓰므로 여기서 복사만 한다.
+  if (mppi_) {
+    plant_est_.P = P_now;
+    plant_est_.v[0].z = (float)z_micro_;  plant_est_.v[0].dir = dir_micro_;
+    plant_est_.v[1].z = (float)z_macro_;  plant_est_.v[1].dir = dir_macro_;
+    plant_est_.v[2].z = (float)z_atm_;    plant_est_.v[2].dir = dir_atm_;
+    mppi::advance_valve_estimate(mppi_plant_, plant_est_, u0, ex, dt_sec);
+  }
 
   // 4095 스케일 (100% -> 4095)
   // 40.95 = 4095 / 100
@@ -820,6 +939,35 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.macro_micro_sat_pct = get_param_or<double>(this, "MPC_parameters.macro_micro_sat_pct", 100.0);
   mpc_.cmd_taper_kpa       = get_param_or<double>(this, "MPC_parameters.cmd_taper_kpa",          3.0);
   mpc_.valve_crack_area_frac = get_param_or<double>(this, "MPC_parameters.valve_crack_area_frac", 1e-6);
+
+  // ── 솔버 선택 ────────────────────────────────────────────────────────────
+  mpc_.solver = get_param_or<std::string>(this, "MPC_parameters.solver", std::string("qp"));
+  mpc_.mppi_samples    = get_param_or<int>   (this, "MPC_parameters.mppi_samples",    128);
+  mpc_.mppi_lambda     = get_param_or<double>(this, "MPC_parameters.mppi_lambda",     0.30);
+  mpc_.mppi_sigma_pct  = get_param_or<double>(this, "MPC_parameters.mppi_sigma_pct",  8.0);
+  mpc_.mppi_sigma_explore_pct = get_param_or<double>(this, "MPC_parameters.mppi_sigma_explore_pct", 30.0);
+  mpc_.mppi_explore_frac      = get_param_or<double>(this, "MPC_parameters.mppi_explore_frac",       0.30);
+  mpc_.mppi_du_limit_pct      = get_param_or<double>(this, "MPC_parameters.mppi_du_limit_pct",     100.0);
+  mpc_.mppi_ref_tau_s         = get_param_or<double>(this, "MPC_parameters.mppi_ref_tau_s",         -1.0);
+  mpc_.mppi_noise_beta = get_param_or<double>(this, "MPC_parameters.mppi_noise_beta", 0.70);
+  mpc_.mppi_w_track    = get_param_or<double>(this, "MPC_parameters.mppi_w_track",   -1.0);
+  mpc_.mppi_w_effort   = get_param_or<double>(this, "MPC_parameters.mppi_w_effort",  -1.0);
+  mpc_.mppi_w_du       = get_param_or<double>(this, "MPC_parameters.mppi_w_du",       0.05);
+  mpc_.mppi_track_scale_kpa = get_param_or<double>(this, "MPC_parameters.mppi_track_scale_kpa", 10.0);
+  mpc_.mppi_terminal_mult   = get_param_or<double>(this, "MPC_parameters.mppi_terminal_mult",    5.0);
+  mpc_.mppi_substeps        = get_param_or<int>   (this, "MPC_parameters.mppi_substeps",           2);
+  mpc_.mppi_taper_in_rollout= get_param_or<bool>  (this, "MPC_parameters.mppi_taper_in_rollout", true);
+  {
+    std::string sv = mpc_.solver;
+    std::transform(sv.begin(), sv.end(), sv.begin(), ::tolower);
+    if (sv != "qp" && sv != "mppi") {
+      RCLCPP_WARN(get_logger(),
+        "MPC_parameters.solver='%s' 는 알 수 없다 — 'qp' 로 진행한다 (선택: qp | mppi)",
+        mpc_.solver.c_str());
+      sv = "qp";
+    }
+    mpc_.solver = sv;
+  }
 
 
   default_volume_ml_  = get_param_or<double>(this, "default_volume_ml",    1.0);
@@ -1303,7 +1451,26 @@ void Controller::build_mpcs() {
       cfg.cmd_taper_kpa        = (float)mpc_.cmd_taper_kpa;
       cfg.valve_crack_area_frac = (float)mpc_.valve_crack_area_frac;
 
+      cfg.use_mppi             = (mpc_.solver == "mppi");
+      cfg.mppi_samples         = mpc_.mppi_samples;
+      cfg.mppi_lambda          = (float)mpc_.mppi_lambda;
+      cfg.mppi_sigma_pct       = (float)mpc_.mppi_sigma_pct;
+      cfg.mppi_sigma_explore_pct = (float)mpc_.mppi_sigma_explore_pct;
+      cfg.mppi_explore_frac      = (float)mpc_.mppi_explore_frac;
+      cfg.mppi_du_limit_pct      = (float)mpc_.mppi_du_limit_pct;
+      cfg.mppi_ref_tau_s         = (float)mpc_.mppi_ref_tau_s;
+      cfg.mppi_noise_beta      = (float)mpc_.mppi_noise_beta;
+      cfg.mppi_w_track         = (float)mpc_.mppi_w_track;
+      cfg.mppi_w_effort        = (float)mpc_.mppi_w_effort;
+      cfg.mppi_w_du            = (float)mpc_.mppi_w_du;
+      cfg.mppi_track_scale_kpa = (float)mpc_.mppi_track_scale_kpa;
+      cfg.mppi_terminal_mult   = (float)mpc_.mppi_terminal_mult;
+      cfg.mppi_substeps        = mpc_.mppi_substeps;
+      cfg.mppi_taper_in_rollout= mpc_.mppi_taper_in_rollout;
+
       auto mpc_obj = std::make_unique<AcadosMpc>(cfg);
+      // MPPI 를 써도 QP 솔버는 붙여 둔다 — solver 파라미터만 바꿔 같은 빌드로
+      // A/B 비교할 수 있어야 하고, 붙어 있어도 호출되지 않으면 비용이 0 이다.
       int nv = cfg.n_u * cfg.NP; 
       int nc = 0; 
       auto qp_solver = std::make_shared<QP>(nv, nc);
@@ -1313,6 +1480,20 @@ void Controller::build_mpcs() {
   }
 
   RCLCPP_INFO(get_logger(), "Initialized %zu MPC controllers based on active_mpc_channels parameter.", mpcs_.size());
+  if (mpc_.solver == "mppi") {
+    RCLCPP_INFO(get_logger(),
+      "MPC 솔버 = MPPI (선형화 없음): K=%d, NP=%d, Ts=%.1f ms, 서브스텝=%d, "
+      "lambda=%.3f(비용 산포 비율), sigma=%.1f%%, beta=%.2f, "
+      "w=(track %.3g, effort %.3g, du %.3g), 오차 기준 %.1f kPa, 말단 ×%.1f, 테이퍼 롤아웃=%s",
+      mpc_.mppi_samples, mpc_.NP, mpc_.Ts * 1000.0, mpc_.mppi_substeps,
+      mpc_.mppi_lambda, mpc_.mppi_sigma_pct, mpc_.mppi_noise_beta,
+      (mpc_.mppi_w_track  >= 0.0 ? mpc_.mppi_w_track  : mpc_.Q_value),
+      (mpc_.mppi_w_effort >= 0.0 ? mpc_.mppi_w_effort : mpc_.R_value),
+      mpc_.mppi_w_du, mpc_.mppi_track_scale_kpa, mpc_.mppi_terminal_mult,
+      mpc_.mppi_taper_in_rollout ? "on" : "off");
+  } else {
+    RCLCPP_INFO(get_logger(), "MPC 솔버 = QP (선형화 + 응축 qpOASES)");
+  }
 
   zoh_.fill(0);
 }

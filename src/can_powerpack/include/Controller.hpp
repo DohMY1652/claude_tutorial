@@ -27,6 +27,7 @@
 #include <string>
 
 #include <qpOASES.hpp>
+#include "Mppi.hpp"
 
 #ifdef __linux__
   #include <pthread.h>
@@ -203,6 +204,30 @@ public:
     float zeta_up{1.2f};
     float wn_down{45.0f};
     float zeta_down{1.0f};
+
+    // ── 솔버 선택 ─────────────────────────────────────────────────────────
+    // false: 기존 경로 (선형화 → 응축 QP → qpOASES)
+    // true : MPPI (선형화 없음, 비선형 롤아웃 샘플링).  Mppi.hpp 머리말 참조.
+    // 하네스가 비결정론적이라(README 0절) 두 경로를 남겨 A/B 비교할 수 있게 했다.
+    bool  use_mppi{false};
+    int   mppi_samples{128};
+    float mppi_lambda{0.30f};
+    float mppi_sigma_pct{8.0f};
+    float mppi_sigma_explore_pct{30.0f};
+    float mppi_explore_frac{0.30f};
+    float mppi_du_limit_pct{100.0f};   // MPPI 경로의 Δu 한계 (QP 경로의 du_min/max 와 별개)
+    // 지평 안 스테이지 레퍼런스의 접근 시상수 [s]. ≤0 이면 target_time_constant 를 쓴다.
+    // 피드포워드보다 **빠른** 궤적을 주면 MPPI 가 그만큼 더 밀어붙인다.
+    float mppi_ref_tau_s{-1.0f};
+    float mppi_noise_beta{0.70f};
+    // 음수면 Q_value / R_value 를 그대로 쓴다 (기존 튜닝 의미를 잇는다).
+    float mppi_w_track{-1.0f};
+    float mppi_w_effort{-1.0f};
+    float mppi_w_du{0.05f};
+    float mppi_track_scale_kpa{10.0f};
+    float mppi_terminal_mult{5.0f};
+    int   mppi_substeps{2};
+    bool  mppi_taper_in_rollout{true};
   };
 
   explicit AcadosMpc(const Config& cfg);
@@ -264,6 +289,16 @@ private:
 
   int qp_fail_count_{0};
   int qp_stat_tick_{0};
+
+  // ── MPPI 경로 ────────────────────────────────────────────────────────────
+  // plant_est_ 는 밸브 2차 동특성 상태(q, qd) 추정이다. 롤아웃 초기값으로 쓰고,
+  // 매 틱 실제 인가 명령 + 측정 압력으로 함께 전진시킨다. z 는 여기 두지 않고
+  // z_micro_/z_atm_/z_macro_ 를 단일 출처로 삼아 매 틱 복사해 넣는다.
+  std::unique_ptr<mppi::Solver> mppi_;
+  mppi::PlantParams             mppi_plant_{};
+  mppi::ChannelState            plant_est_{};
+  int   mppi_stat_tick_{0};
+  float vol_dot_est_{0.0f};        // compute_input_reference 가 매 틱 갱신 [m³/s]
 
   Eigen::MatrixXf S_bar_, T_bar_;
   Eigen::VectorXf x0_mpc_, Xref_mpc_, qtmp_, solution_;
@@ -518,6 +553,23 @@ private:
     double macro_micro_sat_pct{100.0};
     double cmd_taper_kpa{3.0};
     double valve_crack_area_frac{1e-6};
+    // 솔버 선택 + MPPI 하이퍼파라미터
+    std::string solver{"qp"};
+    int    mppi_samples{128};
+    double mppi_lambda{0.30};
+    double mppi_sigma_pct{8.0};
+    double mppi_sigma_explore_pct{30.0};
+    double mppi_explore_frac{0.30};
+    double mppi_du_limit_pct{100.0};
+    double mppi_ref_tau_s{-1.0};
+    double mppi_noise_beta{0.70};
+    double mppi_w_track{-1.0};
+    double mppi_w_effort{-1.0};
+    double mppi_w_du{0.05};
+    double mppi_track_scale_kpa{10.0};
+    double mppi_terminal_mult{5.0};
+    int    mppi_substeps{2};
+    bool   mppi_taper_in_rollout{true};
   } mpc_;
 
   std::vector<double> vol_ml_;
