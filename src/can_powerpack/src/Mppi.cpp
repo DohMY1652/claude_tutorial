@@ -180,7 +180,8 @@ void step(const PlantParams& p, ChannelState& s, const std::array<float, 3>& u,
 // ============================================================================
 void advance_valve_estimate(const PlantParams& p, ChannelState& s,
                             const std::array<float, 3>& u_applied,
-                            const Exogenous& ex, float dt)
+                            const Exogenous& ex, float dt,
+                            bool integrate_chamber, float V)
 {
   float pin[3], pout[3];
   if (p.is_positive) {
@@ -192,20 +193,35 @@ void advance_valve_estimate(const PlantParams& p, ChannelState& s,
     pin[V_MACRO] = s.P;        pout[V_MACRO] = p.ejector_p_limit;
     pin[V_ATM]   = ex.P_atm;   pout[V_ATM]   = s.P;
   }
+  float q[3];
   for (int j = 0; j < 3; ++j) {
     float Qs;
     if (!p.is_positive && j == V_MACRO && s.P <= p.ejector_p_limit)
       Qs = 0.0f;
     else
       Qs = q_static(p, u_applied[(size_t)j], pin[j], pout[j], s.v[(size_t)j].z);
-    valve_dyn(p, s.v[(size_t)j], Qs, dt);
+    q[j] = valve_dyn(p, s.v[(size_t)j], Qs, dt);
   }
+  if (!integrate_chamber) return;
+
+  // 챔버압도 함께 전진 — step() 과 **같은 식**이다 (누설 포함, 등온 이상기체).
+  float q_leak = 0.0f;
+  if (p.leakage_u > 0.0f) {
+    q_leak = p.is_positive ? q_static(p, p.leakage_u, s.P, ex.P_atm, s.v[V_ATM].z)
+                           : q_static(p, p.leakage_u, ex.P_atm, s.P, s.v[V_ATM].z);
+  }
+  const float q_net = p.is_positive
+      ? (q[V_MICRO] + q[V_MACRO] - q[V_ATM] - q_leak)
+      : (q[V_ATM] + q_leak - q[V_MICRO] - q[V_MACRO]);
+  const float Vc = std::max(1e-12f, (V > 0.0f) ? V : ex.V0);
+  s.P += dt * (RGAS_AIR * TEMP_K * (q_net * LPM_TO_KGPS) / 1000.0f - s.P * ex.Vdot) / Vc;
+  s.P = std::clamp(s.P, 1.0f, 5000.0f);
 }
 
 // ============================================================================
 // RNG — xoshiro128++ + Box-Muller
 // ============================================================================
-Solver::Rng::Rng(uint32_t seed)
+Rng::Rng(uint32_t seed)
 {
   // splitmix32 로 상태를 벌린다. seed 0 이어도 전 상태가 0 이 되지 않게.
   uint32_t x = seed + 0x9E3779B9u;
@@ -218,7 +234,23 @@ Solver::Rng::Rng(uint32_t seed)
   if ((s[0] | s[1] | s[2] | s[3]) == 0u) s[0] = 1u;
 }
 
-uint32_t Solver::Rng::next_u32()
+void Rng::reseed(uint64_t seed)
+{
+  // splitmix64 로 64비트 시드를 32비트 상태 4개로 벌린다. 표본 인덱스마다 독립적인
+  // 스트림을 얻으므로 어느 스레드가 어느 표본을 잡아도 같은 노이즈가 나온다.
+  uint64_t z = seed + 0x9E3779B97F4A7C15ull;
+  for (int i = 0; i < 4; ++i) {
+    z += 0x9E3779B97F4A7C15ull;
+    uint64_t t = z;
+    t = (t ^ (t >> 30)) * 0xBF58476D1CE4E5B9ull;
+    t = (t ^ (t >> 27)) * 0x94D049BB133111EBull;
+    s[i] = (uint32_t)((t ^ (t >> 31)) & 0xFFFFFFFFull);
+  }
+  if ((s[0] | s[1] | s[2] | s[3]) == 0u) s[0] = 1u;
+  has_cache = false;
+}
+
+uint32_t Rng::next_u32()
 {
   const uint32_t r = ((s[0] + s[3]) << 7 | (s[0] + s[3]) >> 25) + s[0];
   const uint32_t t = s[1] << 9;
@@ -228,13 +260,13 @@ uint32_t Solver::Rng::next_u32()
   return r;
 }
 
-float Solver::Rng::uniform01()
+float Rng::uniform01()
 {
   // (0,1) 개구간 — log(0) 을 피한다
   return (float)((next_u32() >> 8) + 1) * (1.0f / 16777218.0f);
 }
 
-float Solver::Rng::normal()
+float Rng::normal()
 {
   if (has_cache) { has_cache = false; return cache; }
   const float u1 = uniform01(), u2 = uniform01();
@@ -305,6 +337,7 @@ float Solver::rollout_cost(const ChannelState& x0, const Exogenous& ex,
   }
 
   ChannelState s = x0;
+  Exogenous exk = ex;          // 스텝마다 레일압을 갱신해 넘긴다
   // 스테이지 레퍼런스 계수 — 지평 안에서 지수적으로 접근한다.
   const bool  ramp = (ex.tau_ref > 1e-4f);
   const float decay = ramp ? std::exp(-pr_.Ts / ex.tau_ref) : 0.0f;
@@ -332,8 +365,9 @@ float Solver::rollout_cost(const ChannelState& x0, const Exogenous& ex,
       float u_out = u_raw;
       if (pr_.taper_in_rollout) {
         float pin_j;
+        const float p_rail = ex.P_micro + ex.dP_micro_dt * (float)k * pr_.Ts;
         if (pp_.is_positive)
-          pin_j = (j == V_MICRO) ? ex.P_micro : (j == V_MACRO) ? ex.P_macro : s.P;
+          pin_j = (j == V_MICRO) ? p_rail : (j == V_MACRO) ? ex.P_macro : s.P;
         else
           pin_j = (j == V_ATM) ? ex.P_atm : s.P;
         const float uc = pp_.u_crack(pin_j, s.v[j].z);
@@ -353,7 +387,9 @@ float Solver::rollout_cost(const ChannelState& x0, const Exogenous& ex,
     }
 
     const float V = std::max(1e-12f, ex.V0 + ex.Vdot * (float)k * pr_.Ts);
-    for (int sub = 0; sub < pr_.substeps; ++sub) step(pp_, s, u_app, ex, V, dt);
+    // 레일 궤적 — 명목 기반 1차 예측. 상수 가정이 만드는 ≈5~34 kPa 오차를 없앤다.
+    exk.P_micro = ex.P_micro + ex.dP_micro_dt * (float)k * pr_.Ts;
+    for (int sub = 0; sub < pr_.substeps; ++sub) step(pp_, s, u_app, exk, V, dt);
 
     if (ramp) gap *= decay;
     const float ref_k = ramp ? (ex.P_ref - gap) : ex.P_ref;

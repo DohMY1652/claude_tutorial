@@ -32,6 +32,7 @@ add_executable(pp_controller
   src/Controller.cpp
   src/PressureRefGen.cpp
   src/Mppi.cpp
+  src/MppiSystem.cpp
   src/controller_main.cpp
 )
 

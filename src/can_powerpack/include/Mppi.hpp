@@ -100,6 +100,18 @@ struct ChannelState {
 // 40 ms 지평 안에서는 거의 안 변하므로 상수로 두는 것이 타당하다.
 struct Exogenous {
   float P_micro{101.325f};   // 양압: 양압레일 / 음압: 음압레일
+  // 레일 압력 변화율 [kPa/s]. **채널별 롤아웃에 결합을 넣는 최소 장치다.**
+  //
+  // 지금까지 레일을 지평 동안 상수로 뒀는데, 실제로는 채널 1개 개방에 40 ms 동안
+  // ≈5 kPa, 양압 6채널 동시에 ≈34 kPa 떨어진다. 전체를 하나의 MPPI 로 푸는 것도
+  // 시도했으나(MppiSystem.hpp) 공유 롤아웃에서는 채널 g 의 표본들이 **다른 11채널의
+  // 무작위 탐색이 만든 레일 궤적까지 다르므로** 공로 배분이 뭉개져 오히려 나빠졌다
+  // (계측 IAE 5.7 → 17.8).
+  //
+  // 그래서 롤아웃은 채널별로 유지하고, 레일 궤적만 **명목(피드포워드) 명령으로 한 번**
+  // 계산해 12채널이 공유한다. 무작위성이 레일에 들어가지 않으므로 공로 배분이 깨끗하고,
+  // 결합은 1차까지 정확하다.
+  float dP_micro_dt{0.f};
   float P_macro{101.325f};   // 양압: 탱크    / 음압: 미사용(이젝터는 p_limit)
   float P_atm{101.325f};
   float V0{1.0e-5f};         // 챔버 부피 [m³]
@@ -139,9 +151,13 @@ void  step(const PlantParams& p, ChannelState& s, const std::array<float, 3>& u,
 //
 // z 는 갱신하지 않는다 — AcadosMpc 가 compute_input_reference 에서 이미 갱신하므로
 // 여기서 또 밀면 히스테리시스가 틱마다 두 번 전진한다. 호출자가 z/dir 을 채워 넣는다.
+// `integrate_chamber` 가 true 면 챔버압 `s.P` 도 같은 식으로 한 스텝 전진시킨다.
+// 그러면 이 함수 하나가 **예측기**가 된다 — 측정을 기다리지 않고 모델로 앞서 나간다.
+// 호출자는 그 예측을 측정과 비교해 보정하면 관측기가 완성된다 (AcadosMpc::solve 참조).
 void  advance_valve_estimate(const PlantParams& p, ChannelState& s,
                              const std::array<float, 3>& u_applied,
-                             const Exogenous& ex, float dt);
+                             const Exogenous& ex, float dt,
+                             bool integrate_chamber = false, float V = -1.0f);
 
 // ── MPPI 하이퍼파라미터 ────────────────────────────────────────────────────
 struct Params {
@@ -197,6 +213,23 @@ struct Stats {
   uint64_t flat{0};            // 비용이 평평해 갱신을 건너뛴 틱 수
 };
 
+// ── RNG (공용) ─────────────────────────────────────────────────────────────
+// xoshiro128++ + Box-Muller. std::mt19937 + normal_distribution 은 이 호출량
+// (채널당 K·NP·3 = 3840/틱, 500 Hz)에서 무시할 수 없다.
+//
+// **표본별로 시드할 수 있어야 한다.** 중앙집중 솔버는 표본을 스레드에 나눠 돌리므로,
+// RNG 하나를 순차로 돌리면 결과가 스레드 스케줄에 의존해 결정론이 깨진다.
+struct Rng {
+  uint32_t s[4];
+  bool  has_cache{false};
+  float cache{0.f};
+  explicit Rng(uint32_t seed);
+  void reseed(uint64_t seed);
+  uint32_t next_u32();
+  float uniform01();                // (0,1) 개구간
+  float normal();
+};
+
 // ── 솔버 ───────────────────────────────────────────────────────────────────
 // 스레드당 1 인스턴스(채널당 1개)를 전제로 한다 — 내부 버퍼·RNG 를 공유하지 않는다.
 // 핫패스에서 힙 할당이 없도록 생성 시 전부 예약한다.
@@ -216,18 +249,6 @@ public:
   const Params& params() const { return pr_; }
 
 private:
-  // xoshiro128++ + Box-Muller. std::mt19937 + normal_distribution 은 이 호출량
-  // (채널당 K·NP·3 = 3840/틱, 500 Hz)에서 무시할 수 없다.
-  struct Rng {
-    uint32_t s[4];
-    bool  has_cache{false};
-    float cache{0.f};
-    explicit Rng(uint32_t seed);
-    uint32_t next_u32();
-    float uniform01();                // (0,1) 개구간
-    float normal();
-  };
-
   float rollout_cost(const ChannelState& x0, const Exogenous& ex,
                      const std::array<float, 3>& uref, int sample);
 

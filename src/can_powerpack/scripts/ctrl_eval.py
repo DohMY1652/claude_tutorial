@@ -52,7 +52,7 @@ class Rec(Node):
     def __init__(self):
         super().__init__('ctrl_eval_rec')
         self.ta, self.ang = [], []
-        self.tp, self.pm, self.pr = [], [], []
+        self.tp, self.pm, self.pr, self.rail = [], [], [], []
         self.create_subscription(Float64MultiArray, '/pack2/board/analog', self._a, 50)
         self.create_subscription(Float64MultiArray, '/pack2/controller/sensors_kpa', self._s, 50)
         self.create_subscription(Float64MultiArray, '/pack2/controller/mpc_refs_kpa', self._r, 50)
@@ -72,6 +72,9 @@ class Rec(Node):
         self.tp.append(time.time() - self.t0)
         self.pm.append([d[g + BOARD_OFF - 1] for g in range(N_CH)])
         self.pr.append(self._last_ref)
+        # 레일 압력 (board 1 = 양압, board 2 = 음압). 중앙집중 MPPI 는 라인 밸브를
+        # 직접 지령하므로 레일이 유지되는지가 진단의 핵심이다.
+        self.rail.append([d[0], d[1]])
 
     def _r(self, m):
         if len(m.data) >= N_CH:
@@ -130,7 +133,10 @@ def main():
     # 스텝 1회 = 잡음 큰 표본 1개이고, 유사 설정의 IAE 가 19.5~29.2 로 흩어졌다.
     ap.add_argument('--profile', default='45,15,40,25')
     ap.add_argument('--dwell', type=float, default=5.0)
-    ap.add_argument('--warmup', type=float, default=8.0)
+    # 10 s: 밸브 잠금 해제 게이트가 elapsed_time_sec_ ≥ 5 s 에서 풀리는데 그 시간이
+    # **틱 기반**이다. 실측 틱 간격이 2.09 ms(가정 2.0)라 벽시계로는 5.22 s 에 풀린다.
+    # 8 s 웜업이면 정착 여유가 2.8 s 로 줄어 첫 전이의 초기 상태가 흔들렸다.
+    ap.add_argument('--warmup', type=float, default=10.0)
     ap.add_argument('--port', type=int, default=2293)
     ap.add_argument('--log', default=None)
     ap.add_argument('--overrides', default='')
@@ -176,9 +182,15 @@ def main():
         agg = {k: float(np.nanmean([p[k] for p in per])) for k in per[0]}
         pr_ = prs_metrics(rec.tp, rec.pm, rec.pr, marks[0][0])
         tag = args.tag or args.solver
+        rl = np.asarray(rec.rail) if rec.rail else np.zeros((1, 2))
+        tt = np.asarray(rec.tp) if rec.tp else np.zeros(1)
+        mm = tt >= marks[0][0]
+        rl = rl[mm] if mm.any() and rl.shape[0] == tt.size else rl
         print(f'RESULT\t{tag}\tIAE={agg["iae"]:.3f}\tover={agg["over"]:.2f}\t'
               f'settle={agg["settle"]:.2f}\tfin={agg["fin"]:.3f}\t'
-              f'pRMSE={pr_["rmse"]:.2f}\tpFin={pr_["fin"]:.2f}\tn={len(per)}')
+              f'pRMSE={pr_["rmse"]:.2f}\tpFin={pr_["fin"]:.2f}\t'
+              f'railP={rl[:,0].mean():.0f}/{rl[:,0].min():.0f}\t'
+              f'railN={rl[:,1].mean():.0f}/{rl[:,1].max():.0f}\tn={len(per)}')
         rec.destroy_node()
         rclpy.shutdown()
     finally:

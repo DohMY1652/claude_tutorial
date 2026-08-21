@@ -28,6 +28,7 @@
 
 #include <qpOASES.hpp>
 #include "Mppi.hpp"
+#include "MppiSystem.hpp"
 
 #ifdef __linux__
   #include <pthread.h>
@@ -233,6 +234,22 @@ public:
     float mppi_terminal_mult{5.0f};
     int   mppi_substeps{2};
     bool  mppi_taper_in_rollout{true};
+    // 롤아웃 초기 상태로 필터 전 생값을 쓴다. 측정 지연 가설의 싼 **진단** 스위치.
+    // 계측(스텝 4개 평균): 압력 RMSE 5.51 → 5.09, 정상상태 압력오차 0.25 → 0.00 으로
+    // 개선되지만 위치 IAE 는 5.30 → 6.43 으로 악화된다. 생값은 양자화 잡음(양압 보드
+    // 0.25 kPa/LSB)이 그대로라 MPPI 가 잡음을 쫓아 밸브가 떨린다. 즉 지연 가설은 맞지만
+    // 해법은 생값이 아니라 **관측기**다 (아래).
+    bool  mppi_raw_state{false};
+
+    // ── 상태 관측기 ────────────────────────────────────────────────────────
+    // 필터값은 매끄럽지만 ≈18 ms 늦고(LPF 직렬 2단, 각 τ≈9 ms — 지평 40 ms 의 45%),
+    // 생값은 즉각이지만 시끄럽다. 모델로 앞서 예측하고 그 예측에 **같은 LPF 2단을
+    // 복제**해 측정과 같은 조건으로 비교한 뒤 잔차로 보정하면 둘을 동시에 얻는다.
+    // MPPI 에는 필터가 안 걸린 추정값을 넘긴다.
+    bool  mppi_estimator{false};
+    float obs_gain{0.10f};          // 잔차 보정 이득 [1/tick]
+    float obs_bridge_alpha{0.2f};   // 브리지/시뮬 LPF 계수 (컨트롤러가 직접 모르는 값)
+    float obs_ctrl_alpha{0.2f};     // 컨트롤러 LPF 계수 (sensor_filter_alpha 를 그대로 받는다)
   };
 
   explicit AcadosMpc(const Config& cfg);
@@ -244,6 +261,21 @@ public:
   void set_AB_sequences(const std::vector<float>& A_seq, const std::vector<Eigen::RowVector3f>& B_seq);
   void set_AB_constant(float A_scalar, const Eigen::RowVector3f& B_row);
   void solve(float dt_ms, std::array<uint16_t, MPC_OUT_DIM>& out3, float current_time_sec);
+  // 중앙집중 MPPI 용 분리 — 그 사이에 전체 시스템 솔버가 끼어든다.
+  // prepare: z 갱신 · 피드포워드 · 적분항 · 크래킹 임계 → uref
+  // finish : 테이퍼 · 클램프 · PWM · 밸브 상태 추정 전진
+  std::array<float,3> prepare(float dt_ms, float current_time_sec);
+  void finish(const std::array<float,3>& du3, std::array<uint16_t, MPC_OUT_DIM>& out3);
+  void report_mppi_stats();
+  inline float p_used() const { return P_used_; }          // 실제 쓴 압력 (추정/생/필터)
+  inline const std::array<float,3>& u_crack() const { return u_crack_; }
+  inline const std::array<float,3>& uref()    const { return uref_; }
+  inline const mppi::ChannelState& plant_est() const { return plant_est_; }
+  inline float vol_dot_est() const { return vol_dot_est_; }
+  // 롤아웃 초기 상태 — 채널 경로와 중앙집중 경로가 **같은 조립 규칙**을 쓰게 한다.
+  // prepare() 직후에 부를 것 (z 가 이번 틱 값으로 갱신된 뒤여야 한다).
+  mppi::ChannelState rollout_state() const;
+  const mppi::PlantParams& plant_params() const { return mppi_plant_; }
   const Config& cfg() const { return cfg_; }
 
   // macro(탱크 부스트 / 이젝터) 경로 개방 허용 — 생성기(mode 2)가 매 틱 갱신한다.
@@ -254,8 +286,14 @@ public:
   //   ② MPC 자체: micro 밸브 명령이 포화 (지금 이 순간의 백스톱, mode 0/1 은 이것만)
   // 둘 다 물리에서 유도되므로 임의로 정하는 kPa 임계값이 필요 없다.
   inline void set_macro_allow(bool allow) { macro_allow_ = allow; }
+  // 이 채널이 붙은 레일의 압력 변화율 [kPa/s]. 컨트롤러가 12채널 명목 명령으로 한 번
+  // 계산해 공유한다 — 롤아웃이 레일을 상수로 두던 오차(≈5~34 kPa)를 없앤다.
+  inline void set_rail_rate(float r) { rail_rate_ = r; }
 
   float current_P_now_       = 101.325f;
+  // 롤아웃 초기 상태 전용 생값(필터 전). 오차·피드포워드·적분항은 그대로 필터값을 쓴다 —
+  // 그래야 "초기 상태만" 바꾼 효과를 분리해 볼 수 있다.
+  float current_P_now_raw_   = 101.325f;
   float current_P_micro_     = 101.325f;
   float current_P_macro_     = 101.325f;
   float current_P_macro_neg_ = 101.325f;
@@ -304,6 +342,21 @@ private:
   mppi::ChannelState            plant_est_{};
   int   mppi_stat_tick_{0};
   float vol_dot_est_{0.0f};        // compute_input_reference 가 매 틱 갱신 [m³/s]
+  // prepare → finish 사이에 넘겨야 하는 값들
+  std::array<float,3> uref_{0.f,0.f,0.f};
+  float taper_{1.0f};
+  float dt_sec_{0.004f};
+  float P_used_{101.325f};         // 이번 틱에 실제로 쓴 압력 (추정/생/필터 중 하나)
+  float rail_rate_{0.0f};          // 레일 압력 변화율 [kPa/s] (컨트롤러가 주입)
+
+  // ── 관측기 상태 ──────────────────────────────────────────────────────────
+  // p_hat_      : 필터가 걸리지 않은 **진짜** 챔버압 추정 (MPPI 초기 상태로 쓴다)
+  // p_hat_f1/f2 : 그 추정에 브리지 LPF·컨트롤러 LPF 를 복제 적용한 값.
+  //               측정값(filt_out_)과 같은 지연을 가지므로 직접 비교할 수 있다.
+  float p_hat_{101.325f}, p_hat_f1_{101.325f}, p_hat_f2_{101.325f};
+  bool  p_hat_init_{false};
+  double obs_resid_acc_{0.0};      // 진단: 잔차 절대값 누적
+  int    obs_resid_n_{0};
 
   Eigen::MatrixXf S_bar_, T_bar_;
   Eigen::VectorXf x0_mpc_, Xref_mpc_, qtmp_, solution_;
@@ -477,6 +530,10 @@ private:
   double sensor_filter_alpha_{1.0};
   std::vector<double> filt_state_;                      // [NUM_CAN_BOARDS]
   std::array<double,   NUM_CAN_BOARDS> filt_out_{};     // kPa, indexed by board_id-1
+  // 필터 **전** 압력. 측정 경로에 LPF 가 직렬 2단(브리지 α=0.2 + 여기 α=0.2, 각 τ≈9 ms)
+  // 걸려 있어 filt_out_ 은 약 18 ms 낡았고, 그것은 MPPI 지평 40 ms 의 45% 다.
+  // 예측기의 초기 상태로는 생값이 더 나을 수 있어 비교용으로 함께 들고 간다.
+  std::array<double,   NUM_CAN_BOARDS> raw_out_{};
   bool filter_initialized_{false};
 
   std::vector<double> ref_snapshot_;
@@ -537,6 +594,32 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_kpa_all_;
 
   std::unique_ptr<ThreadPool> pool_;
+  size_t pool_threads_{2};
+  std::vector<std::function<void()>> sys_tasks_;   // 핫패스 재할당 방지
+
+  // ── 중앙집중 MPPI (solver: mppi_system) ──────────────────────────────────
+  // 12개 채널 + 라인 밸브 2개를 **하나의 최적화**로 푼다. 레일 강하와 채널 유량 요구
+  // 총합이 같은 모델 안에 들어오므로, 채널별 독립 MPPI 가 레일을 무한 소스로 가정해
+  // 생기던 ≈34 kPa(6채널 동시) 예측 오차가 원리적으로 사라진다. 라인 PID 는 흡수된다.
+  std::unique_ptr<mppi::SystemSolver> sys_mppi_;
+  mppi::SysParams    sys_params_{};
+  mppi::SysState     sys_state_{};
+  mppi::SysExo       sys_exo_{};
+  std::vector<float> sys_uref_;
+  bool  sys_init_{false};
+  bool  sys_control_lines_{false};
+  int   sys_stat_tick_{0};
+  double sys_pred_err_pos_{0.0}, sys_pred_err_neg_{0.0};
+  double sys_pred1_pos_{0.0}, sys_pred1_neg_{0.0};
+  bool   sys_pred1_valid_{false};
+  int    sys_pred_n_{0};
+  void build_system_mppi();
+  void estimate_rail_rates(double P_line_pos_kPa, double P_line_neg_kPa,
+                           double P_atm_kPa, float& dPpos_dt, float& dPneg_dt);
+  float rail_rate_pos_{0.0f}, rail_rate_neg_{0.0f};
+  bool  rail_rate_enable_{false};
+  void run_system_mppi(double P_atm_kPa, double P_line_pos_kPa, double P_line_neg_kPa,
+                       double P_line_macro_kPa, double P_line_macro_neg_kPa);
   std::mutex sensors_mtx_;
   std::array<uint16_t, NUM_CAN_BOARDS> sensors_raw_{};   // indexed by board_id-1
 
@@ -546,6 +629,7 @@ private:
 
   std::vector<std::unique_ptr<AcadosMpc>> mpcs_;
   uint64_t tick_{0};
+  double wall_elapsed_sec_{0.0};   // 실제 벽시계 경과 — 틱 간격 진단용 (제어에는 쓰지 않는다)
   SensorCalib sensor_;
 
   struct MpcYaml {
@@ -577,6 +661,10 @@ private:
     double mppi_terminal_mult{5.0};
     int    mppi_substeps{2};
     bool   mppi_taper_in_rollout{true};
+    bool   mppi_raw_state{false};
+    bool   mppi_estimator{false};
+    double obs_gain{0.10};
+    double obs_bridge_alpha{0.2};
   } mpc_;
 
   std::vector<double> vol_ml_;

@@ -725,157 +725,186 @@ std::array<float,3> AcadosMpc::solve_qp_first_step(const Eigen::MatrixXf& P,
   return {solution_(0), solution_(1), solution_(2)};
 }
 
-void AcadosMpc::solve(float dt_ms,
-                      std::array<uint16_t, MPC_OUT_DIM>& out3,
-                      float current_time_sec)
+// ============================================================================
+// prepare / finish — 중앙집중 MPPI 를 위한 분리
+//
+// prepare : Bouc-Wen z 갱신 · 피드포워드 역모델 · 적분항 · 크래킹 임계 갱신을 하고
+//           uref 를 낸다. **여기까지가 채널별로 독립이다.**
+// (그 사이) 채널별 MPPI/QP 또는 **전체 시스템 MPPI** 가 Δu 를 결정한다.
+// finish  : 명령 테이퍼 · 클램프 · PWM 스케일 · 밸브 상태 추정 전진.
+//
+// solve() 는 이 셋을 순서대로 부르는 얇은 껍데기다. 그래서 중앙집중 경로가 기존의
+// 튜닝된 피드포워드·적분·크래킹 처리를 **한 줄도 복제하지 않고** 재사용한다.
+// ============================================================================
+std::array<float,3> AcadosMpc::prepare(float dt_ms, float current_time_sec)
 {
   float P_now   = current_P_now_;
-  float err     = cfg_.ref_value - P_now;
 
-  // ── 명령 테이퍼 (하드 데드밴드 대체) ─────────────────────────────────────
-  // 이 밸브는 **크래킹 임계**가 있다: 솔레노이드 자기력이 스프링/압력을 이겨 스풀을
-  // 들어올려야 흐르기 시작하므로, 그 전류(≈50%, 상류 압력에 따라 변동) 아래에서는
-  // 유량이 0 이다. 13-variable 모델이 이걸 C_p·Pin 항과 alpha_shape 로 재현한다
-  // (실측 ≈50%, 모델은 351 kPa abs 레일에서 ≈52%).
+  // ── 관측기 보정 (오차·피드포워드보다 **먼저**) ────────────────────────────
+  // 직전 틱 끝에서 모델로 한 스텝 예측해 둔 p_hat_ 을 이번 측정으로 보정한다.
+  // 비교는 같은 지연 조건에서 해야 하므로 예측값에도 LPF 2단을 복제해 걸고 필터된
+  // 측정값과 비교한다. 정상상태에서는 모든 필터가 DC 를 통과시키므로 바이어스가 없다.
   //
-  // 따라서 "개도를 줄인다"는 것은 u 를 0 쪽으로 줄이는 게 아니라 **크래킹 임계 위쪽
-  // 여유분**을 줄이는 것이다. u 를 그냥 0 쪽으로 스케일하면 임계 아래로 떨어져
-  // 유량이 급절되므로, 연속 테이퍼가 아니라 데드밴드를 다시 만드는 셈이 된다.
-  //   u_out = u_crack + (u_req − u_crack) · taper      (u_req > u_crack 일 때)
-  // err→0 에서 u_out → u_crack 이고 그 점의 유량이 0 이므로 **유량이 연속**이다.
-  // 명령을 u_crack 에서 0 으로 떨어뜨리는 것도 유량 기준으로는 무동작이라 안전하다.
-  //
-  // 하드 데드밴드를 버린 이유: |err| 로 명령을 잘라내면 그 경계에서 유량이 0 ↔ 큰 값
-  // 으로 튀어, 밸브 지연·히스테리시스와 만나면 데드존을 넘나드는 릴레이 진동을 스스로
-  // 유발한다. 위 방식은 경계에서 유량이 0 에서 출발하므로 그 기전이 없다.
-  // 적분항은 살아 있어 정상상태 오차는 계속 밀어낸다 (수렴만 느려진다).
-  const float taper = std::clamp(std::abs(err) / std::max(1e-3f, cfg_.cmd_taper_kpa),
-                                 0.0f, 1.0f);
+  // **일관성이 중요하다.** 추정값을 MPPI 초기 상태에만 쓰고 오차·피드포워드·적분항은
+  // 필터값을 쓰면 과도 구간에 둘이 최대 9 kPa 어긋나 MPPI 보정이 피드포워드와 싸운다
+  // (계측: 절반 적용 시 압력 RMSE 5.51→4.91 로 개선되지만 위치 IAE 5.30→6.71 로 악화.
+  //  일관 적용으로 바꾸자 IAE 5.78, 정착 1.22→1.08, 정상상태 압력오차 0.25→0.00).
+  // 안전 트립은 여기서 쓰지 않는다 — 과압 보호는 모델이 아니라 측정에 근거해야 한다.
+  if (cfg_.mppi_estimator) {
+    if (!p_hat_init_) { p_hat_ = p_hat_f1_ = p_hat_f2_ = P_now; p_hat_init_ = true; }
+    const float a = std::clamp(cfg_.obs_bridge_alpha, 0.01f, 1.0f);
+    const float b = std::clamp(cfg_.obs_ctrl_alpha,   0.01f, 1.0f);
+    p_hat_f1_ = a * p_hat_    + (1.0f - a) * p_hat_f1_;
+    p_hat_f2_ = b * p_hat_f1_ + (1.0f - b) * p_hat_f2_;
+    const float resid = P_now - p_hat_f2_;
+    p_hat_ = std::clamp(p_hat_ + cfg_.obs_gain * resid, 1.0f, 5000.0f);
+    obs_resid_acc_ += std::abs((double)resid);
+    ++obs_resid_n_;
+    P_now = p_hat_;
+  } else if (cfg_.mppi_raw_state) {
+    P_now = current_P_now_raw_;
+  }
+  P_used_ = P_now;
 
-  float P_micro     = current_P_micro_;
-  float P_macro     = current_P_macro_;
-  float P_macro_neg = current_P_macro_neg_;
+  const float err = cfg_.ref_value - P_now;
+  taper_ = std::clamp(std::abs(err) / std::max(1e-3f, cfg_.cmd_taper_kpa), 0.0f, 1.0f);
 
   float dt_sec = dt_ms / 1000.0f;
   if (dt_sec <= 0.0001f) dt_sec = cfg_.Ts;
+  dt_sec_ = dt_sec;
 
-  auto uref_arr = compute_input_reference(P_now, P_micro, P_macro, P_macro_neg, dt_sec, current_time_sec);
-  Eigen::RowVector3f u_ref(uref_arr[0], uref_arr[1], uref_arr[2]);
+  uref_ = compute_input_reference(P_now, current_P_micro_, current_P_macro_,
+                                  current_P_macro_neg_, dt_sec, current_time_sec);
+  return uref_;
+}
 
-  std::fill(P_ref_.begin(), P_ref_.end(), cfg_.ref_value);
+void AcadosMpc::finish(const std::array<float,3>& du3,
+                       std::array<uint16_t, MPC_OUT_DIM>& out3)
+{
+  // 테이퍼는 보정까지 포함한 **최종** 명령에 적용한다. uref 만 줄이면 Δu 로 다시
+  // 밀어올려 무력화되기 때문이다.
+  const float tp = taper_;
+  auto taper_above_crack = [tp](float u, float u_c) {
+    return (u <= u_c) ? 0.0f : u_c + (u - u_c) * tp;
+  };
+  std::array<float,3> u0{
+    taper_above_crack(std::clamp(uref_[0] + du3[0], 0.0f, 100.0f), u_crack_[0]),
+    taper_above_crack(std::clamp(uref_[1] + du3[1], 0.0f, 100.0f), u_crack_[1]),
+    taper_above_crack(std::clamp(uref_[2] + du3[2], 0.0f, 100.0f), u_crack_[2]),
+  };
+  last_u3_ = u0;
 
-  // ── 외생 입력 (두 솔버 경로가 공유) ─────────────────────────────────────
+  // 밸브 내부 상태(q, qd) 추정을 실제 인가 명령 + 측정 압력으로 한 틱 전진시킨다.
+  // 관측기를 쓰면 압력 예측도 이어 간다 (매 틱 측정으로 리셋하지 않는다).
   mppi::Exogenous ex;
-  ex.P_micro = P_micro;
-  ex.P_macro = P_macro;          // 음압 채널은 이젝터(p_limit)를 쓰므로 사용되지 않는다
+  ex.P_micro = current_P_micro_;
+  ex.P_macro = current_P_macro_;
   ex.P_atm   = current_P_atm_;
   ex.V0      = cfg_.volume_m3;
   ex.Vdot    = vol_dot_est_;
   ex.P_ref   = cfg_.ref_value;
-  // 피드포워드가 겨냥하는 것과 **같은** 접근 궤적을 MPPI 의 스테이지 레퍼런스로 준다.
-  ex.tau_ref = (cfg_.mppi_ref_tau_s > 0.f) ? cfg_.mppi_ref_tau_s
-                                           : cfg_.target_time_constant;
-  ex.P0      = P_now;
+  plant_est_.P = (cfg_.mppi_estimator && p_hat_init_) ? p_hat_ : P_used_;
+  plant_est_.v[0].z = (float)z_micro_;  plant_est_.v[0].dir = dir_micro_;
+  plant_est_.v[1].z = (float)z_macro_;  plant_est_.v[1].dir = dir_macro_;
+  plant_est_.v[2].z = (float)z_atm_;    plant_est_.v[2].dir = dir_atm_;
+  mppi::advance_valve_estimate(mppi_plant_, plant_est_, u0, ex, dt_sec_,
+                               cfg_.mppi_estimator, cfg_.volume_m3);
+  if (cfg_.mppi_estimator) p_hat_ = plant_est_.P;
+
+  // 4095 스케일 (100% -> 4095), 출력 순서는 micro, atm, macro
+  out3[0] = static_cast<uint16_t>( std::round(u0[0] * 40.95f) );
+  out3[1] = static_cast<uint16_t>( std::round(u0[2] * 40.95f) );
+  out3[2] = static_cast<uint16_t>( std::round(u0[1] * 40.95f) );
+}
+
+mppi::ChannelState AcadosMpc::rollout_state() const
+{
+  mppi::ChannelState x0;
+  x0.P = P_used_;
+  const double zs[3]  = { z_micro_,      z_macro_,      z_atm_      };
+  const double pis[3] = { prev_I_micro_, prev_I_macro_, prev_I_atm_ };
+  const int    dis[3] = { dir_micro_,    dir_macro_,    dir_atm_    };
+  for (int j = 0; j < 3; ++j) {
+    x0.v[(size_t)j].q     = plant_est_.v[(size_t)j].q;
+    x0.v[(size_t)j].qd    = plant_est_.v[(size_t)j].qd;
+    x0.v[(size_t)j].z     = (float)zs[j];
+    x0.v[(size_t)j].prevI = (float)pis[j];
+    x0.v[(size_t)j].dir   = dis[j];
+  }
+  return x0;
+}
+
+void AcadosMpc::solve(float dt_ms,
+                      std::array<uint16_t, MPC_OUT_DIM>& out3,
+                      float current_time_sec)
+{
+  // 채널 독립 경로: prepare → (MPPI 또는 QP) → finish.
+  // 중앙집중 경로(Controller::run_system_mppi)는 prepare 와 finish 사이에
+  // 전체 시스템 솔버를 끼워 넣는다 — 같은 피드포워드·적분·크래킹 처리를 공유한다.
+  const auto uref_arr = prepare(dt_ms, current_time_sec);
+  Eigen::RowVector3f u_ref(uref_arr[0], uref_arr[1], uref_arr[2]);
+
+  std::fill(P_ref_.begin(), P_ref_.end(), cfg_.ref_value);
+
+  mppi::Exogenous ex;
+  ex.P_micro = current_P_micro_;
+  ex.P_macro = current_P_macro_;
+  ex.P_atm   = current_P_atm_;
+  ex.V0      = cfg_.volume_m3;
+  ex.Vdot    = vol_dot_est_;
+  ex.P_ref   = cfg_.ref_value;
+  ex.tau_ref = (cfg_.mppi_ref_tau_s > 0.f) ? cfg_.mppi_ref_tau_s : cfg_.target_time_constant;
+  ex.P0      = P_used_;
 
   std::array<float,3> du3{0.f, 0.f, 0.f};
 
   if (mppi_) {
-    // ── MPPI: 선형화 없이 비선형 롤아웃으로 보정 Δu 를 낸다 ───────────────
-    // 초기 상태 = 측정 압력 + 밸브 내부 상태 추정. z/prevI/dir 은
-    // compute_input_reference 가 방금 갱신한 값을 단일 출처로 복사한다
-    // (여기서 또 갱신하면 히스테리시스가 틱마다 두 번 전진한다).
-    mppi::ChannelState x0;
-    x0.P = P_now;
-    const double  zs[3]  = { z_micro_,      z_macro_,      z_atm_      };
-    const double  pis[3] = { prev_I_micro_, prev_I_macro_, prev_I_atm_ };
-    const int     dis[3] = { dir_micro_,    dir_macro_,    dir_atm_    };
-    for (int j = 0; j < 3; ++j) {
-      x0.v[(size_t)j].q     = plant_est_.v[(size_t)j].q;
-      x0.v[(size_t)j].qd    = plant_est_.v[(size_t)j].qd;
-      x0.v[(size_t)j].z     = (float)zs[j];
-      x0.v[(size_t)j].prevI = (float)pis[j];
-      x0.v[(size_t)j].dir   = dis[j];
-    }
-    du3 = mppi_->solve(x0, ex, uref_arr);
-
-    // 진단: QP 경로와 같은 주기(500 Hz 에서 10 s)로, 실시간 예산과 가중 붕괴를 본다.
-    if (++mppi_stat_tick_ >= 5000) {
-        mppi_stat_tick_ = 0;
-        const auto st = mppi_->take_stats();
-        if (st.calls) {
-            // 유효샘플·이상치배율은 **활성 틱(갱신을 실제로 한 틱)** 에서만 누적된다.
-            // 전체 틱으로 나누면 평평 틱 비율만큼 축소돼 보여 진단을 오독하게 된다
-            // (평평 74% 이면 실제값의 26% 로 표시됐다).
-            const double active  = std::max<double>(1.0, (double)(st.calls - st.flat));
-            const double avg_us = st.sum_us / (double)st.calls;
-            const double eff    = st.sum_eff / active;
-            const double sat    = 100.0 * (double)st.sat_first / (double)st.calls;
-            // eff 가 1 에 붙으면 가중치가 한 샘플로 붕괴해 탐색이 죽은 것이고,
-            // K 에 붙으면 균일 평균이라 선택이 없는 것이다. lambda 로 조정한다.
-            RCLCPP_INFO(rclcpp::get_logger("Mppi"),
-              "gid=%d MPPI: %.0f us 평균 / %.0f us 최대 (틱 예산 대비), "
-              "유효샘플 %.1f/%d, Jmin %.4f, 초과 %.4f, 이상치배율 %.1f, "
-              "첫스텝 포화 %.1f%%, 평평 %.1f%%",
-              cfg_.global_id, avg_us, (double)st.max_us, eff,
-              mppi_->params().K, st.sum_cost / (double)st.calls,
-              st.sum_spread / (double)st.calls,
-              st.sum_outlier / active, sat,
-              100.0 * (double)st.flat / (double)st.calls);
-        }
-    }
+    du3 = mppi_->solve(rollout_state(), ex, uref_arr);
+    report_mppi_stats();
   } else {
-    // ── 기존 경로: 선형화 → 응축 QP → qpOASES ────────────────────────────
     update_linearization(cfg_.ref_value, u_ref);
-
     const int Nu = cfg_.n_u * cfg_.NP;
-    Pmat_.setZero(Nu, Nu);
-    qvec_.setZero(Nu);
-    Acon_.setZero(Nu, Nu);
-    LL_.setZero(Nu);
-    UL_.setZero(Nu);
-
-    build_mpc_qp(A_seq_, B_seq_, P_now, P_ref_, Pmat_, qvec_, Acon_, LL_, UL_);
-
-    for (int i = 0; i < cfg_.NP; ++i) {
-        for (int j = 0; j < 3; ++j) {
-            int idx = i * 3 + j;
-            float u_current_ref = uref_arr[j];
-
-            LL_(idx) = std::max(-u_current_ref, cfg_.du_min);
-            UL_(idx) = std::min(100.0f - u_current_ref, cfg_.du_max);
-        }
-    }
-
+    Pmat_.setZero(Nu, Nu); qvec_.setZero(Nu); Acon_.setZero(Nu, Nu);
+    LL_.setZero(Nu); UL_.setZero(Nu);
+    build_mpc_qp(A_seq_, B_seq_, P_used_, P_ref_, Pmat_, qvec_, Acon_, LL_, UL_);
+    for (int i = 0; i < cfg_.NP; ++i)
+      for (int j = 0; j < 3; ++j) {
+        const int idx = i * 3 + j;
+        LL_(idx) = std::max(-uref_arr[(size_t)j], cfg_.du_min);
+        UL_(idx) = std::min(100.0f - uref_arr[(size_t)j], cfg_.du_max);
+      }
     du3 = solve_qp_first_step(Pmat_, qvec_, Acon_, LL_, UL_);
   }
 
-  // 테이퍼는 QP 결과까지 포함한 **최종** 명령에 적용한다. u_ref 만 줄이면 MPC 가 Δu 로
-  // 다시 밀어올려 무력화되기 때문이다.
-  auto taper_above_crack = [taper](float u, float u_c) {
-    return (u <= u_c) ? 0.0f : u_c + (u - u_c) * taper;
-  };
-  std::array<float,3> u0{
-    taper_above_crack(std::clamp(uref_arr[0] + du3[0], 0.0f, 100.0f), u_crack_[0]),
-    taper_above_crack(std::clamp(uref_arr[1] + du3[1], 0.0f, 100.0f), u_crack_[1]),
-    taper_above_crack(std::clamp(uref_arr[2] + du3[2], 0.0f, 100.0f), u_crack_[2]),
-  };
-  last_u3_ = u0;
+  finish(du3, out3);
+}
 
-  // 밸브 내부 상태(q, qd) 추정을 **실제 인가 명령 + 측정 압력**으로 한 틱 전진시킨다.
-  // 다음 틱 롤아웃의 초기값이 된다. z 는 단일 출처(z_*)를 쓰므로 여기서 복사만 한다.
-  if (mppi_) {
-    plant_est_.P = P_now;
-    plant_est_.v[0].z = (float)z_micro_;  plant_est_.v[0].dir = dir_micro_;
-    plant_est_.v[1].z = (float)z_macro_;  plant_est_.v[1].dir = dir_macro_;
-    plant_est_.v[2].z = (float)z_atm_;    plant_est_.v[2].dir = dir_atm_;
-    mppi::advance_valve_estimate(mppi_plant_, plant_est_, u0, ex, dt_sec);
+// 진단 로그 — 채널 경로와 중앙집중 경로가 공유한다.
+void AcadosMpc::report_mppi_stats()
+{
+  if (!mppi_) return;
+  if (++mppi_stat_tick_ < 5000) return;
+  mppi_stat_tick_ = 0;
+  const auto st = mppi_->take_stats();
+  if (!st.calls) return;
+  // 유효샘플·이상치배율은 **활성 틱** 에서만 누적된다. 전체 틱으로 나누면 평평 틱
+  // 비율만큼 축소돼 보여 진단을 오독하게 된다 (평평 74% 이면 실제값의 26%).
+  const double active = std::max<double>(1.0, (double)(st.calls - st.flat));
+  RCLCPP_INFO(rclcpp::get_logger("Mppi"),
+    "gid=%d MPPI: %.0f us 평균 / %.0f us 최대 (틱 예산 대비), "
+    "유효샘플 %.1f/%d, Jmin %.4f, 초과 %.4f, 이상치배율 %.1f, "
+    "첫스텝 포화 %.1f%%, 평평 %.1f%%",
+    cfg_.global_id, st.sum_us / (double)st.calls, (double)st.max_us,
+    st.sum_eff / active, mppi_->params().K, st.sum_cost / (double)st.calls,
+    st.sum_spread / (double)st.calls, st.sum_outlier / active,
+    100.0 * (double)st.sat_first / (double)st.calls,
+    100.0 * (double)st.flat / (double)st.calls);
+  if (cfg_.mppi_estimator && obs_resid_n_ > 0) {
+    RCLCPP_INFO(rclcpp::get_logger("Mppi"),
+      "gid=%d 관측기: 평균 |잔차| %.3f kPa (이득 %.2f)",
+      cfg_.global_id, obs_resid_acc_ / (double)obs_resid_n_, (double)cfg_.obs_gain);
+    obs_resid_acc_ = 0.0; obs_resid_n_ = 0;
   }
-
-  // 4095 스케일 (100% -> 4095)
-  // 40.95 = 4095 / 100
-  out3[0] = static_cast<uint16_t>( std::round(u0[0] * 40.95f) ); 
-  out3[1] = static_cast<uint16_t>( std::round(u0[2] * 40.95f) ); 
-  out3[2] = static_cast<uint16_t>( std::round(u0[1] * 40.95f) ); 
 }
 
 
@@ -963,13 +992,18 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.mppi_terminal_mult   = get_param_or<double>(this, "MPC_parameters.mppi_terminal_mult",    5.0);
   mpc_.mppi_substeps        = get_param_or<int>   (this, "MPC_parameters.mppi_substeps",           2);
   mpc_.mppi_taper_in_rollout= get_param_or<bool>  (this, "MPC_parameters.mppi_taper_in_rollout", true);
+  mpc_.mppi_raw_state       = get_param_or<bool>  (this, "MPC_parameters.mppi_raw_state",       false);
+  rail_rate_enable_         = get_param_or<bool>  (this, "MPC_parameters.mppi_rail_rate",      false);
+  mpc_.mppi_estimator       = get_param_or<bool>  (this, "MPC_parameters.mppi_estimator",       false);
+  mpc_.obs_gain             = get_param_or<double>(this, "MPC_parameters.obs_gain",              0.10);
+  mpc_.obs_bridge_alpha     = get_param_or<double>(this, "MPC_parameters.obs_bridge_alpha",      0.2);
   {
     std::string sv = mpc_.solver;
     std::transform(sv.begin(), sv.end(), sv.begin(), ::tolower);
-    if (sv != "qp" && sv != "mppi") {
+    if (sv != "qp" && sv != "mppi" && sv != "mppi_system") {
       RCLCPP_WARN(get_logger(),
-        "MPC_parameters.solver='%s' 는 알 수 없다 — 'qp' 로 진행한다 (선택: qp | mppi)",
-        mpc_.solver.c_str());
+        "MPC_parameters.solver='%s' 는 알 수 없다 — 'qp' 로 진행한다 "
+        "(선택: qp | mppi | mppi_system)", mpc_.solver.c_str());
       sv = "qp";
     }
     mpc_.solver = sv;
@@ -1095,6 +1129,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
       (size_t)num_total_channels_,
       std::thread::hardware_concurrency()));
   std::vector<int> pins; if (enable_thread_pinning_) for (auto v: cpu_pins_param_) pins.push_back((int)v);
+  pool_threads_ = nth;
   pool_ = std::make_unique<ThreadPool>(nth, pins);
 
   build_mpcs();
@@ -1270,6 +1305,11 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
       get_param_or<double>(this, "PressureRefGen.orifice_mm.eject",  4.0));
 
     refgen_ = std::make_unique<PressureRefGen>(gp);
+    // 중앙집중 MPPI 는 이 생성기의 펌프 능력 테이블을 재사용하므로 **여기 뒤**에서
+    // 만들어야 한다. build_mpcs() 직후에 만들었더니 refgen_ 이 아직 null 이어서
+    // 펌프 유량이 0 이 됐고, 모델이 "양압 레일은 절대 회복 못 한다" 고 믿어
+    // 레일 예측오차가 24.6 kPa 까지 벌어졌다.
+    build_system_mppi();
     RCLCPP_INFO(get_logger(),
       "PressureRefGen: N=%d, dt=%.0f ms, 정격 P⁺≤%.1f kPa / P⁻≥%.1f kPa (gauge), "
       "Cd=%.2f eta=%.2f, F_max=%.1f N → τ_max=%.2f N·m",
@@ -1457,6 +1497,8 @@ void Controller::build_mpcs() {
       cfg.cmd_taper_kpa        = (float)mpc_.cmd_taper_kpa;
       cfg.valve_crack_area_frac = (float)mpc_.valve_crack_area_frac;
 
+      // mppi_system 에서는 채널 솔버를 만들지 않는다 — Δu 를 중앙집중이 낸다.
+      // prepare/finish(피드포워드·적분·크래킹·상태추정)는 그대로 쓰인다.
       cfg.use_mppi             = (mpc_.solver == "mppi");
       cfg.mppi_samples         = mpc_.mppi_samples;
       cfg.mppi_lambda          = (float)mpc_.mppi_lambda;
@@ -1475,6 +1517,12 @@ void Controller::build_mpcs() {
       cfg.mppi_terminal_mult   = (float)mpc_.mppi_terminal_mult;
       cfg.mppi_substeps        = mpc_.mppi_substeps;
       cfg.mppi_taper_in_rollout= mpc_.mppi_taper_in_rollout;
+      cfg.mppi_raw_state       = mpc_.mppi_raw_state;
+      cfg.mppi_estimator       = mpc_.mppi_estimator;
+      cfg.obs_gain             = (float)mpc_.obs_gain;
+      cfg.obs_bridge_alpha     = (float)mpc_.obs_bridge_alpha;
+      // 컨트롤러 LPF 계수는 이미 알고 있으므로 그대로 넘긴다 (복제 정확도).
+      cfg.obs_ctrl_alpha       = (float)sensor_filter_alpha_;
 
       auto mpc_obj = std::make_unique<AcadosMpc>(cfg);
       // MPPI 를 써도 QP 솔버는 붙여 둔다 — solver 파라미터만 바꿔 같은 빌드로
@@ -1532,9 +1580,324 @@ void Controller::on_volume(const std_msgs::msg::Float64MultiArray::SharedPtr msg
   }
 }
 
+// ============================================================================
+// 중앙집중 MPPI — 12채널 + 라인 밸브 2개를 하나의 최적화로 푼다
+//
+// 채널별 독립 MPPI 는 공유 레일을 지평 동안 상수로 둔다. 실제로는 채널 1개 개방에
+// ≈5 kPa, 양압 6채널 동시에 ≈34 kPa 강하한다 (추종 정규화 기준 10 kPa 대비 0.5~3.4σ).
+// 게다가 "채널 수요 합 vs 레일 공급" 을 비교하는 코드가 어디에도 없었다.
+// 전체를 한 모델에 넣으면 그 결합이 자동으로 들어오고 라인 PID 도 흡수된다.
+//
+// **기존 자산을 한 줄도 복제하지 않는다**: 채널별 피드포워드·적분항·크래킹 임계·
+// macro 게이트는 AcadosMpc::prepare/finish 를 그대로 부른다. 이 함수는 그 사이에서
+// Δu 만 전체 시스템 기준으로 다시 결정한다.
+// ============================================================================
+void Controller::build_system_mppi()
+{
+  if (mpc_.solver != "mppi_system") return;
+  if (mpcs_.empty()) {
+    RCLCPP_ERROR(get_logger(), "mppi_system: 활성 채널이 없다");
+    return;
+  }
+
+  auto& sp = sys_params_;
+  sp.n_ch  = num_total_channels_;
+  sp.n_pos = num_positive_channels_;
+  sp.P_atm = (float)sensor_.kpa_atm();
+
+  // 채널별 13-parameter — AcadosMpc 가 이미 만들어 둔 것을 그대로 쓴다 (단일 출처).
+  sp.ch.assign((size_t)sp.n_ch, mppi::PlantParams{});
+  for (auto& m : mpcs_) {
+    const int gid = m->cfg().global_id;
+    if (gid >= 0 && gid < sp.n_ch) sp.ch[(size_t)gid] = m->plant_params();
+  }
+  // 비활성 채널은 밸브를 닫아 둔 것과 같으므로 기본 파라미터로 채운다 (양·음 구분만).
+  for (int g = 0; g < sp.n_ch; ++g) sp.ch[(size_t)g].is_positive = (g < sp.n_pos);
+
+  // 라인 밸브 — 채널 0 의 13-parameter 를 공용으로 쓴다. 실기에서는 라인 밸브를
+  // 따로 피팅해야 한다 (RUNBOOK.md 는 채널 36개만 다룬다).
+  sp.line = sp.ch.empty() ? mppi::PlantParams{} : sp.ch[0];
+  sp.line.leakage_u = 0.0f;
+  sp.line.is_positive = true;      // 사용처에서 상·하류를 직접 지정하므로 무의미하다
+
+  sp.V_pos_m3 = (float)(get_param_or<double>(this, "MPC_parameters.rail_volume_pos_ml", 500.0) * 1e-6);
+  sp.V_neg_m3 = (float)(get_param_or<double>(this, "MPC_parameters.rail_volume_neg_ml", 500.0) * 1e-6);
+  sp.leak_pos = (float)get_param_or<double>(this, "MPC_parameters.rail_leak_pos", 0.002);
+  sp.leak_neg = (float)get_param_or<double>(this, "MPC_parameters.rail_leak_neg", 0.002);
+  sp.pos_min  = 50.0f;  sp.pos_max = 800.0f;
+  sp.neg_min  = 5.0f;   sp.neg_max = 110.0f;
+  sp.pump     = refgen_ ? &refgen_->pump_table() : nullptr;   // 이미 만든 능력 테이블 재사용
+  sp.finalize();
+
+  mppi::SysMppiParams mp;
+  mp.K        = get_param_or<int>(this, "MPC_parameters.sys_samples", 256);
+  mp.NP       = (mpc_.mppi_np > 0) ? mpc_.mppi_np : mpc_.NP;
+  mp.Ts       = (float)((mpc_.mppi_ts_s > 0.0) ? mpc_.mppi_ts_s : mpc_.Ts);
+  mp.substeps = mpc_.mppi_substeps;
+  mp.lambda   = (float)mpc_.mppi_lambda;
+  mp.sigma_pct         = (float)mpc_.mppi_sigma_pct;
+  mp.sigma_explore_pct = (float)mpc_.mppi_sigma_explore_pct;
+  mp.explore_frac      = (float)mpc_.mppi_explore_frac;
+  mp.noise_beta        = (float)mpc_.mppi_noise_beta;
+  mp.w_track   = (float)((mpc_.mppi_w_track >= 0.0) ? mpc_.mppi_w_track : mpc_.Q_value);
+  mp.w_effort  = (float)((mpc_.mppi_w_effort >= 0.0) ? mpc_.mppi_w_effort : mpc_.R_value);
+  mp.w_du      = (float)mpc_.mppi_w_du;
+  mp.w_rail    = (float)get_param_or<double>(this, "MPC_parameters.sys_w_rail", 0.5);
+  mp.rail_scale_kpa = (float)get_param_or<double>(this, "MPC_parameters.sys_rail_scale_kpa", 20.0);
+  mp.track_scale_kpa = (float)mpc_.mppi_track_scale_kpa;
+  mp.terminal_mult   = (float)mpc_.mppi_terminal_mult;
+  mp.du_limit_pct    = (float)mpc_.mppi_du_limit_pct;
+  mp.taper_in_rollout= mpc_.mppi_taper_in_rollout;
+  mp.rail_share  = (float)get_param_or<double>(this, "MPC_parameters.sys_rail_share", 0.20);
+  mp.control_lines = get_param_or<bool>(this, "MPC_parameters.sys_control_lines", false);
+  sys_control_lines_ = mp.control_lines;
+
+  sys_mppi_ = std::make_unique<mppi::SystemSolver>(sp, mp, 0xC0FFEEu);
+  sys_state_.resize(sp.n_ch);
+  sys_uref_.assign((size_t)mppi::sys_nu(sp.n_ch), 0.0f);
+  sys_exo_.V.assign((size_t)sp.n_ch, 1e-5f);
+  sys_exo_.Vdot.assign((size_t)sp.n_ch, 0.0f);
+  sys_exo_.P_ref.assign((size_t)sp.n_ch, (float)sensor_.kpa_atm());
+  sys_exo_.u_macro.assign((size_t)sp.n_ch, 0.0f);
+
+  RCLCPP_INFO(get_logger(),
+    "MPC 솔버 = **중앙집중 MPPI**: 제어 %d개(채널 micro %d + atm %d + 라인 2), "
+    "K=%d, NP=%d, Ts=%.1f ms (지평 %.0f ms), 서브스텝=%d, "
+    "w=(track %.3g, rail %.3g, effort %.3g, du %.3g), 레일 기준 %.0f kPa, "
+    "레일 부피 %.0f/%.0f mL, 펌프 테이블 %s",
+    mppi::sys_nu(sp.n_ch), sp.n_ch, sp.n_ch, mp.K, mp.NP, mp.Ts * 1000.0,
+    mp.NP * mp.Ts * 1000.0, mp.substeps,
+    mp.w_track, mp.w_rail, mp.w_effort, mp.w_du, mp.rail_scale_kpa,
+    sp.V_pos_m3 * 1e6, sp.V_neg_m3 * 1e6, sp.pump ? "재사용" : "없음(유량 0)");
+}
+
+// ============================================================================
+// 레일 변화율 추정 — 채널별 MPPI 에 결합을 넣는 최소 장치
+//
+// 채널 12개의 **명목(피드포워드) 명령**으로 지금 이 순간의 레일 질량수지를 한 번 계산해
+// dP_rail/dt 를 낸다. 롤아웃은 그것으로 레일을 선형 이동시킨다.
+//
+// 왜 이 형태인가: 전체를 하나의 MPPI 로 푸는 것도 구현해 봤는데(mppi_system), 공유
+// 롤아웃에서는 채널 g 의 표본들이 자기 제어만 다른 게 아니라 **다른 11채널의 무작위
+// 탐색이 만든 레일 궤적까지 달라서** 공로 배분이 뭉개졌다 (IAE 5.7 → 17.8).
+// 명목만으로 레일을 예측하면 무작위성이 레일에 들어가지 않아 그 문제가 없다.
+//
+// 식은 sys_step 의 레일 항과 같다 (VirtualPowerpack::integrate 와 동일).
+void Controller::estimate_rail_rates(double P_line_pos_kPa, double P_line_neg_kPa,
+                                     double P_atm_kPa,
+                                     float& dPpos_dt, float& dPneg_dt)
+{
+  dPpos_dt = dPneg_dt = 0.0f;
+  if (sys_params_.ch.empty()) return;
+
+  float draw_pos = 0.0f, fill_neg = 0.0f;
+  for (auto& mpc : mpcs_) {
+    AcadosMpc* m = mpc.get();
+    const int gid = m->cfg().global_id;
+    if (gid < 0 || gid >= (int)sys_params_.ch.size()) continue;
+    const auto& cp = sys_params_.ch[(size_t)gid];
+    const float u_mi = m->uref()[0];              // 명목 micro 개도
+    const float P    = m->p_used();
+    const float z    = m->plant_est().v[0].z;
+    if (m->cfg().is_positive)
+      draw_pos += mppi::q_static(cp, u_mi, (float)P_line_pos_kPa, P, z);
+    else
+      fill_neg += mppi::q_static(cp, u_mi, P, (float)P_line_neg_kPa, z);
+  }
+
+  float Q_pump = 0.0f;
+  if (sys_params_.pump)
+    Q_pump = (float)(sys_params_.pump->flow_out(P_line_pos_kPa * 1000.0,
+                                                P_line_neg_kPa * 1000.0)
+                     / (double)mppi::LPM_TO_KGPS);
+
+  const float u_vent  = (float)std::clamp(zoh_[pid_pos_pwm_index_] / 40.95, 0.0, 100.0);
+  const float u_admit = (float)std::clamp(zoh_[pid_neg_pwm_index_] / 40.95, 0.0, 100.0);
+  const float z_v = sys_state_.v[(size_t)sys_state_.iv_vent()].z;
+  const float z_a = sys_state_.v[(size_t)sys_state_.iv_admit()].z;
+  const float f_vent  = mppi::q_static(sys_params_.line, u_vent,
+                                       (float)P_line_pos_kPa, (float)P_atm_kPa, z_v);
+  const float f_admit = mppi::q_static(sys_params_.line, u_admit,
+                                       (float)P_atm_kPa, (float)P_line_neg_kPa, z_a);
+  const float lk_p = sys_params_.leak_pos * std::max(0.0f, (float)(P_line_pos_kPa - P_atm_kPa));
+  const float lk_n = sys_params_.leak_neg * std::max(0.0f, (float)(P_atm_kPa - P_line_neg_kPa));
+
+  const float K = mppi::RGAS_AIR * mppi::TEMP_K * mppi::LPM_TO_KGPS / 1000.0f;
+  dPpos_dt = K * (Q_pump - f_vent - lk_p - draw_pos) / sys_params_.V_pos_m3;
+  dPneg_dt = K * (f_admit + lk_n + fill_neg - Q_pump) / sys_params_.V_neg_m3;
+}
+
+void Controller::run_system_mppi(double P_atm_kPa, double P_line_pos_kPa,
+                                 double P_line_neg_kPa, double P_line_macro_kPa,
+                                 double P_line_macro_neg_kPa)
+{
+  const int n  = sys_params_.n_ch;
+  const int nu = mppi::sys_nu(n);
+
+  // ── ① 채널별 prepare — **순차**. 채널당 수 µs 짜리 12개인데 풀 디스패치가
+  //    그보다 비싸다 (틱당 풀 호출을 2회에서 1회로 줄인다).
+  for (auto& mpc : mpcs_) {
+    AcadosMpc* m = mpc.get();
+    {
+      const int brd_idx = m->cfg().can_board_id - 1;
+      const int gid     = m->cfg().global_id;
+      const bool pos    = m->cfg().is_positive;
+      m->current_P_atm_       = (float)P_atm_kPa;
+      m->current_P_now_       = (float)filt_out_[brd_idx];
+      m->current_P_now_raw_   = (float)raw_out_[brd_idx];
+      m->current_P_micro_     = (float)(pos ? P_line_pos_kPa : P_line_neg_kPa);
+      m->current_P_macro_     = (float)P_line_macro_kPa;
+      m->current_P_macro_neg_ = (float)P_line_macro_neg_kPa;
+      m->set_volume((float)(final_active_vols_ml_[gid] * 1e-6));
+      m->set_prev_volume((float)prev_vol_m3_[gid]);
+      float ref_kpa = 0.f;
+      if (gid >= 0 && gid < (int)ref_snapshot_.size()) ref_kpa = (float)ref_snapshot_[(size_t)gid];
+      m->set_ref_value(ref_kpa);
+      m->prepare((float)period_ms_, (float)elapsed_time_sec_);
+    }
+  }
+
+  // ── ② 전체 시스템 상태·외생 입력·명목 조립 ────────────────────────────────
+  sys_state_.P_pos = (float)P_line_pos_kPa;
+  sys_state_.P_neg = (float)P_line_neg_kPa;
+  sys_params_.P_macro     = (float)P_line_macro_kPa;
+  sys_params_.P_macro_neg = (float)P_line_macro_neg_kPa;
+  sys_params_.P_atm       = (float)P_atm_kPa;
+
+  for (auto& mpc : mpcs_) {
+    AcadosMpc* m = mpc.get();
+    const int gid = m->cfg().global_id;
+    if (gid < 0 || gid >= n) continue;
+    const auto x0 = m->rollout_state();          // 채널 경로와 **같은 조립 규칙**
+    sys_state_.P_ch[(size_t)gid] = x0.P;
+    for (int j = 0; j < 3; ++j) sys_state_.v[(size_t)sys_state_.iv_ch(gid, j)] = x0.v[(size_t)j];
+    sys_exo_.V[(size_t)gid]     = m->cfg().volume_m3;
+    sys_exo_.Vdot[(size_t)gid]  = m->vol_dot_est();
+    sys_exo_.P_ref[(size_t)gid] = m->cfg().ref_value;
+    // macro 는 1단계에서 최적화 대상이 아니다 — 기존 게이트가 정한 피드포워드를 그대로 쓴다.
+    sys_exo_.u_macro[(size_t)gid] = m->uref()[1];
+    sys_uref_[(size_t)mppi::sys_i_micro(gid)]   = m->uref()[0];
+    sys_uref_[(size_t)mppi::sys_i_atm(n, gid)]  = m->uref()[2];
+  }
+  sys_exo_.rail_pos_sp = (float)(gen_rail_pos_sp_kpa_ > 0.0 ? gen_rail_pos_sp_kpa_ : pid_pos_.ref);
+  sys_exo_.rail_neg_sp = (float)(gen_rail_neg_sp_kpa_ > 0.0 ? gen_rail_neg_sp_kpa_ : pid_neg_.ref);
+  sys_exo_.ref_tau_s   = (float)((mpc_.mppi_ref_tau_s > 0.0) ? mpc_.mppi_ref_tau_s
+                                                             : mpc_.target_tc);
+
+  // 라인 밸브 — PWM 값이 곧 개도다 (LinePID 의 (100−u) 반전은 그 안에서 끝난다).
+  // 제어하지 않는 모드에서는 **외생 입력**으로만 넘겨 롤아웃이 레일을 예측하게 한다.
+  const int iv = mppi::sys_i_vent(n), ia = mppi::sys_i_admit(n);
+  const float u_vent_now  = (float)std::clamp(zoh_[pid_pos_pwm_index_] / 40.95, 0.0, 100.0);
+  const float u_admit_now = (float)std::clamp(zoh_[pid_neg_pwm_index_] / 40.95, 0.0, 100.0);
+  sys_exo_.u_vent  = u_vent_now;
+  sys_exo_.u_admit = u_admit_now;
+  if (sys_control_lines_) {
+    sys_uref_[(size_t)iv] = u_vent_now;      // 명목 = 직전 인가값 (워밍 스타트)
+    sys_uref_[(size_t)ia] = u_admit_now;
+  }
+
+  // ── ③ 한 번의 최적화. 표본을 스레드에 나눈다 (채널이 아니라) ──────────────
+  // 표본을 **덩어리로** 나눈다. 표본 1개당 태스크 1개로 하면 태스크가 ~5 us 짜리인데
+  // 디스패치·스핀대기 오버헤드가 그보다 커서 계산을 압도한다
+  // (계측: K=256 개별 태스크 → 평균 1334 us, 최대 31205 us. 틱 예산 2 ms 의 15배).
+  // 스레드 수만큼만 만들면 디스패치가 256 → 12 회로 줄고 표본별 결정론은 유지된다
+  // (노이즈가 표본 인덱스로 시드되므로 어느 스레드가 어느 구간을 잡아도 같다).
+  auto pfor = [this](int nn, const std::function<void(int)>& fn) {
+    const int nthr = std::max(1, (int)pool_threads_);
+    const int chunk = (nn + nthr - 1) / nthr;
+    sys_tasks_.clear();
+    for (int c = 0; c < nthr; ++c) {
+      const int lo = c * chunk, hi = std::min(nn, lo + chunk);
+      if (lo >= hi) break;
+      sys_tasks_.emplace_back([&fn, lo, hi]() { for (int i = lo; i < hi; ++i) fn(i); });
+    }
+    pool_->run_batch_and_wait(sys_tasks_);
+  };
+  const auto& du = sys_mppi_->solve(sys_state_, sys_exo_, sys_uref_, pfor);
+
+  // ── ④ 채널별 finish (테이퍼·클램프·PWM·상태 추정) ─────────────────────────
+  for (auto& mpc : mpcs_) {
+    AcadosMpc* m = mpc.get();
+    const int gid = m->cfg().global_id;
+    if (gid < 0 || gid >= n) continue;
+    // macro Δu = 0 — 1단계에서는 최적화 대상이 아니다.
+    const std::array<float,3> du3{ du[(size_t)mppi::sys_i_micro(gid)], 0.0f,
+                                   du[(size_t)mppi::sys_i_atm(n, gid)] };
+    std::array<uint16_t, MPC_OUT_DIM> u3{};
+    m->finish(du3, u3);
+    const int base = (m->cfg().can_board_id - 1) * PWM_PER_BOARD;
+    zoh_[base + 0] = u3[0];
+    zoh_[base + 1] = u3[1];
+    zoh_[base + 2] = u3[2];
+  }
+
+  // ── ⑤ 라인 밸브 ──────────────────────────────────────────────────────────
+  const float u_vent  = sys_control_lines_
+      ? std::clamp(sys_uref_[(size_t)iv] + du[(size_t)iv], 0.0f, 100.0f) : u_vent_now;
+  const float u_admit = sys_control_lines_
+      ? std::clamp(sys_uref_[(size_t)ia] + du[(size_t)ia], 0.0f, 100.0f) : u_admit_now;
+  if (sys_control_lines_) {
+    zoh_[pid_pos_pwm_index_] = (uint16_t)std::lround(u_vent  * 40.95f);
+    zoh_[pid_neg_pwm_index_] = (uint16_t)std::lround(u_admit * 40.95f);
+  }
+
+  // 라인 밸브 내부 상태를 실제 인가 명령으로 전진 (채널은 finish 가 한다)
+  {
+    const float dt = (float)period_ms_ / 1000.0f;
+    auto adv = [&](int idx, float u, float pin, float pout) {
+      auto& vs = sys_state_.v[(size_t)idx];
+      const float z = mppi::step_bw(sys_params_.line, vs, u);
+      mppi::valve_dyn(sys_params_.line, vs,
+                      mppi::q_static(sys_params_.line, u, pin, pout, z), dt);
+    };
+    adv(sys_state_.iv_vent(),  u_vent,  (float)P_line_pos_kPa, (float)P_atm_kPa);
+    adv(sys_state_.iv_admit(), u_admit, (float)P_atm_kPa,      (float)P_line_neg_kPa);
+  }
+
+  // ── ⑥ 진단 — 예측 레일압 vs 측정 레일압 ───────────────────────────────────
+  // 이것이 VirtualPowerpack 과 모델이 어긋났는지 보는 **연속 교차검증**이다.
+  // 두 파일의 식이 갈리면 이 잔차가 커진다.
+  // **직전 틱의 1스텝 예측**을 이번 측정과 비교한다. 40 ms 앞 예측을 현재 측정과
+  // 비교하면 당연히 크게 벌어진다 (그 실수로 22.8 kPa 로 보였다).
+  if (sys_pred1_valid_) {
+    sys_pred_err_pos_ += std::abs(sys_pred1_pos_ - P_line_pos_kPa);
+    sys_pred_err_neg_ += std::abs(sys_pred1_neg_ - P_line_neg_kPa);
+    ++sys_pred_n_;
+  }
+  sys_pred1_pos_ = (double)sys_mppi_->pred1_rail_pos();
+  sys_pred1_neg_ = (double)sys_mppi_->pred1_rail_neg();
+  sys_pred1_valid_ = sys_mppi_->pred1_valid();
+  if (++sys_stat_tick_ >= 5000) {
+    sys_stat_tick_ = 0;
+    const auto st = sys_mppi_->take_stats();
+    if (st.calls) {
+      const double active = std::max<double>(1.0, (double)(st.calls - st.flat));
+      RCLCPP_INFO(get_logger(),
+        "중앙집중 MPPI: %.0f us 평균 / %.0f us 최대 (틱 %d ms), 유효샘플 %.1f/%d, "
+        "Jmin %.4f, 초과 %.4f, 첫스텝 포화 %.1f%%, 평평 %.1f%% | "
+        "레일 예측오차 양 %.2f / 음 %.2f kPa",
+        st.sum_us / (double)st.calls, (double)st.max_us, period_ms_,
+        st.sum_eff / (double)st.calls, sys_mppi_->params().K, st.sum_cost / (double)st.calls,
+        st.sum_spread / (double)st.calls,
+        100.0 * (double)st.sat_first / (double)(st.calls * mppi::sys_nu(n)),
+        100.0 * (double)st.flat / (double)st.calls,
+        sys_pred_err_pos_ / std::max(1, sys_pred_n_),
+        sys_pred_err_neg_ / std::max(1, sys_pred_n_));
+    }
+    sys_pred_err_pos_ = sys_pred_err_neg_ = 0.0; sys_pred_n_ = 0;
+  }
+}
+
 void Controller::on_timer() {
-  auto now = std::chrono::steady_clock::now();
-  elapsed_time_sec_ = std::chrono::duration<double>(now - start_time_).count();
+  // 경과 시간을 **틱 카운트**에서 만든다. 벽시계로 만들면 5초 안에 제어 틱이 몇 번
+  // 들어가는지가 실행마다 달라져, 아래 두 게이트(밸브 잠금 해제 / 적분 리셋 해제)가
+  // 서로 다른 시점에 풀린다 — 같은 빌드 반복 실행에서 정상상태 밸브 개방률이
+  // 0/32/100% 로 흩어진 원인 중 하나다 (README 0절).
+  // 틱 기준이면 같은 입력에 항상 같은 궤적이 나오고, 오프라인 하네스로 옮길 때도
+  // 시간 주입점이 여기 한 곳으로 끝난다.
+  elapsed_time_sec_ = (double)tick_ * (double)std::max(1, period_ms_) / 1000.0;
+  wall_elapsed_sec_ = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - start_time_).count();
 
   std::array<uint16_t, NUM_CAN_BOARDS> snap_sensors;
   {
@@ -1590,12 +1953,14 @@ void Controller::on_timer() {
     int gid = bid - channel_board_offset_;
     if (!is_line_board && (gid < 0 || gid >= num_total_channels_ || active_channels_.count(gid) == 0)) {
       filt_out_[idx] = sensor_.kpa_atm();
+      raw_out_[idx]  = sensor_.kpa_atm();
       continue;
     }
     double raw_kpa = sensor_.kpa(bid, snap_sensors[idx]);
     if (!filter_initialized_) filt_state_[idx] = raw_kpa;
     filt_state_[idx] = sensor_filter_alpha_ * raw_kpa + (1.0 - sensor_filter_alpha_) * filt_state_[idx];
     filt_out_[idx]   = filt_state_[idx];
+    raw_out_[idx]    = raw_kpa;              // 예측기 초기 상태 비교용 (지연 없음, 잡음 있음)
   }
   filter_initialized_ = true;
 
@@ -1684,6 +2049,21 @@ void Controller::on_timer() {
     pub_active_vols_->publish(msg);
   }
 
+  // ── 중앙집중 MPPI 경로 ───────────────────────────────────────────────────
+  // 12채널을 각자 풀지 않고 라인 밸브 2개까지 포함해 **한 번에** 푼다.
+  // 여기서 return 하지 않고 아래 공통 후처리(macro 스위치·과압 보호·PWM 발행)로 간다.
+  if (sys_mppi_) {
+    run_system_mppi(P_atm_kPa, P_line_pos_kPa, P_line_neg_kPa,
+                    P_line_macro_kPa, P_line_macro_neg_kPa);
+  } else {
+
+  // 레일 변화율을 **한 번** 계산해 12채널이 공유한다 (명목 기반이라 무작위성이 없다).
+  if (rail_rate_enable_ && !sys_params_.ch.empty())
+    estimate_rail_rates(P_line_pos_kPa, P_line_neg_kPa, P_atm_kPa,
+                        rail_rate_pos_, rail_rate_neg_);
+  else
+    rail_rate_pos_ = rail_rate_neg_ = 0.0f;
+
   const int phase = static_cast<int>(tick_ % MPC_PHASES);
   std::vector<std::function<void()>> tasks;
   
@@ -1701,6 +2081,7 @@ void Controller::on_timer() {
 
       m->current_P_atm_       = static_cast<float>(P_atm_kPa);
       m->current_P_now_       = static_cast<float>(P_state_kPa);
+      m->current_P_now_raw_   = static_cast<float>(raw_out_[brd_idx]);
       m->current_P_micro_     = static_cast<float>(pos_side ? P_line_pos_kPa : P_line_neg_kPa);
       m->current_P_macro_     = static_cast<float>(P_line_macro_kPa);
       m->current_P_macro_neg_ = static_cast<float>(P_line_macro_neg_kPa);
@@ -1718,6 +2099,7 @@ void Controller::on_timer() {
         log_file_ << tick_ << "," << ref_kpa << "," << P_state_kPa << "\n";
       }
 
+      m->set_rail_rate(pos_side ? rail_rate_pos_ : rail_rate_neg_);
       std::array<uint16_t, MPC_OUT_DIM> u3{};
       m->solve(static_cast<float>(period_ms_), u3, static_cast<float>(elapsed_time_sec_));
 
@@ -1729,7 +2111,8 @@ void Controller::on_timer() {
   }
 
   pool_->run_batch_and_wait(tasks);
-  
+  }   // ← 채널별 경로 끝 (중앙집중 경로는 위에서 이미 zoh_ 를 채웠다)
+
   if (macro_switch_pwm_index_ >= 0 && macro_switch_pwm_index_ < PWM_TOTAL) {
     bool any_neg_macro_active = false;
     for (int gid = num_positive_channels_; gid < num_total_channels_; ++gid) {
@@ -1744,10 +2127,21 @@ void Controller::on_timer() {
 
   const double dt = std::max(1e-6, (double)period_ms_ / 1000.0);
 
+  // 중앙집중 MPPI 는 라인 밸브 2개를 **직접** 지령한다 (라인 PID 를 흡수).
+  // 그 경로에서 PID 를 함께 돌리면 같은 PWM 인덱스에 두 주인이 생긴다.
+  //
+  // 흡수가 원리적으로 옳은 이유: 양압 PID 의 액추에이터는 **대기 방출 밸브뿐**이라
+  // 레일압을 올릴 수단이 없고 정상상태에 이미 포화(u=100)해 있다. 채널들이 레일을
+  // 끌어내릴 때 남은 권한이 0 이다. 반면 MPPI 는 "지금 채널들이 얼마를 빼갈 것인가"를
+  // 지평 안에서 알고 있으므로 미리 덜 버리거나 채널 개도를 조절할 수 있다.
+  // 중앙집중이라도 라인 밸브를 MPPI 가 소유하지 않으면 LinePID 는 그대로 돌아야 한다
+  // (레일은 예측만 하고 제어는 맡긴다 — 계측상 MPPI 가 라인을 잡으면 불안정했다).
+  const bool line_pid_active = (sys_mppi_ == nullptr) || !sys_control_lines_;
+
   // -------------------------------------------------------------
   // [양압 라인 PID] (Positive Line)
   // -------------------------------------------------------------
-  {
+  if (line_pid_active) {
     const double err = pid_pos_.ref - P_line_pos_kPa;
     
     pid_pos_state_.integ += err * dt;
@@ -1781,7 +2175,7 @@ void Controller::on_timer() {
   // -------------------------------------------------------------
   // [음압 라인 PID] (Negative Line)
   // -------------------------------------------------------------
-  {
+  if (line_pid_active) {
     const double err = P_line_neg_kPa - pid_neg_.ref; 
     
     pid_neg_state_.integ += err * dt;
@@ -1810,6 +2204,15 @@ void Controller::on_timer() {
   }
 
   inner_loop_1khz(static_cast<float>(period_ms_));
+
+  if (tick_ > 0 && (tick_ % 5000) == 0) {
+    const double ratio = wall_elapsed_sec_ / std::max(1e-9, elapsed_time_sec_);
+    if (ratio < 0.97 || ratio > 1.03)
+      RCLCPP_WARN(get_logger(),
+        "틱 간격이 가정과 다르다: 가정 %.1f ms, 실측 평균 %.2f ms (비 %.3f). "
+        "컨트롤러는 dt 를 항상 period_ms 로 쓰므로 이 괴리는 모델 오차다.",
+        (double)period_ms_, (double)period_ms_ * ratio, ratio);
+  }
 
   if (sys_valve_operate_ && elapsed_time_sec_ >= 5.0) {
     for (int i = 0; i < PWM_TOTAL; ++i)
