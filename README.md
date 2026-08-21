@@ -11,6 +11,9 @@ ROS 2 (foxy) 패키지. 6개 공압 액추에이터의 위치를 제어하며, �
 
 ---
 
+> **실기에서 피팅을 진행할 때는 [`RUNBOOK.md`](RUNBOOK.md) 를 볼 것.** 이 문서는 배경·이론·경과이고,
+> 런북은 순서와 손이 할 일만 담은 절차서다.
+
 ## 0. 현재 상태 (한눈에)
 
 브랜치 `feat/optimized-pressure-ref`. **피팅 도구는 다 만들었고 합성 자기검증까지 통과했지만,
@@ -804,6 +807,7 @@ a8748b9  펌프 파라미터 피팅 파이프라인 + 생성기 펌프 설정 �
 ## 9. 파일 안내
 
 ```
+RUNBOOK.md                           실기 피팅 절차서 (순서·손이 할 일·코드 안내)
 압력레퍼런스_해설.pdf / .tex          설계 근거·물리 배경 해설서
 pressure_reference_optimizer.m       압력 레퍼런스 최적화기 (PressureRefGen 의 원본)
 current_hysteresis_fitting_*.m       13-parameter 밸브 피팅 레퍼런스
