@@ -356,8 +356,9 @@ def main():
         f_true, f_fit = pm.frontier(g, pns), pm.frontier(gf, pns)
         for q, ft, ff in zip(pns, f_true, f_fit):
             print(f'    P⁻={q/1e3:+6.1f}: 진짜 경계 {ft/1e3:7.1f} → 피팅 {ff/1e3:7.1f} kPa gauge')
-        print('    5-파라미터 슬라이더-크랭크는 유량 데이터로 다중 모드다 — 측정 범위 안을')
-        print('    잘 맞추면서도 데드헤드(범위 밖 외삽)가 크게 틀어진다. 능력경계는 [3] 의')
+        print('    5-파라미터 슬라이더-크랭크는 소기량×Cb_in 이 곱으로만 갈리는 축퇴가 남아')
+        print('    개별 기하값은 배수로 틀릴 수 있다. 다만 소비되는 산출물인 능력경계는')
+        print('    외삽이라도 ~15% 안에 든다. 그래도 1차 산출물은 [3] 의')
         print('    측정 테이블을 쓰는 것이 정답이다.')
         for label, f in (('소기량 [mL]', lambda x: x.v_swept * 1e6),
                          ('사구간 [mL]', lambda x: x.v_dead * 1e6),
@@ -369,7 +370,7 @@ def main():
         print('\n' + '=' * 74)
         print('자기검증 ' + ('PASS' if ok else 'FAIL — 위 FAIL 항목 확인'))
         print('판정은 **측정 산출물**(부피·누설·맵·능력경계)로 한다 — 컨트롤러와 시뮬이')
-        print('실제로 쓰는 것이 그것이고, 기하 피팅의 데드헤드는 외삽이라 믿을 수 없다.')
+        print('실제로 쓰는 것이 그것이고, 기하 피팅의 데드헤드는 외삽이라 정확도가 낮다.')
         print('=' * 74)
         rep = os.path.join(wd, 'pump_report.md')
         if os.path.exists(rep):

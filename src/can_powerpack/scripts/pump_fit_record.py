@@ -67,6 +67,9 @@ from valve_fit_record import (PCT_TO_PWM, PWM_BOARDS, PWM_LEN, PWM_PER_BOARD,  #
 IDX_RELIEF = (BOARD_LINE_POS - 1) * PWM_PER_BOARD + 0   # board1 v1 = 0 : 양압 → 대기
 IDX_ADMIT = (BOARD_LINE_NEG - 1) * PWM_PER_BOARD + 0    # board2 v1 = 3 : 대기 → 음압
 READ_BOARDS = (BOARD_LINE_POS, BOARD_LINE_NEG, BOARD_MACRO, BOARD_MACRO_NEG)
+# 0점 검증 대상 — 레일뿐이다. board 3(탱크 레귤레이터)·board 4(외부 진공)는
+# 구조상 대기압이 될 수 없어서 검증에 넣으면 실기에서 항상 중단된다.
+ZERO_CHECK_BOARDS = (BOARD_LINE_POS, BOARD_LINE_NEG)
 
 CSV_HEADER = [
     't', 'phase', 'sub', 'point', 'pump_on', 'u_relief', 'u_admit',
@@ -187,7 +190,12 @@ class RailRecorder(Node):
     # ── 유틸 ──────────────────────────────────────────────────────────────
     def zero_offsets(self, seconds=0.5, tol_kpa=8.0):
         """대기 개방 상태에서 offset 재취득 + 검증.
-        압력이 남은 채 보정하면 그 값이 오프셋으로 흡수돼 트립 기준까지 틀어진다."""
+
+        압력이 남은 채 보정하면 그 값이 오프셋으로 흡수돼 트립 기준까지 틀어진다.
+        단 **검증은 레일(board 1·2)만** 한다 — board 3(탱크 레귤레이터 출력)과
+        board 4(외부 인가 진공)는 구조상 대기압이 될 수 없으므로 검증에 넣으면
+        실기에서 항상 중단된다. offset 자체는 네 보드 모두 갱신한다.
+        """
         acc = {b: [] for b in READ_BOARDS}
         t_end = time.time() + seconds
         while time.time() < t_end:
@@ -201,13 +209,13 @@ class RailRecorder(Node):
             yaml_off, gain = self.calib.get(b, (mv, 0.0))
             drift = abs(mv - yaml_off) * abs(gain)
             new[b] = (mv, drift)
-            if drift > tol_kpa:
+            if b in ZERO_CHECK_BOARDS and drift > tol_kpa:
                 bad.append(f'board {b}: {drift:.1f} kPa 상당 (mV {mv:.0f} vs yaml {yaml_off:.0f})')
         if bad:
             raise SystemExit('0점 보정값이 yaml 과 너무 다르다 — 레일에 압력이 남아 있다.\n  '
                              + '\n  '.join(bad)
-                             + '\n양 밸브를 열어 대기압으로 되돌린 뒤 다시 시작할 것 '
-                               '(--no-zero 로 yaml 값 사용 가능).')
+                             + '\n**펌프를 끄고** 양 밸브를 열어 대기압으로 되돌린 뒤 다시 '
+                               '시작할 것 (--no-zero 로 yaml 값 사용 가능).')
         for b, (mv, _) in new.items():
             self._offset[b] = mv
         return {b: f'{mv:.0f}mV(Δ{d:.1f}kPa)' for b, (mv, d) in new.items()}
@@ -391,17 +399,31 @@ def phase_frontier(node, args):
         print(f'    [{k+1}/{len(targets)}] P⁻ 목표 {tgt - node.atm:+.1f} kPa gauge '
               f'→ board1 v1 폐쇄, P⁺ 램프...')
         why, u_end = ramp_with_pneg_hold(node, args, tgt, args.frontier_timeout)
+        # 상한에 닿아 멈춘 경우에는 **즉시 제동**해야 한다. 릴리프가 닫힌 채로 스톨 확인
+        # 유지를 하면 그 시간만큼 P⁺ 가 더 오른다 — 리허설 계측: 1 s 유지에 30 kPa 더 올라
+        # 상한 501 을 넘어 트립(541)이 걸렸다. 진짜 스톨(dP/dt≈0)일 때만 길게 유지한다.
         node.tag.update(sub='stall')
-        time.sleep(args.stall_hold)     # 스톨 확인용 유지
+        time.sleep(args.stall_hold if why == 'settled' else args.limit_hold)
         pp2, pn2 = node.p_pos(), node.p_neg()
-        print(f'       u_admit 종료값 {u_end:.1f}%')
+        # **배기 구간을 'stall' 로 태깅하면 안 된다.** 솔버는 sub='stall' 행의 중앙값을
+        # 경계점으로 쓰는데, 릴리프를 연 뒤 reopen_s 동안 압력이 무너지므로 짧은
+        # limit_hold 와 합쳐지면 중앙값이 경계가 아닌 배기 중간값이 된다
+        # (리허설: 503 kPa gauge 경계가 276~299 로 읽혀 상한 도달 판정까지 놓쳤다).
+        node.tag.update(sub='vent')
         node.open_both()
         time.sleep(args.reopen_s)
-
         kind = '하한 경계(상한 도달)' if why == 'limit' else \
                ('스톨' if why == 'settled' else f'미완({why})')
+        print(f'       u_admit 종료값 {u_end:.1f}%')
         print(f'       P⁺={pp2:6.1f} ({pp2 - node.atm:+6.1f} gauge)  '
               f'P⁻={pn2:6.1f} kPa  → {kind}')
+        # 순 초과 ≈ (폴링 주기 + 밸브 개방 시간) × 램프율 이라 램프율에 비례한다.
+        # 레일 부피가 작으면 램프율이 커져 트립 여유를 잠식하므로 미리 경고한다.
+        excess = pp2 - args.ppos_ceiling
+        if excess > 0.5 * args.trip_margin:
+            print(f'       !! 상한 초과 {excess:.1f} kPa — 트립 여유 {args.trip_margin:.0f} 의 '
+                  f'절반을 넘었다. --stop-lead 를 {args.stop_lead * 2:.2f} 로 올리거나 '
+                  f'--trip-margin 을 키울 것.')
     node.tag.update(phase='frontier', sub='-', point=-1)
     return not node.tripped
 
@@ -439,7 +461,11 @@ def main():
     ap.add_argument('--reopen-s', type=float, default=0.4)
     ap.add_argument('--settle-eps', type=float, default=1.5, help='정착 판정 |dP/dt| [kPa/s]')
     ap.add_argument('--stall-eps', type=float, default=0.4, help='스톨 판정 |dP/dt| [kPa/s]')
-    ap.add_argument('--stall-hold', type=float, default=1.0)
+    ap.add_argument('--stall-hold', type=float, default=1.0,
+                    help='진짜 스톨(dP/dt≈0) 확인 유지 [s]. 압력이 안 오르므로 길어도 안전.')
+    ap.add_argument('--limit-hold', type=float, default=0.15,
+                    help='상한 도달 시 유지 [s]. 릴리프가 닫힌 채라 짧아야 한다 — '
+                         '솔버가 읽을 최소 표본(200 Hz 에서 30행)만.')
 
     ap.add_argument('--ppos-ceiling', type=float, default=500.0,
                     help='양압 레일 스윕 상한 [kPa **gauge**]')
@@ -452,6 +478,8 @@ def main():
 
     ap.add_argument('--no-zero', action='store_true')
     ap.add_argument('--zero-tol-kpa', type=float, default=8.0)
+    ap.add_argument('--vent-seconds', type=float, default=6.0,
+                    help='0점 보정 전 대기압 복귀 시간 [s]')
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--publish-in-dry-run', action='store_true')
     args = ap.parse_args()
@@ -523,11 +551,23 @@ def main():
         if args.no_zero:
             print('0점 보정 생략 — yaml offset 사용')
         else:
-            print('대기압 복귀 중 (양 밸브 전개)...')
-            node.open_both()
-            time.sleep(4.0)
-            print('0점 보정...')
-            print(f'  {node.zero_offsets(tol_kpa=args.zero_tol_kpa)}')
+            # 펌프가 돌면 레일이 대기압에 도달하지 못한다 (펌프가 계속 당긴다).
+            # 리허설 계측: 펌프 ON 상태에서 board 2 가 17.3 kPa 벗어났다.
+            print('\n0점 보정은 **펌프를 끈 상태**에서 해야 한다 '
+                  '(펌프가 돌면 레일이 대기압에 못 간다).')
+            ans = prompt('  펌프를 끄고 Enter (s=0점 보정 건너뛰기, q=종료): ', 'ysq')
+            if ans == 'q':
+                raise KeyboardInterrupt
+            if ans == 's':
+                print('  0점 보정 건너뜀 — yaml offset 사용')
+            else:
+                node.tag.update(pump_on=0)
+                print('  대기압 복귀 중 (양 밸브 전개)...')
+                node.open_both()
+                time.sleep(args.vent_seconds)
+                print('  0점 보정 (레일 board 1·2 만 검증)...')
+                print(f'    {node.zero_offsets(tol_kpa=args.zero_tol_kpa)}')
+                node.tag.update(pump_on=1)
 
         ok = {'leak': phase_leak, 'map': phase_map,
               'frontier': phase_frontier}[args.phase](node, args)

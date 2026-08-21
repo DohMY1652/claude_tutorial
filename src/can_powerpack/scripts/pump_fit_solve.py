@@ -83,12 +83,33 @@ def solve_volumes(runs, args):
             continue
         t = col(rows, 't')
         t = t - t[0]
+        span = t[-1] - t[0]
         for rail, key in (('pos', 'P_pos'), ('neg', 'P_neg')):
-            fit = pm.exp_decay_fit(t, col(rows, key), p_inf_guess=run['atm'])
-            if fit and math.isfinite(fit['tau']):
-                taus[(rail, run['extra_rail'])] = fit
-                print(f'    {rail} 레일 (ΔV→{run["extra_rail"]}): τ={fit["tau"]:.2f} s  '
-                      f'R²={fit["r2"]:.4f}  n={fit["n"]}')
+            p = col(rows, key)
+            fit = pm.exp_decay_fit(t, p, p_inf_guess=run['atm'])
+            tag = f'{rail} 레일 (ΔV→{run["extra_rail"]})'
+            if not (fit and math.isfinite(fit['tau'])):
+                print(f'    {tag}: 감쇠 피팅 실패 — 기각')
+                continue
+            # 이 τ 가 부피의 절대 스케일을 정하므로 품질 게이트가 필수다. 리허설에서
+            # R²=-805(상수보다 나쁜 피팅)인 τ=3.6e16 s 가 그냥 통과했다 — 뒤쪽 τ 비
+            # 검사에 우연히 걸렸을 뿐이고, R²~0.3 짜리는 조용히 통과해 전부를 오염시킨다.
+            drop = abs(p[0] - p[-1])
+            why = None
+            if drop < args.decay_min_kpa:
+                why = (f'기록 구간 압력 변화 {drop:.2f} < {args.decay_min_kpa:.1f} kPa '
+                       f'— 감쇠가 없다 (펌프가 정말 꺼졌는지 확인)')
+            elif fit['r2'] < args.decay_min_r2:
+                why = f'R²={fit["r2"]:.4f} < {args.decay_min_r2:.2f} — 1차 감쇠 모델이 안 맞는다'
+            elif not (0.02 * span < fit['tau'] < 50.0 * span):
+                why = (f'τ={fit["tau"]:.3g} s 가 기록 길이 {span:.1f} s 대비 범위 밖 '
+                       f'— 기록을 τ 의 0.1~5 배로 잡을 것')
+            if why:
+                print(f'    {tag}: 기각 — {why}')
+                continue
+            taus[(rail, run['extra_rail'])] = fit
+            print(f'    {tag}: τ={fit["tau"]:.2f} s  R²={fit["r2"]:.4f}  '
+                  f'n={fit["n"]}  ΔP={drop:.1f} kPa')
 
     vols, leaks, diag = {}, {}, {}
     for rail in ('pos', 'neg'):
@@ -356,14 +377,23 @@ def write_yaml(outdir, geom, vols, leaks, args, indir, front_pts=(), map_pts=())
                     'is_lower_bound': [c for _, _, c in fr],
                 }}}},
         '/pack2/can_bridge': {'ros__parameters': {
-            'Virtual': {
-                'pump': dict(pump),
-                'line_volume_pos_ml': float(round(vols.get('pos', 500.0), 2)),
-                'line_volume_neg_ml': float(round(vols.get('neg', 500.0), 2)),
-                'line_leak_pos_lpm_per_kpa': float(f"{leaks.get('pos', 0.002):.6g}"),
-                'line_leak_neg_lpm_per_kpa': float(f"{leaks.get('neg', 0.002):.6g}"),
-            }}},
+            'Virtual': {'pump': dict(pump)}}},
     }
+    # 이 파일은 powerpack_config.yaml **뒤에** 병합되는 오버레이다. 측정하지 못한 값은
+    # 키를 아예 쓰지 않아야 기존 설정값이 그대로 유효하다. 예전에는 폴백 리터럴
+    # (부피 500 mL, 누설 0.002 LPM/kPa) 을 적었는데, 그러면 미측정값이 **측정값처럼**
+    # 파일에 박혀 이후에 구별이 불가능해진다.
+    virt = doc['/pack2/can_bridge']['ros__parameters']['Virtual']
+    missing = []
+    for rail in ('pos', 'neg'):
+        if rail in vols:
+            virt[f'line_volume_{rail}_ml'] = float(round(vols[rail], 2))
+        else:
+            missing.append(f'line_volume_{rail}_ml')
+        if rail in leaks and leaks[rail] == leaks[rail]:
+            virt[f'line_leak_{rail}_lpm_per_kpa'] = float(f'{leaks[rail]:.6g}')
+        else:
+            missing.append(f'line_leak_{rail}_lpm_per_kpa')
     doc['/pack2/can_bridge']['ros__parameters']['Virtual']['pump_map_measured'] = {
         'ppos_kpa_gauge': [float(round(p['ppos_g'] / 1e3, 2)) for p in map_pts],
         'pneg_kpa_gauge': [float(round(p['pneg_g'] / 1e3, 2)) for p in map_pts],
@@ -383,12 +413,16 @@ def write_yaml(outdir, geom, vols, leaks, args, indir, front_pts=(), map_pts=())
         '# ★ 신뢰도 순서 ★\n'
         '#   1) pump_frontier_measured  — 직접 측정. 컨트롤러가 쓰는 유일한 출력(cap_ppos)이다.\n'
         '#   2) pump_map_measured       — 직접 측정한 (P⁺,P⁻,ṁ) 점들. 시뮬 flow_out 용.\n'
-        '#   3) pump: {...}             — 기하 피팅 산물. **데드헤드는 측정 범위 밖 외삽이라\n'
-        '#      신뢰도가 낮다** (자기검증에서 능력경계를 재현하지 못했다). 참고용으로만 쓰고,\n'
-        '#      능력경계는 위 측정 테이블을 쓸 것.\n'
+        '#   3) pump: {...}             — 기하 피팅 산물. 소기량×Cb_in 축퇴가 남아 개별\n'
+        '#      기하값은 배수로 틀릴 수 있고, 데드헤드는 측정 범위 밖 외삽이다\n'
+        '#      (자기검증: 능력경계 ~15% 오차). 참고용으로 쓰고 능력경계는 위 측정 테이블을 쓸 것.\n'
         '# 생성기와 시뮬 **양쪽**에 같은 값을 쓴다 — 두 소비자가 다른 펌프를 가정하면\n'
         '# 생성기의 능력경계가 시뮬 하드웨어와 어긋나는데 아무 경고도 나지 않는다.\n'
-        '# ============================================================\n'
+        + ('' if not missing else
+           '#\n# ⚠ 아래 키는 **측정하지 못해 이 파일에 없다** — powerpack_config.yaml 의\n'
+           '#   기존 값이 그대로 쓰인다. Phase L 을 다시 기록해서 채울 것:\n'
+           + ''.join(f'#     {k}\n' for k in missing))
+        + '# ============================================================\n'
     )
     path = os.path.join(outdir, 'pump_params.yaml')
     with open(path, 'w') as f:
@@ -518,6 +552,11 @@ def main():
                     help='실측 크랭크 반경 [m]. 소기량과 곱으로만 나타나 따로 갈리지 않는다.')
     ap.add_argument('--rpm', type=float, default=None, help='지정 RPM. 없으면 리플 추정 → 정격')
     ap.add_argument('--n-piston', type=int, default=2)
+    ap.add_argument('--decay-min-r2', type=float, default=0.90,
+                    help='Phase L 감쇠 피팅 R² 하한. τ 가 모든 값의 절대 스케일을 '
+                         '정하므로 낮추지 말 것.')
+    ap.add_argument('--decay-min-kpa', type=float, default=3.0,
+                    help='감쇠로 인정할 최소 압력 변화 [kPa]. 센서 잡음보다 커야 한다.')
     ap.add_argument('--volume-pos-ml', type=float, default=None, help='실측 부피로 이중 부피법 대체')
     ap.add_argument('--volume-neg-ml', type=float, default=None)
     ap.add_argument('--pulse-frac', type=float, default=0.7,
@@ -582,6 +621,11 @@ def main():
     # 스톨점은 "유량이 누설과 같은 맵 점" 이다 — 압력을 비교하면 모델의 경계 판정
     # 기준(>0.02 g/s)과 실측 정의(dP/dt≈0, 즉 누설과 균형)가 어긋나 계통 오차가 난다.
     flow_pts = [(p['ppos_g'], p['pneg_g'], p['mdot'], 1.0, 0.0) for p in map_pts]
+    if 'pos' not in leaks:
+        # leaks.get('pos', 0.0) 이 조용히 0 을 넣으면 "스톨에서 유량 0" 이 되고, 유량을
+        # 전혀 안 내는 펌프가 그 항을 공짜로 만족시킨다 (리허설에서 실제로 그랬다).
+        print('  !! 양압 누설 미측정 — 스톨 목표 유량이 0 이 된다. 기하 피팅 결과를 '
+              '신뢰하지 말 것 (측정 맵·경계 테이블은 영향 없음).')
     for p in front_pts:
         tgt = float(pm.leak_kgps(p['ppos_g'] / 1e3, leaks.get('pos', 0.0)))
         flow_pts.append((p['ppos_g'], p['pneg_g'], tgt,
@@ -602,7 +646,7 @@ def main():
 
     sens = pm.sensitivity(geom, flow_pts, r_fixed=args.crank_m, rpm=rpm,
                           npis=args.n_piston, dt=args.fit_dt, nrev=args.fit_nrev,
-                          stall_points=stall_pts)
+                          stall_points=stall_pts, w_stall=args.frontier_weight)
     weak = [k for k, v in sens.items() if v < 1e-3]
     if weak:
         print(f'  식별성 낮음 (실측 권장): {weak}')

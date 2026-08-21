@@ -124,17 +124,30 @@ def fit_to_geom(x, r_fixed, rpm, npis, dt=1e-4, nrev=12):
                     dt=dt, nrev=nrev)
 
 
-def fit_bound_penalty(x, weight=1.0e6):
+def fit_project(x, weight=1.0e6):
+    """경계 **안으로 투영**하고 이동 거리를 벌점으로 낸다. (x_clipped, penalty) 반환.
+
+    투영을 쓰는 이유: 예전에는 `pen>0` 이면 데이터를 보지 않고 벌점만 돌려줬는데,
+    벌점이 `1e6·((lo−v)/span)²` 이고 `span` 이 1e-4 라 **경계를 아주 살짝 벗어나면
+    벌점이 3e-32 까지 작아진다.** 그래서 Nelder-Mead 가 "경계 밖 미세 이탈이 어떤
+    실제 피팅보다 싸다" 를 학습해 cost=3.3e-32 을 보고하면서 압축비 350·A_in 하한
+    붙은 물리적으로 불가능한 기하를 내놨다. 투영하면 항상 실현 가능한 점의 실제
+    데이터 잔차가 평가되므로 그 평평한 탈출구가 사라진다.
+    """
+    xc = np.array(x, dtype=float)
     pen = 0.0
     for i, name in enumerate(FIT_PARAM_NAMES):
         lo, hi = FIT_BOUNDS[name]
-        v = abs(x[i]) if name != 'l_over_r' else abs(x[i])
+        v = abs(xc[i])
         span = hi - lo
         if v < lo:
             pen += ((lo - v) / span) ** 2
+            v = lo
         elif v > hi:
             pen += ((v - hi) / span) ** 2
-    return weight * pen
+            v = hi
+        xc[i] = v
+    return xc, weight * pen
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -452,12 +465,12 @@ def fit(flow_points, r_fixed, rpm, npis=2, base=None, stall_points=None, w_stall
     scale_pa = float(np.mean([abs(p[1]) for p in stalls])) if stalls else 1.0
 
     def cost(z):
-        x = _from_z(z)
-        pen = fit_bound_penalty(x)
-        if pen > 0:
-            return pen
+        # 경계 밖이면 **투영해서 실제 잔차를 계산**하고 이동 거리를 더한다.
+        # 예전의 `return pen` 조기 반환은 경계 바로 밖에 cost≈0 인 탈출구를 만들었다.
+        x, pen = fit_project(_from_z(z))
         g = fit_to_geom(x, r_fixed, rpm, npis, dt=dt, nrev=nrev)
-        return _flow_cost(g, flow_points, scale) + w_stall * _stall_cost(g, stalls, scale_pa)
+        return (_flow_cost(g, flow_points, scale)
+                + w_stall * _stall_cost(g, stalls, scale_pa) + pen)
 
     if verbose:
         print(f'  1단계 전역 탐색 {n_samples} 샘플 (로그 균등, dt={dt:.0e}, nrev={nrev})...')
@@ -480,22 +493,25 @@ def fit(flow_points, r_fixed, rpm, npis=2, base=None, stall_points=None, w_stall
 
     best_z, best_e = z0, base_cost
     for i, (_, guess) in enumerate(ranked[:n_starts]):
-        z, e, nfev = vm.nelder_mead(cost, guess, max_iter=3000, max_feval=6000)
-        # 다중 시작 재시작 — 로그 공간에서도 한 번에 안 내려가는 경우가 있다
-        z, e2, _ = vm.nelder_mead(cost, z, max_iter=3000, max_feval=6000)
-        e = min(e, e2)
+        z1, e1, nfev = vm.nelder_mead(cost, guess, max_iter=3000, max_feval=6000)
+        # 다중 시작 재시작 — 로그 공간에서도 한 번에 안 내려가는 경우가 있다.
+        # 재시작이 더 나빠질 수도 있으므로 **점과 그 점의 비용을 함께** 골라야 한다.
+        # (예전엔 e=min(e,e2) 로 비용만 골라 z 는 재시작 결과를 남겨서, 보고한 비용이
+        #  반환한 파라미터의 비용이 아닌 경우가 있었다.)
+        z2, e2, _ = vm.nelder_mead(cost, z1, max_iter=3000, max_feval=6000)
+        z, e = (z2, e2) if e2 <= e1 else (z1, e1)
         if verbose:
             print(f'  2단계 정밀 탐색 {i+1}/{n_starts}: cost={e:.5g} (nfev={nfev})')
         if e < best_e:
             best_z, best_e = z, e
 
-    geom = fit_to_geom(_from_z(best_z), r_fixed, rpm, npis)   # 최종은 기본 dt/nrev
+    geom = fit_to_geom(fit_project(_from_z(best_z))[0], r_fixed, rpm, npis)
     return geom, best_e, dict(search_best=float(ranked[0][0]), base_cost=float(base_cost),
                               n_points=len(flow_points))
 
 
 def sensitivity(geom, flow_points, r_fixed, rpm, npis=2, rel=0.10, dt=4e-4, nrev=6,
-                stall_points=None):
+                stall_points=None, w_stall=3.0):
     """피팅 좌표별 ±rel 섭동 시 목적함수 상대 변화. 0 에 가까우면 데이터로 안 갈린다."""
     x = geom_to_fit(geom)
     scale = float(np.mean([abs(p[2]) for p in flow_points])) if flow_points else 1.0
@@ -505,7 +521,7 @@ def sensitivity(geom, flow_points, r_fixed, rpm, npis=2, rel=0.10, dt=4e-4, nrev
         e = _flow_cost(g, flow_points, scale)
         if stall_points:
             sp = float(np.mean([abs(q[1]) for q in stall_points]))
-            e += 3.0 * _stall_cost(g, stall_points, sp)
+            e += w_stall * _stall_cost(g, stall_points, sp)
         return e
 
     base_e = c(x)
