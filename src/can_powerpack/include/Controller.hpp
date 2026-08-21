@@ -219,6 +219,11 @@ public:
     // 지평 안 스테이지 레퍼런스의 접근 시상수 [s]. ≤0 이면 target_time_constant 를 쓴다.
     // 피드포워드보다 **빠른** 궤적을 주면 MPPI 가 그만큼 더 밀어붙인다.
     float mppi_ref_tau_s{-1.0f};
+    // 계획 지평은 제어 주기와 **독립**이다. ≤0 이면 NP / Ts 를 그대로 쓴다.
+    // 지평 길이 = mppi_np · mppi_ts_s. 밸브 τ≈25 ms 보다 충분히 길어야 밸브가
+    // 응답하는 것을 지평 안에서 볼 수 있다.
+    int   mppi_np{-1};
+    float mppi_ts_s{-1.0f};
     float mppi_noise_beta{0.70f};
     // 음수면 Q_value / R_value 를 그대로 쓴다 (기존 튜닝 의미를 잇는다).
     float mppi_w_track{-1.0f};
@@ -562,6 +567,8 @@ private:
     double mppi_explore_frac{0.30};
     double mppi_du_limit_pct{100.0};
     double mppi_ref_tau_s{-1.0};
+    int    mppi_np{-1};
+    double mppi_ts_s{-1.0};
     double mppi_noise_beta{0.70};
     double mppi_w_track{-1.0};
     double mppi_w_effort{-1.0};

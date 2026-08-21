@@ -267,8 +267,8 @@ AcadosMpc::AcadosMpc(const Config& cfg) : cfg_(cfg) {
 
     mppi::Params pr;
     pr.K        = cfg_.mppi_samples;
-    pr.NP       = cfg_.NP;
-    pr.Ts       = cfg_.Ts;
+    pr.NP       = (cfg_.mppi_np    > 0)   ? cfg_.mppi_np    : cfg_.NP;
+    pr.Ts       = (cfg_.mppi_ts_s  > 0.f) ? cfg_.mppi_ts_s  : cfg_.Ts;
     pr.substeps = cfg_.mppi_substeps;
     pr.lambda   = cfg_.mppi_lambda;
     pr.sigma_pct  = cfg_.mppi_sigma_pct;
@@ -803,8 +803,12 @@ void AcadosMpc::solve(float dt_ms,
         mppi_stat_tick_ = 0;
         const auto st = mppi_->take_stats();
         if (st.calls) {
+            // 유효샘플·이상치배율은 **활성 틱(갱신을 실제로 한 틱)** 에서만 누적된다.
+            // 전체 틱으로 나누면 평평 틱 비율만큼 축소돼 보여 진단을 오독하게 된다
+            // (평평 74% 이면 실제값의 26% 로 표시됐다).
+            const double active  = std::max<double>(1.0, (double)(st.calls - st.flat));
             const double avg_us = st.sum_us / (double)st.calls;
-            const double eff    = st.sum_eff / (double)st.calls;
+            const double eff    = st.sum_eff / active;
             const double sat    = 100.0 * (double)st.sat_first / (double)st.calls;
             // eff 가 1 에 붙으면 가중치가 한 샘플로 붕괴해 탐색이 죽은 것이고,
             // K 에 붙으면 균일 평균이라 선택이 없는 것이다. lambda 로 조정한다.
@@ -815,7 +819,7 @@ void AcadosMpc::solve(float dt_ms,
               cfg_.global_id, avg_us, (double)st.max_us, eff,
               mppi_->params().K, st.sum_cost / (double)st.calls,
               st.sum_spread / (double)st.calls,
-              st.sum_outlier / (double)st.calls, sat,
+              st.sum_outlier / active, sat,
               100.0 * (double)st.flat / (double)st.calls);
         }
     }
@@ -949,6 +953,8 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.mppi_explore_frac      = get_param_or<double>(this, "MPC_parameters.mppi_explore_frac",       0.30);
   mpc_.mppi_du_limit_pct      = get_param_or<double>(this, "MPC_parameters.mppi_du_limit_pct",     100.0);
   mpc_.mppi_ref_tau_s         = get_param_or<double>(this, "MPC_parameters.mppi_ref_tau_s",         -1.0);
+  mpc_.mppi_np                = get_param_or<int>   (this, "MPC_parameters.mppi_np",                  -1);
+  mpc_.mppi_ts_s              = get_param_or<double>(this, "MPC_parameters.mppi_ts_s",              -1.0);
   mpc_.mppi_noise_beta = get_param_or<double>(this, "MPC_parameters.mppi_noise_beta", 0.70);
   mpc_.mppi_w_track    = get_param_or<double>(this, "MPC_parameters.mppi_w_track",   -1.0);
   mpc_.mppi_w_effort   = get_param_or<double>(this, "MPC_parameters.mppi_w_effort",  -1.0);
@@ -1459,6 +1465,8 @@ void Controller::build_mpcs() {
       cfg.mppi_explore_frac      = (float)mpc_.mppi_explore_frac;
       cfg.mppi_du_limit_pct      = (float)mpc_.mppi_du_limit_pct;
       cfg.mppi_ref_tau_s         = (float)mpc_.mppi_ref_tau_s;
+      cfg.mppi_np                = mpc_.mppi_np;
+      cfg.mppi_ts_s              = (float)mpc_.mppi_ts_s;
       cfg.mppi_noise_beta      = (float)mpc_.mppi_noise_beta;
       cfg.mppi_w_track         = (float)mpc_.mppi_w_track;
       cfg.mppi_w_effort        = (float)mpc_.mppi_w_effort;
@@ -1482,10 +1490,15 @@ void Controller::build_mpcs() {
   RCLCPP_INFO(get_logger(), "Initialized %zu MPC controllers based on active_mpc_channels parameter.", mpcs_.size());
   if (mpc_.solver == "mppi") {
     RCLCPP_INFO(get_logger(),
-      "MPC 솔버 = MPPI (선형화 없음): K=%d, NP=%d, Ts=%.1f ms, 서브스텝=%d, "
+      "MPC 솔버 = MPPI (선형화 없음): K=%d, NP=%d, Ts=%.1f ms (지평 %.0f ms), 서브스텝=%d, "
       "lambda=%.3f(비용 산포 비율), sigma=%.1f%%, beta=%.2f, "
       "w=(track %.3g, effort %.3g, du %.3g), 오차 기준 %.1f kPa, 말단 ×%.1f, 테이퍼 롤아웃=%s",
-      mpc_.mppi_samples, mpc_.NP, mpc_.Ts * 1000.0, mpc_.mppi_substeps,
+      mpc_.mppi_samples,
+      (mpc_.mppi_np > 0 ? mpc_.mppi_np : mpc_.NP),
+      (mpc_.mppi_ts_s > 0.0 ? mpc_.mppi_ts_s : mpc_.Ts) * 1000.0,
+      (mpc_.mppi_np > 0 ? mpc_.mppi_np : mpc_.NP)
+        * (mpc_.mppi_ts_s > 0.0 ? mpc_.mppi_ts_s : mpc_.Ts) * 1000.0,
+      mpc_.mppi_substeps,
       mpc_.mppi_lambda, mpc_.mppi_sigma_pct, mpc_.mppi_noise_beta,
       (mpc_.mppi_w_track  >= 0.0 ? mpc_.mppi_w_track  : mpc_.Q_value),
       (mpc_.mppi_w_effort >= 0.0 ? mpc_.mppi_w_effort : mpc_.R_value),
