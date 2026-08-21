@@ -405,9 +405,10 @@ def main():
 def write_yaml(outdir, fits, volumes, orif, args):
     """머신 생성 파일 — powerpack_config.yaml 뒤에 병합해 덮어쓰는 용도.
 
-    주의: 현재 C++ ChannelConfig 는 채널당 13-parameter 세트가 **하나**뿐이고
-    micro/atm/macro 에 같은 값을 쓴다. 아래 valve 단위 트리를 실제로 로드하려면
-    로더를 chN.{micro,atm,macro}.* 로 확장해야 한다 (별도 작업).
+    C++ 로더가 `channel_config.chN.{micro,atm,macro}.*` 를 읽는다 (없으면 평면
+    `chN.*` 로 폴백). 즉 이 파일을 config/ 에 넣고 다시 빌드하면 **밸브별 값이 실제로
+    쓰인다** — 피드포워드 역모델·크래킹 임계·Bouc-Wen·MPPI 롤아웃·QP 선형화 전부.
+    기동 로그의 "밸브별 파라미터: N/M 채널" 로 로드 여부를 확인할 수 있다.
     """
     ch = defaultdict(dict)
     valve_role = {'v1': 'micro', 'v2': 'atm', 'v3': 'macro'}
@@ -448,9 +449,9 @@ def write_yaml(outdir, fits, volumes, orif, args):
         f'# n_poly={args.n_poly}  seed={args.seed}  samples={args.samples}\n'
         '#\n'
         '# powerpack_config.yaml **뒤에** 병합해 덮어쓰는 용도다.\n'
-        '# 주의: 현재 C++ ChannelConfig 는 채널당 13-parameter 세트가 하나뿐이고\n'
-        '#       micro/atm/macro 에 같은 값을 쓴다. 아래 밸브 단위 트리를 실제로\n'
-        '#       로드하려면 로더를 chN.{micro,atm,macro}.* 로 확장해야 한다.\n'
+        '# C++ 로더가 chN.{micro,atm,macro}.* 를 읽는다 (없으면 평면 chN.* 폴백).\n'
+        '# config/valve_params.yaml 로 넣고 재빌드하면 밸브별 값이 실제로 쓰인다.\n'
+        '# 기동 로그의 "밸브별 파라미터: N/M 채널" 로 확인할 것.\n'
         '# ============================================================\n'
     )
     with open(os.path.join(outdir, 'valve_params.yaml'), 'w') as f:

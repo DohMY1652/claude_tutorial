@@ -243,27 +243,10 @@ AcadosMpc::AcadosMpc(const Config& cfg) : cfg_(cfg) {
   }
 
   // ── MPPI 경로 구성 ─────────────────────────────────────────────────────
+  // 밸브별 13-parameter 는 build_mpcs 가 cfg_.pv 에 이미 채웠다 (단일 출처).
   if (cfg_.use_mppi) {
-    mppi_plant_.I_MAX       = cfg_.I_MAX;
-    mppi_plant_.A_max       = cfg_.A_max;
-    mppi_plant_.k_shape     = cfg_.k_shape;
-    mppi_plant_.C_k         = cfg_.C_k;
-    mppi_plant_.C_p         = cfg_.C_p;
-    mppi_plant_.C_z         = cfg_.C_z;
-    mppi_plant_.alpha_shape = cfg_.alpha_shape;
-    mppi_plant_.A_bw        = cfg_.A_bw;
-    mppi_plant_.beta_bw     = cfg_.beta_bw;
-    mppi_plant_.gamma_bw    = cfg_.gamma_bw;
-    mppi_plant_.wn_up       = cfg_.wn_up;
-    mppi_plant_.zeta_up     = cfg_.zeta_up;
-    mppi_plant_.wn_down     = cfg_.wn_down;
-    mppi_plant_.zeta_down   = cfg_.zeta_down;
-    mppi_plant_.is_positive     = cfg_.is_positive;
-    mppi_plant_.ejector_p_limit = cfg_.ejector_p_limit;
-    mppi_plant_.leakage_u       = cfg_.is_positive ? cfg_.leakage_u_pos : cfg_.leakage_u_neg;
-    mppi_plant_.crack_area_frac = cfg_.valve_crack_area_frac;
-    mppi_plant_.cmd_taper_kpa   = cfg_.cmd_taper_kpa;
-    mppi_plant_.finalize();
+    mppi_pv_ = cfg_.pv;
+    for (auto& t : mppi_pv_) t.finalize();
 
     mppi::Params pr;
     pr.K        = cfg_.mppi_samples;
@@ -275,22 +258,17 @@ AcadosMpc::AcadosMpc(const Config& cfg) : cfg_(cfg) {
     pr.sigma_explore_pct = cfg_.mppi_sigma_explore_pct;
     pr.explore_frac      = cfg_.mppi_explore_frac;
     pr.noise_beta = cfg_.mppi_noise_beta;
-    // 음수면 기존 Q_value/R_value 를 잇는다. 다만 QP 는 원 단위(kPa², %²)로 썼고
-    // MPPI 는 정규화 오차²/이탈² 이므로 절대 크기의 의미는 다르다 — 비율만 잇는다.
     pr.w_track  = (cfg_.mppi_w_track  >= 0.f) ? cfg_.mppi_w_track  : cfg_.Q_value;
     pr.w_effort = (cfg_.mppi_w_effort >= 0.f) ? cfg_.mppi_w_effort : cfg_.R_value;
     pr.w_du     = cfg_.mppi_w_du;
     pr.track_scale_kpa = cfg_.mppi_track_scale_kpa;
     pr.terminal_mult   = cfg_.mppi_terminal_mult;
-    // MPPI 는 QP 의 ±30 을 쓰지 않는다. uref≈0 에서 ±30 이면 크래킹 임계(≈52%)에
-    // 도달조차 못 해 전 샘플이 같은 궤적이 되고 선택이 사라진다.
     pr.du_min = -cfg_.mppi_du_limit_pct;
     pr.du_max = +cfg_.mppi_du_limit_pct;
     pr.taper_in_rollout = cfg_.mppi_taper_in_rollout;
 
-    // 시드는 채널마다 다르되 **고정**이다. 하네스가 이미 비결정론적이므로
-    // (README 0절) 솔버까지 매 실행 달라지면 원인 분리가 불가능해진다.
-    mppi_ = std::make_unique<mppi::Solver>(mppi_plant_, pr, (uint32_t)(0x9E37u + cfg_.global_id));
+    // 시드는 채널마다 다르되 **고정**이다 (하네스가 이미 비결정론적이므로).
+    mppi_ = std::make_unique<mppi::Solver>(mppi_pv_, pr, (uint32_t)(0x9E37u + cfg_.global_id));
   }
 }
 
@@ -309,47 +287,26 @@ void AcadosMpc::update_linearization(float /*x_ref*/,
   const double Rgas      = 287.0;
   const double TempK     = 293.15;
   const double Volume    = std::max(1e-12, (double)cfg_.volume_m3);
-  const double I_MAX_d   = (double)cfg_.I_MAX;
-  const double A_max_d   = (double)cfg_.A_max;
-  const double k_shape_d = (double)cfg_.k_shape;
-  const double C_k_d     = (double)cfg_.C_k;
-  const double C_p_d     = (double)cfg_.C_p;
-  const double C_z_d     = (double)cfg_.C_z;
-  const double alpha_d   = (double)cfg_.alpha_shape;
 
-  // Compressible flow Phi helper (kappa=1.4)
-  auto get_phi_local = [](double Pin, double Pout) -> double {
-    if (Pin < 1e-9 || Pout >= Pin) return 0.0;
-    constexpr double kappa = 1.4;
-    const double Pr  = std::clamp(Pout / Pin, 0.0, 1.0);
-    const double Pcr = std::pow(2.0 / (kappa + 1.0), kappa / (kappa - 1.0));
-    if (Pr <= Pcr)
-      return std::sqrt(kappa * std::pow(2.0/(kappa+1.0), (kappa+1.0)/(kappa-1.0)));
-    return std::sqrt(2.0*kappa/(kappa-1.0)) * std::sqrt(std::max(0.0,
-      std::pow(Pr, 2.0/kappa) - std::pow(Pr, (kappa+1.0)/kappa)));
-  };
 
-  // Static flow Q_static [LPM] for the 13-var model (dynamics frozen at current z)
-  auto Q_static_fn = [&](double u_pct, double Pin, double Pout, double z_val) -> double {
-    u_pct = std::clamp(u_pct, 0.0, 100.0);
-    const double I         = u_pct / 100.0 * I_MAX_d;
-    const double Force_net = std::clamp(I + C_z_d*z_val + C_p_d*Pin - C_k_d, -500.0, 500.0);
-    const double sigma     = 1.0 / (1.0 + std::exp(-k_shape_d * Force_net));
-    const double Area_eff  = A_max_d * std::pow(sigma, alpha_d);
-    return Area_eff * Pin * get_phi_local(Pin, Pout);
+  // 정적 유량 [LPM] — **밸브별 파라미터**를 쓴다 (mppi 커널 재사용).
+  // 예전에는 채널 공용 값을 써서 피팅한 atm/macro 값이 선형화에 반영되지 않았다.
+  auto Q_static_fn = [&](int j, double u_pct, double Pin, double Pout, double z_val) -> double {
+    return (double)mppi::q_static(cfg_.pv[(size_t)j], (float)std::clamp(u_pct, 0.0, 100.0),
+                                  (float)Pin, (float)Pout, (float)z_val);
   };
 
   // Numerical Jacobian of Q_static → [dQ/du_pct, dQ/dPin, dQ/dPout] * scale
   // Matches the original calc_rounds return convention: [round_input, round_pin, round_pout]
-  auto calc_rounds = [&](double input, double Pin, double Pout, double z_val)
+  auto calc_rounds = [&](int j, double input, double Pin, double Pout, double z_val)
   {
     input = std::clamp(input, 0.0, 100.0);
-    const double Q0 = Q_static_fn(input, Pin, Pout, z_val);
+    const double Q0 = Q_static_fn(j, input, Pin, Pout, z_val);
 
     constexpr double du = 0.5, dP = 0.5;
-    const double dQ_du   = (Q_static_fn(std::min(input+du, 100.0), Pin,    Pout,    z_val) - Q0) / du;
-    const double dQ_dPin = (Q_static_fn(input, Pin + dP, Pout,    z_val) - Q0) / dP;
-    const double dQ_dPout= (Q_static_fn(input, Pin,    Pout + dP, z_val) - Q0) / dP;
+    const double dQ_du   = (Q_static_fn(j, std::min(input+du, 100.0), Pin,    Pout,    z_val) - Q0) / du;
+    const double dQ_dPin = (Q_static_fn(j, input, Pin + dP, Pout,    z_val) - Q0) / dP;
+    const double dQ_dPout= (Q_static_fn(j, input, Pin,    Pout + dP, z_val) - Q0) / dP;
 
     const double scale = (Rgas * TempK / Volume) * lpm2kgps;
     return std::array<double,3>{dQ_du*scale, dQ_dPin*scale, dQ_dPout*scale};
@@ -362,7 +319,7 @@ void AcadosMpc::update_linearization(float /*x_ref*/,
     const double P_limit = (double)cfg_.ejector_p_limit;
     if (P_chamber <= P_limit) return std::array<double,3>{0.0, 0.0, 0.0};
     // Treat ejector suction as flow from P_chamber to P_limit
-    return calc_rounds(input, P_chamber, P_limit, z_macro_);
+    return calc_rounds(mppi::V_MACRO, input, P_chamber, P_limit, z_macro_);
   };
 
   const double u_mi = std::clamp((double)u_ref(0), 0.0, 100.0);
@@ -375,10 +332,10 @@ void AcadosMpc::update_linearization(float /*x_ref*/,
   Eigen::RowVector3f B_row; B_row.setZero();
 
   if (cfg_.is_positive) {
-    auto mi = calc_rounds(u_mi, P_micro, P_now,  z_micro_);
-    auto ma = calc_rounds(u_ma, P_macro, P_now,  z_macro_);
-    auto at = calc_rounds(u_at, P_now,   P_atm,  z_atm_);
-    auto lk = calc_rounds(leak_u_pos, P_now, P_atm, z_atm_);
+    auto mi = calc_rounds(mppi::V_MICRO, u_mi, P_micro, P_now,  z_micro_);
+    auto ma = calc_rounds(mppi::V_MACRO, u_ma, P_macro, P_now,  z_macro_);
+    auto at = calc_rounds(mppi::V_ATM,   u_at, P_now,   P_atm,  z_atm_);
+    auto lk = calc_rounds(mppi::V_ATM,   leak_u_pos, P_now, P_atm, z_atm_);
 
     const double tmp_A = mi[2] + ma[2] - at[1] - lk[1];
     const double b0 =  mi[0];
@@ -389,10 +346,10 @@ void AcadosMpc::update_linearization(float /*x_ref*/,
     B_row << (float)b0, (float)b1, (float)b2;
 
   } else {
-    auto at = calc_rounds(u_at, P_atm,  P_now,  z_atm_);
-    auto mi = calc_rounds(u_mi, P_now,  P_micro, z_micro_);
+    auto at = calc_rounds(mppi::V_ATM,   u_at, P_atm,  P_now,  z_atm_);
+    auto mi = calc_rounds(mppi::V_MICRO, u_mi, P_now,  P_micro, z_micro_);
     auto ma = ejector_calc_rounds(u_ma, P_now);
-    auto lk = calc_rounds(leak_u_neg, P_atm, P_now, z_atm_);
+    auto lk = calc_rounds(mppi::V_ATM,   leak_u_neg, P_atm, P_now, z_atm_);
 
     const double tmp_A = at[2] - mi[1] - ma[1] + lk[2];
     const double b0 = -mi[0];
@@ -430,21 +387,24 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   const double prev_vol    = std::max(1e-12, (double)cfg_.prev_vol_m3);
 
   // Update Bouc-Wen hysteresis states from last commanded currents
-  auto update_bw = [&](double& z, double& prev_I, int& dir, double u_pct) {
-    const double I     = u_pct / 100.0 * (double)cfg_.I_MAX;
+  // Bouc-Wen 히스테리시스도 **밸브별 파라미터**로 갱신한다 (A_bw/beta/gamma/I_MAX 가
+  // 밸브마다 다르다). 예전에는 채널 공용 값을 써서 피팅 결과가 반영되지 않았다.
+  auto update_bw = [&](int j, double& z, double& prev_I, int& dir, double u_pct) {
+    const auto& p = cfg_.pv[(size_t)j];
+    const double I     = u_pct / 100.0 * (double)p.I_MAX;
     const double dI    = I - prev_I;
     const double abs_dI = std::abs(dI);
-    z += (double)cfg_.A_bw * dI
-       - (double)cfg_.beta_bw  * abs_dI * z
-       - (double)cfg_.gamma_bw * dI * std::abs(z);
+    z += (double)p.A_bw * dI
+       - (double)p.beta_bw  * abs_dI * z
+       - (double)p.gamma_bw * dI * std::abs(z);
     z = std::clamp(z, -1e6, 1e6);
     if      (dI >  1e-4) dir = 1;
     else if (dI < -1e-4) dir = 0;
     prev_I = I;
   };
-  update_bw(z_micro_, prev_I_micro_, dir_micro_, (double)last_u3_[0]);
-  update_bw(z_atm_,   prev_I_atm_,   dir_atm_,   (double)last_u3_[2]);
-  update_bw(z_macro_, prev_I_macro_, dir_macro_, (double)last_u3_[1]);
+  update_bw(mppi::V_MICRO, z_micro_, prev_I_micro_, dir_micro_, (double)last_u3_[0]);
+  update_bw(mppi::V_ATM,   z_atm_,   prev_I_atm_,   dir_atm_,   (double)last_u3_[2]);
+  update_bw(mppi::V_MACRO, z_macro_, prev_I_macro_, dir_macro_, (double)last_u3_[1]);
 
   // Compressible Phi helper (kappa=1.4)
   auto get_phi_ff = [](double Pin, double Pout) -> double {
@@ -458,33 +418,20 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
       std::pow(Pr, 2.0/kappa) - std::pow(Pr, (kappa+1.0)/kappa)));
   };
 
-  // 유효면적 → 필요 전류[%] 역산. 순방향 모델
-  //   F_net = I + C_z·z + C_p·Pin − C_k ,  A_eff = A_max·sigmoid(k·F_net)^alpha
-  // 을 그대로 뒤집은 것이다. C_p·Pin 항 때문에 **상류 압력이 높으면 필요 전류가 낮아진다**
-  // (압력이 스풀을 밀어 올려 자기력을 돕는다).
-  auto u_of_area = [&](double Area_req, double Pin, double z_val) -> float {
-    const double A_max_d = (double)cfg_.A_max;
-    const double alpha_d = (double)cfg_.alpha_shape;
-    if (Area_req >= A_max_d) return 100.0f;
-    const double sigma = std::pow(std::clamp(Area_req / A_max_d, 1e-9, 1.0-1e-9), 1.0/alpha_d);
-    const double F_req = std::log(sigma / (1.0 - sigma)) / (double)cfg_.k_shape;
-    const double I_req = F_req - (double)cfg_.C_z * z_val - (double)cfg_.C_p * Pin + (double)cfg_.C_k;
-    return (float)std::clamp(I_req / (double)cfg_.I_MAX * 100.0, 0.0, 100.0);
+  // 역모델은 `mppi::valve_invert` / `mppi::u_of_area` / `PlantParams::u_crack` 을 쓴다
+  // — 예전에는 여기 람다로 복제돼 있었고, 그래서 **밸브별 파라미터를 쓸 수 없었다.**
+  // 이제 밸브 인덱스(0=micro, 1=macro, 2=atm)로 각자의 13-parameter 를 적용한다.
+  // C_p·Pin 항 때문에 상류 압력이 높으면 필요 전류가 낮아진다 (압력이 스풀을 돕는다).
+  auto valve_invert = [&](int j, double Q_req, double Pin, double Pout, double z_val) -> float {
+    return mppi::valve_invert(cfg_.pv[(size_t)j], (float)Q_req, (float)Pin, (float)Pout,
+                              (float)z_val);
   };
-
-  // Inverse valve model: given required Q [LPM], P_in, P_out, z → u_pct [0,100]
-  auto valve_invert = [&](double Q_req, double Pin, double Pout, double z_val) -> float {
-    if (Q_req <= 0.0) return 0.0f;
-    const double phi = get_phi_ff(Pin, Pout);
-    if (phi < 1e-9) return 0.0f;
-    return u_of_area(Q_req / (Pin * phi), Pin, z_val);
-  };
-
   // 크래킹 임계 [%] — 이 명령 이하에서는 스풀이 들리지 않아 유량이 0 이다.
-  // 실측(50% 부근)과 일치한다: 351 kPa abs 레일에서 이 모델은 약 52% 를 준다.
-  auto u_crack = [&](double Pin, double z_val) {
-    return u_of_area((double)cfg_.valve_crack_area_frac * (double)cfg_.A_max, Pin, z_val);
+  // 실측(50% 부근)과 일치한다: 351 kPa abs 레일에서 약 52% 다.
+  auto u_crack = [&](int j, double Pin, double z_val) {
+    return cfg_.pv[(size_t)j].u_crack((float)Pin, (float)z_val);
   };
+  (void)get_phi_ff;
 
   const float Pref = cfg_.ref_value;
   float err = Pref - P_now;
@@ -556,40 +503,40 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
 
   if (cfg_.is_positive) {
     // 양압 채널: micro=레일→챔버, macro=탱크→챔버, atm=챔버→대기
-    u_crack_ = { u_crack((double)P_micro, z_micro_),
-                 u_crack((double)P_macro, z_macro_),
-                 u_crack((double)P_now,   z_atm_) };
+    u_crack_ = { u_crack(mppi::V_MICRO, (double)P_micro, z_micro_),
+                 u_crack(mppi::V_MACRO, (double)P_macro, z_macro_),
+                 u_crack(mppi::V_ATM,   (double)P_now,   z_atm_) };
     if ((m_dot_pressure + m_dot_volume) > 0.f) {
-      u_mi_req = valve_invert(Q_req, (double)P_micro, (double)P_now, z_micro_)
+      u_mi_req = valve_invert(mppi::V_MICRO, Q_req, (double)P_micro, (double)P_now, z_micro_)
                  + ki_mi * pos_error_integral_;
       u_at_req = 0.f;
       u_ma_req = macro_open(u_mi_req)
-                 ? valve_invert(Q_req, (double)P_macro, (double)P_now, z_macro_)
+                 ? valve_invert(mppi::V_MACRO, Q_req, (double)P_macro, (double)P_now, z_macro_)
                    + ki_ma * pos_error_integral_
                  : 0.f;
     } else {
       u_mi_req = 0.f;
       u_ma_req = 0.f;
-      u_at_req = valve_invert(Q_req, (double)P_now, (double)P_abs_atm, z_atm_)
+      u_at_req = valve_invert(mppi::V_ATM, Q_req, (double)P_now, (double)P_abs_atm, z_atm_)
                  + ki_at * std::abs(pos_error_integral_);
     }
   } else {
     // 음압 채널: micro=챔버→음압레일, macro=챔버→이젝터, atm=대기→챔버
-    u_crack_ = { u_crack((double)P_now,     z_micro_),
-                 u_crack((double)P_now,     z_macro_),
-                 u_crack((double)P_abs_atm, z_atm_) };
+    u_crack_ = { u_crack(mppi::V_MICRO, (double)P_now,     z_micro_),
+                 u_crack(mppi::V_MACRO, (double)P_now,     z_macro_),
+                 u_crack(mppi::V_ATM,   (double)P_abs_atm, z_atm_) };
     if ((m_dot_pressure + m_dot_volume) < 0.f) {
-      u_mi_req = valve_invert(Q_req, (double)P_now, (double)P_micro, z_micro_)
+      u_mi_req = valve_invert(mppi::V_MICRO, Q_req, (double)P_now, (double)P_micro, z_micro_)
                  + ki_mi * neg_error_integral_;
       u_at_req = 0.f;
       u_ma_req = macro_open(u_mi_req)
-                 ? valve_invert(Q_req, (double)P_now, (double)cfg_.ejector_p_limit, z_macro_)
+                 ? valve_invert(mppi::V_MACRO, Q_req, (double)P_now, (double)cfg_.ejector_p_limit, z_macro_)
                    + ki_ma * neg_error_integral_
                  : 0.f;
     } else {
       u_mi_req = 0.f;
       u_ma_req = 0.f;
-      u_at_req = valve_invert(Q_req, (double)P_abs_atm, (double)P_now, z_atm_)
+      u_at_req = valve_invert(mppi::V_ATM, Q_req, (double)P_abs_atm, (double)P_now, z_atm_)
                  + ki_at * std::abs(neg_error_integral_);
     }
   }
@@ -787,11 +734,23 @@ void AcadosMpc::finish(const std::array<float,3>& du3,
   auto taper_above_crack = [tp](float u, float u_c) {
     return (u <= u_c) ? 0.0f : u_c + (u - u_c) * tp;
   };
-  std::array<float,3> u0{
-    taper_above_crack(std::clamp(uref_[0] + du3[0], 0.0f, 100.0f), u_crack_[0]),
-    taper_above_crack(std::clamp(uref_[1] + du3[1], 0.0f, 100.0f), u_crack_[1]),
-    taper_above_crack(std::clamp(uref_[2] + du3[2], 0.0f, 100.0f), u_crack_[2]),
+  // 비유한 값 차단 — **실기 안전에 필수**. 솔버나 모델이 NaN/Inf 를 내면 uint16 변환이
+  // 정의되지 않아 임의의 PWM 이 나갈 수 있다. 그런 값은 0(밸브 닫힘)으로 떨어뜨리고
+  // 한 번만 경고한다 (500 Hz 로그 폭주 방지).
+  auto safe = [this](float u, const char* what) {
+    if (std::isfinite(u)) return u;
+    if (nonfinite_cnt_++ == 0)
+      RCLCPP_ERROR(rclcpp::get_logger("AcadosMpc"),
+        "gid=%d %s 가 비유한 값이다 — 0 으로 대체한다. 모델/솔버를 확인할 것.",
+        cfg_.global_id, what);
+    return 0.0f;
   };
+  std::array<float,3> u0{
+    taper_above_crack(std::clamp(safe(uref_[0] + du3[0], "u_micro"), 0.0f, 100.0f), u_crack_[0]),
+    taper_above_crack(std::clamp(safe(uref_[1] + du3[1], "u_macro"), 0.0f, 100.0f), u_crack_[1]),
+    taper_above_crack(std::clamp(safe(uref_[2] + du3[2], "u_atm"),   0.0f, 100.0f), u_crack_[2]),
+  };
+  for (auto& v : u0) if (!std::isfinite(v)) v = 0.0f;   // 테이퍼 이후 한 번 더
   last_u3_ = u0;
 
   // 밸브 내부 상태(q, qd) 추정을 실제 인가 명령 + 측정 압력으로 한 틱 전진시킨다.
@@ -807,7 +766,7 @@ void AcadosMpc::finish(const std::array<float,3>& du3,
   plant_est_.v[0].z = (float)z_micro_;  plant_est_.v[0].dir = dir_micro_;
   plant_est_.v[1].z = (float)z_macro_;  plant_est_.v[1].dir = dir_macro_;
   plant_est_.v[2].z = (float)z_atm_;    plant_est_.v[2].dir = dir_atm_;
-  mppi::advance_valve_estimate(mppi_plant_, plant_est_, u0, ex, dt_sec_,
+  mppi::advance_valve_estimate(mppi_pv_, plant_est_, u0, ex, dt_sec_,
                                cfg_.mppi_estimator, cfg_.volume_m3);
   if (cfg_.mppi_estimator) p_hat_ = plant_est_.P;
 
@@ -1041,20 +1000,63 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     channel_configs_[i].neg_ki_macro = get_param_or<double>(this, prefix + "neg_ki_macro", 0.0);
     channel_configs_[i].neg_ki_atm   = get_param_or<double>(this, prefix + "neg_ki_atm",   0.0);
 
-    channel_configs_[i].I_MAX       = get_param_or<double>(this, prefix + "I_MAX",       0.30);
-    channel_configs_[i].A_max       = get_param_or<double>(this, prefix + "A_max",       0.2845);
-    channel_configs_[i].k_shape     = get_param_or<double>(this, prefix + "k_shape",     33.09);
-    channel_configs_[i].C_k         = get_param_or<double>(this, prefix + "C_k",         0.0288);
-    channel_configs_[i].C_p         = get_param_or<double>(this, prefix + "C_p",         0.00012);
-    channel_configs_[i].C_z         = get_param_or<double>(this, prefix + "C_z",         0.0);
-    channel_configs_[i].A_bw        = get_param_or<double>(this, prefix + "A_bw",        260649.5);
-    channel_configs_[i].beta_bw     = get_param_or<double>(this, prefix + "beta_bw",     179.0);
-    channel_configs_[i].gamma_bw    = get_param_or<double>(this, prefix + "gamma_bw",    0.06);
-    channel_configs_[i].alpha_shape = get_param_or<double>(this, prefix + "alpha_shape", 3884.2);
-    channel_configs_[i].wn_up       = get_param_or<double>(this, prefix + "wn_up",       40.0);
-    channel_configs_[i].zeta_up     = get_param_or<double>(this, prefix + "zeta_up",     1.2);
-    channel_configs_[i].wn_down     = get_param_or<double>(this, prefix + "wn_down",     45.0);
-    channel_configs_[i].zeta_down   = get_param_or<double>(this, prefix + "zeta_down",   1.0);
+    // ── 밸브별 13-parameter ─────────────────────────────────────────────────
+    // 우선순위: chN.<role>.<param>  (valve_fit_solve.py 가 쓰는 형태)
+    //        → chN.<param>          (예전 평면 형태 = 세 밸브 공용)
+    //        → 하드코딩 기본값
+    // 이렇게 하면 피팅 파일을 병합하는 순간 밸브별 값이 실제로 쓰이고, 없으면
+    // 기존 동작과 완전히 같다.
+    {
+      auto flat = [&](const char* n, double dflt) {
+        return get_param_or<double>(this, prefix + n, dflt);
+      };
+      // 평면 값(또는 기본값)을 먼저 읽어 세 밸브의 폴백으로 쓴다.
+      Valve13 base;
+      base.I_MAX       = flat("I_MAX",       0.30);
+      base.A_max       = flat("A_max",       0.2845);
+      base.k_shape     = flat("k_shape",     33.09);
+      base.C_k         = flat("C_k",         0.0288);
+      base.C_p         = flat("C_p",         0.00012);
+      base.C_z         = flat("C_z",         0.0);
+      base.A_bw        = flat("A_bw",        260649.5);
+      base.beta_bw     = flat("beta_bw",     179.0);
+      base.gamma_bw    = flat("gamma_bw",    0.06);
+      base.alpha_shape = flat("alpha_shape", 3884.2);
+      base.wn_up       = flat("wn_up",       40.0);
+      base.zeta_up     = flat("zeta_up",     1.2);
+      base.wn_down     = flat("wn_down",     45.0);
+      base.zeta_down   = flat("zeta_down",   1.0);
+
+      // mppi::ValveIdx 와 같은 순서: 0=micro, 1=macro, 2=atm
+      static const char* kRole[3] = {"micro", "macro", "atm"};
+      bool any_per_valve = false;
+      for (int j = 0; j < 3; ++j) {
+        const std::string rp = prefix + kRole[j] + ".";
+        auto pv = [&](const char* n, double dflt) {
+          const double v = get_param_or<double>(this, rp + n, dflt);
+          if (v != dflt) any_per_valve = true;   // 피팅 파일에서 실제로 읽혔다는 신호
+          return v;
+        };
+        auto& t = channel_configs_[i].v[(size_t)j];
+        t.I_MAX       = pv("I_MAX",       base.I_MAX);
+        t.A_max       = pv("A_max",       base.A_max);
+        t.k_shape     = pv("k_shape",     base.k_shape);
+        t.C_k         = pv("C_k",         base.C_k);
+        t.C_p         = pv("C_p",         base.C_p);
+        t.C_z         = pv("C_z",         base.C_z);
+        t.A_bw        = pv("A_bw",        base.A_bw);
+        t.beta_bw     = pv("beta_bw",     base.beta_bw);
+        t.gamma_bw    = pv("gamma_bw",    base.gamma_bw);
+        t.alpha_shape = pv("alpha_shape", base.alpha_shape);
+        t.wn_up       = pv("wn_up",       base.wn_up);
+        t.zeta_up     = pv("zeta_up",     base.zeta_up);
+        t.wn_down     = pv("wn_down",     base.wn_down);
+        t.zeta_down   = pv("zeta_down",   base.zeta_down);
+      }
+      channel_configs_[i].per_valve_loaded = any_per_valve;
+      channel_configs_[i].chamber_volume_ml =
+          get_param_or<double>(this, prefix + "chamber_volume_ml", -1.0);
+    }
   }
 
   sys_valve_operate_   = get_param_or<bool>(this, "system_parameters.valve_operate",   false);
@@ -1464,20 +1466,34 @@ void Controller::build_mpcs() {
       cfg.neg_ki_macro  = (float)channel_configs_[gid].neg_ki_macro;
       cfg.neg_ki_atm    = (float)channel_configs_[gid].neg_ki_atm;
 
-      cfg.I_MAX       = (float)channel_configs_[gid].I_MAX;
-      cfg.A_max       = (float)channel_configs_[gid].A_max;
-      cfg.k_shape     = (float)channel_configs_[gid].k_shape;
-      cfg.C_k         = (float)channel_configs_[gid].C_k;
-      cfg.C_p         = (float)channel_configs_[gid].C_p;
-      cfg.C_z         = (float)channel_configs_[gid].C_z;
-      cfg.A_bw        = (float)channel_configs_[gid].A_bw;
-      cfg.beta_bw     = (float)channel_configs_[gid].beta_bw;
-      cfg.gamma_bw    = (float)channel_configs_[gid].gamma_bw;
-      cfg.alpha_shape = (float)channel_configs_[gid].alpha_shape;
-      cfg.wn_up       = (float)channel_configs_[gid].wn_up;
-      cfg.zeta_up     = (float)channel_configs_[gid].zeta_up;
-      cfg.wn_down     = (float)channel_configs_[gid].wn_down;
-      cfg.zeta_down   = (float)channel_configs_[gid].zeta_down;
+      // 밸브별 13-parameter → cfg.pv[3]. 채널 공통 필드는 세 원소에 같은 값을 넣는다.
+      for (int j = 0; j < 3; ++j) {
+        const auto& t = channel_configs_[gid].v[(size_t)j];
+        auto& d = cfg.pv[(size_t)j];
+        d.I_MAX = (float)t.I_MAX;             d.A_max = (float)t.A_max;
+        d.k_shape = (float)t.k_shape;         d.C_k = (float)t.C_k;
+        d.C_p = (float)t.C_p;                 d.C_z = (float)t.C_z;
+        d.A_bw = (float)t.A_bw;               d.beta_bw = (float)t.beta_bw;
+        d.gamma_bw = (float)t.gamma_bw;       d.alpha_shape = (float)t.alpha_shape;
+        d.wn_up = (float)t.wn_up;             d.zeta_up = (float)t.zeta_up;
+        d.wn_down = (float)t.wn_down;         d.zeta_down = (float)t.zeta_down;
+        d.is_positive     = (gid < num_positive_channels_);
+        d.ejector_p_limit = (float)mpc_.ejector_p_limit;
+        d.leakage_u       = (float)((gid < num_positive_channels_) ? mpc_.leakage_u_pos
+                                                                  : mpc_.leakage_u_neg);
+        d.crack_area_frac = (float)mpc_.valve_crack_area_frac;
+        d.cmd_taper_kpa   = (float)mpc_.cmd_taper_kpa;
+        d.finalize();
+      }
+      // 하위 호환용 평면 필드 = micro 밸브
+      const auto& m0 = channel_configs_[gid].v[0];
+      cfg.I_MAX = (float)m0.I_MAX;           cfg.A_max = (float)m0.A_max;
+      cfg.k_shape = (float)m0.k_shape;       cfg.C_k = (float)m0.C_k;
+      cfg.C_p = (float)m0.C_p;               cfg.C_z = (float)m0.C_z;
+      cfg.A_bw = (float)m0.A_bw;             cfg.beta_bw = (float)m0.beta_bw;
+      cfg.gamma_bw = (float)m0.gamma_bw;     cfg.alpha_shape = (float)m0.alpha_shape;
+      cfg.wn_up = (float)m0.wn_up;           cfg.zeta_up = (float)m0.zeta_up;
+      cfg.wn_down = (float)m0.wn_down;       cfg.zeta_down = (float)m0.zeta_down;
 
 
       cfg.ref_value = 101.325f;
@@ -1536,6 +1552,24 @@ void Controller::build_mpcs() {
   }
 
   RCLCPP_INFO(get_logger(), "Initialized %zu MPC controllers based on active_mpc_channels parameter.", mpcs_.size());
+  {
+    // 실기에서 **피팅 결과가 실제로 로드됐는지** 확인하는 유일한 수단이다.
+    // valve_params.yaml 을 config/ 에 넣고 재빌드했는데 0/N 이 나오면 병합이 안 된 것이다.
+    int n_pv = 0;
+    for (int gid : active_channels_)
+      if (gid >= 0 && gid < (int)channel_configs_.size()
+          && channel_configs_[(size_t)gid].per_valve_loaded) ++n_pv;
+    RCLCPP_INFO(get_logger(),
+      "밸브별 13-parameter: %d/%zu 채널이 chN.{micro,atm,macro}.* 를 로드했다%s",
+      n_pv, active_channels_.size(),
+      n_pv == 0 ? " — 평면 chN.* 또는 기본값 사용 (피팅 전이면 정상)" : "");
+    for (int gid : active_channels_) {
+      if (gid < 0 || gid >= (int)channel_configs_.size()) continue;
+      const double v = channel_configs_[(size_t)gid].chamber_volume_ml;
+      if (v > 0.0)
+        RCLCPP_INFO(get_logger(), "  ch%d 피팅 챔버 부피 %.2f mL", gid, v);
+    }
+  }
   if (mpc_.solver == "mppi") {
     RCLCPP_INFO(get_logger(),
       "MPC 솔버 = MPPI (선형화 없음): K=%d, NP=%d, Ts=%.1f ms (지평 %.0f ms), 서브스텝=%d, "
@@ -1606,17 +1640,18 @@ void Controller::build_system_mppi()
   sp.P_atm = (float)sensor_.kpa_atm();
 
   // 채널별 13-parameter — AcadosMpc 가 이미 만들어 둔 것을 그대로 쓴다 (단일 출처).
-  sp.ch.assign((size_t)sp.n_ch, mppi::PlantParams{});
+  sp.ch.assign((size_t)sp.n_ch, mppi::ChannelPlant{});
   for (auto& m : mpcs_) {
     const int gid = m->cfg().global_id;
     if (gid >= 0 && gid < sp.n_ch) sp.ch[(size_t)gid] = m->plant_params();
   }
-  // 비활성 채널은 밸브를 닫아 둔 것과 같으므로 기본 파라미터로 채운다 (양·음 구분만).
-  for (int g = 0; g < sp.n_ch; ++g) sp.ch[(size_t)g].is_positive = (g < sp.n_pos);
+  // 비활성 채널은 밸브를 닫아 둔 것과 같으므로 방향만 맞춰 둔다.
+  for (int g = 0; g < sp.n_ch; ++g)
+    for (auto& t : sp.ch[(size_t)g]) t.is_positive = (g < sp.n_pos);
 
-  // 라인 밸브 — 채널 0 의 13-parameter 를 공용으로 쓴다. 실기에서는 라인 밸브를
+  // 라인 밸브 — 채널 0 micro 의 13-parameter 를 공용으로 쓴다. 실기에서는 라인 밸브를
   // 따로 피팅해야 한다 (RUNBOOK.md 는 채널 36개만 다룬다).
-  sp.line = sp.ch.empty() ? mppi::PlantParams{} : sp.ch[0];
+  sp.line = sp.ch.empty() ? mppi::PlantParams{} : sp.ch[0][mppi::V_MICRO];
   sp.line.leakage_u = 0.0f;
   sp.line.is_positive = true;      // 사용처에서 상·하류를 직접 지정하므로 무의미하다
 
@@ -1650,6 +1685,9 @@ void Controller::build_system_mppi()
   mp.taper_in_rollout= mpc_.mppi_taper_in_rollout;
   mp.rail_share  = (float)get_param_or<double>(this, "MPC_parameters.sys_rail_share", 0.20);
   mp.control_lines = get_param_or<bool>(this, "MPC_parameters.sys_control_lines", false);
+  // 데드라인 [us]. 기본은 틱의 60%. 넘으면 다음 틱들을 건너뛰어 루프를 지킨다.
+  sys_deadline_us_ = get_param_or<double>(this, "MPC_parameters.sys_deadline_us",
+                                          0.6 * (double)period_ms_ * 1000.0);
   sys_control_lines_ = mp.control_lines;
 
   sys_mppi_ = std::make_unique<mppi::SystemSolver>(sp, mp, 0xC0FFEEu);
@@ -1695,7 +1733,7 @@ void Controller::estimate_rail_rates(double P_line_pos_kPa, double P_line_neg_kP
     AcadosMpc* m = mpc.get();
     const int gid = m->cfg().global_id;
     if (gid < 0 || gid >= (int)sys_params_.ch.size()) continue;
-    const auto& cp = sys_params_.ch[(size_t)gid];
+    const auto& cp = sys_params_.ch[(size_t)gid][mppi::V_MICRO];
     const float u_mi = m->uref()[0];              // 명목 micro 개도
     const float P    = m->p_used();
     const float z    = m->plant_est().v[0].z;
@@ -1732,7 +1770,6 @@ void Controller::run_system_mppi(double P_atm_kPa, double P_line_pos_kPa,
                                  double P_line_macro_neg_kPa)
 {
   const int n  = sys_params_.n_ch;
-  const int nu = mppi::sys_nu(n);
 
   // ── ① 채널별 prepare — **순차**. 채널당 수 µs 짜리 12개인데 풀 디스패치가
   //    그보다 비싸다 (틱당 풀 호출을 2회에서 1회로 줄인다).
@@ -1813,7 +1850,32 @@ void Controller::run_system_mppi(double P_atm_kPa, double P_line_pos_kPa,
     }
     pool_->run_batch_and_wait(sys_tasks_);
   };
-  const auto& du = sys_mppi_->solve(sys_state_, sys_exo_, sys_uref_, pfor);
+  // ── 실시간 데드라인 ─────────────────────────────────────────────────────
+  // 중앙집중 솔버는 평균은 예산 안이지만 산발적으로 틱 예산의 5~8배 스파이크가 난다.
+  // 제어 루프가 멈추면 실기에서 위험하므로, 최근 실행이 예산을 넘겼으면 **이번 틱은
+  // 건너뛰고 Δu=0(순수 피드포워드)** 을 쓴다. MPPI 는 워밍 스타트 기반이라 한 틱을
+  // 쉬어도 다음 틱에 이어서 개선한다.
+  static thread_local std::vector<float> zero_du;
+  bool skipped = false;
+  if (sys_over_budget_ > 0) {
+    --sys_over_budget_;
+    ++sys_skipped_;
+    skipped = true;
+  }
+  const auto t_solve0 = std::chrono::steady_clock::now();
+  const int nu_sys = mppi::sys_nu(n);
+  if (zero_du.size() != (size_t)nu_sys) zero_du.assign((size_t)nu_sys, 0.0f);
+  const auto& du = skipped ? zero_du
+                           : sys_mppi_->solve(sys_state_, sys_exo_, sys_uref_, pfor);
+  if (!skipped) {
+    const double us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - t_solve0).count();
+    // 예산 초과 시 다음 N 틱을 쉬게 해서 루프가 회복할 시간을 준다.
+    if (us > sys_deadline_us_) {
+      sys_over_budget_ = std::max(1, (int)(us / std::max(1.0, (double)period_ms_ * 1000.0)));
+      ++sys_over_cnt_;
+    }
+  }
 
   // ── ④ 채널별 finish (테이퍼·클램프·PWM·상태 추정) ─────────────────────────
   for (auto& mpc : mpcs_) {
@@ -1837,8 +1899,11 @@ void Controller::run_system_mppi(double P_atm_kPa, double P_line_pos_kPa,
   const float u_admit = sys_control_lines_
       ? std::clamp(sys_uref_[(size_t)ia] + du[(size_t)ia], 0.0f, 100.0f) : u_admit_now;
   if (sys_control_lines_) {
-    zoh_[pid_pos_pwm_index_] = (uint16_t)std::lround(u_vent  * 40.95f);
-    zoh_[pid_neg_pwm_index_] = (uint16_t)std::lround(u_admit * 40.95f);
+    // 비유한 값 차단 — 라인 밸브는 레일 전체를 좌우하므로 특히 위험하다.
+    const float uv = std::isfinite(u_vent)  ? std::clamp(u_vent,  0.0f, 100.0f) : 0.0f;
+    const float ua = std::isfinite(u_admit) ? std::clamp(u_admit, 0.0f, 100.0f) : 0.0f;
+    zoh_[pid_pos_pwm_index_] = (uint16_t)std::lround(uv * 40.95f);
+    zoh_[pid_neg_pwm_index_] = (uint16_t)std::lround(ua * 40.95f);
   }
 
   // 라인 밸브 내부 상태를 실제 인가 명령으로 전진 (채널은 finish 가 한다)
@@ -1871,8 +1936,7 @@ void Controller::run_system_mppi(double P_atm_kPa, double P_line_pos_kPa,
     sys_stat_tick_ = 0;
     const auto st = sys_mppi_->take_stats();
     if (st.calls) {
-      const double active = std::max<double>(1.0, (double)(st.calls - st.flat));
-      RCLCPP_INFO(get_logger(),
+          RCLCPP_INFO(get_logger(),
         "중앙집중 MPPI: %.0f us 평균 / %.0f us 최대 (틱 %d ms), 유효샘플 %.1f/%d, "
         "Jmin %.4f, 초과 %.4f, 첫스텝 포화 %.1f%%, 평평 %.1f%% | "
         "레일 예측오차 양 %.2f / 음 %.2f kPa",
@@ -1883,6 +1947,12 @@ void Controller::run_system_mppi(double P_atm_kPa, double P_line_pos_kPa,
         100.0 * (double)st.flat / (double)st.calls,
         sys_pred_err_pos_ / std::max(1, sys_pred_n_),
         sys_pred_err_neg_ / std::max(1, sys_pred_n_));
+      if (sys_over_cnt_ > 0 || sys_skipped_ > 0)
+        RCLCPP_WARN(get_logger(),
+          "중앙집중 MPPI 데드라인: %ld회 초과(%.0f us 기준), %ld틱 건너뜀 — "
+          "sys_samples 를 줄이거나 period_ms 를 올릴 것",
+          (long)sys_over_cnt_, sys_deadline_us_, (long)sys_skipped_);
+      sys_over_cnt_ = sys_skipped_ = 0;
     }
     sys_pred_err_pos_ = sys_pred_err_neg_ = 0.0; sys_pred_n_ = 0;
   }

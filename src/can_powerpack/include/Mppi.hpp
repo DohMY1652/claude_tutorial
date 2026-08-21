@@ -135,10 +135,21 @@ struct Exogenous {
 float phi(float Pin, float Pout);                                  // 압축성 유동 Φ
 float area_eff(const PlantParams& p, float u_pct, float Pin, float z);
 float q_static(const PlantParams& p, float u_pct, float Pin, float Pout, float z);
+// 역모델: 필요 유효면적 → 명령 [%]. area_eff 를 그대로 뒤집은 것이다.
+// C_p·Pin 항 때문에 **상류 압력이 높으면 필요 전류가 낮아진다** (압력이 스풀을 돕는다).
+float u_of_area(const PlantParams& p, float area_req, float Pin, float z);
+// 역모델: 필요 유량 [LPM] → 명령 [%]
+float valve_invert(const PlantParams& p, float q_req, float Pin, float Pout, float z);
 float step_bw(const PlantParams& p, ValveState& vs, float u_pct);   // z 갱신 후 z 반환
 float valve_dyn(const PlantParams& p, ValveState& vs, float Q_static, float dt);
+// 밸브 3개의 파라미터. **밸브마다 다르다** — RUNBOOK.md 의 피팅이 micro/atm/macro 를
+// 따로 맞추고 `valve_fit_solve.py` 가 `channel_config.chN.{micro,atm,macro}.*` 로 쓴다.
+// 인덱스는 ValveIdx (0=micro, 1=macro, 2=atm). 채널 공통 필드(is_positive, leakage_u,
+// ejector_p_limit, cmd_taper_kpa)는 세 원소에 같은 값을 넣는다.
+using ChannelPlant = std::array<PlantParams, 3>;
+
 // 한 스텝 전진. u 는 **테이퍼·클램프까지 끝난 실제 인가 명령** [%] 3개.
-void  step(const PlantParams& p, ChannelState& s, const std::array<float, 3>& u,
+void  step(const ChannelPlant& pv, ChannelState& s, const std::array<float, 3>& u,
            const Exogenous& ex, float V, float dt);
 
 // 밸브 내부 상태 추정(q, qd)만 **측정 압력**으로 한 스텝 전진시킨다.
@@ -154,7 +165,7 @@ void  step(const PlantParams& p, ChannelState& s, const std::array<float, 3>& u,
 // `integrate_chamber` 가 true 면 챔버압 `s.P` 도 같은 식으로 한 스텝 전진시킨다.
 // 그러면 이 함수 하나가 **예측기**가 된다 — 측정을 기다리지 않고 모델로 앞서 나간다.
 // 호출자는 그 예측을 측정과 비교해 보정하면 관측기가 완성된다 (AcadosMpc::solve 참조).
-void  advance_valve_estimate(const PlantParams& p, ChannelState& s,
+void  advance_valve_estimate(const ChannelPlant& pv, ChannelState& s,
                              const std::array<float, 3>& u_applied,
                              const Exogenous& ex, float dt,
                              bool integrate_chamber = false, float V = -1.0f);
@@ -235,7 +246,7 @@ struct Rng {
 // 핫패스에서 힙 할당이 없도록 생성 시 전부 예약한다.
 class Solver {
 public:
-  Solver(const PlantParams& pp, const Params& pr, uint32_t seed);
+  Solver(const ChannelPlant& pv, const Params& pr, uint32_t seed);
 
   // x0    : 현재 추정 상태 (측정 압력 + 밸브 내부 상태 추정)
   // ex    : 외생 입력
@@ -252,8 +263,8 @@ private:
   float rollout_cost(const ChannelState& x0, const Exogenous& ex,
                      const std::array<float, 3>& uref, int sample);
 
-  PlantParams pp_;
-  Params      pr_;
+  ChannelPlant pv_;
+  Params       pr_;
   Rng         rng_;
   Stats       st_{};
 

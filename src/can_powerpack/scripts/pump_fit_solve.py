@@ -384,14 +384,19 @@ def write_yaml(outdir, geom, vols, leaks, args, indir, front_pts=(), map_pts=())
     # (부피 500 mL, 누설 0.002 LPM/kPa) 을 적었는데, 그러면 미측정값이 **측정값처럼**
     # 파일에 박혀 이후에 구별이 불가능해진다.
     virt = doc['/pack2/can_bridge']['ros__parameters']['Virtual']
+    # 중앙집중 MPPI(solver: mppi_system) 는 레일을 롤아웃 상태로 예측하므로 **컨트롤러도**
+    # 레일 부피·누설을 알아야 한다. Phase L 이 구하는 값이 바로 그것이다.
+    ctrl_mpc = doc['/pack2/pp_controller']['ros__parameters'].setdefault('MPC_parameters', {})
     missing = []
     for rail in ('pos', 'neg'):
         if rail in vols:
             virt[f'line_volume_{rail}_ml'] = float(round(vols[rail], 2))
+            ctrl_mpc[f'rail_volume_{rail}_ml'] = float(round(vols[rail], 2))
         else:
             missing.append(f'line_volume_{rail}_ml')
         if rail in leaks and leaks[rail] == leaks[rail]:
             virt[f'line_leak_{rail}_lpm_per_kpa'] = float(f'{leaks[rail]:.6g}')
+            ctrl_mpc[f'rail_leak_{rail}'] = float(f'{leaks[rail]:.6g}')
         else:
             missing.append(f'line_leak_{rail}_lpm_per_kpa')
     doc['/pack2/can_bridge']['ros__parameters']['Virtual']['pump_map_measured'] = {

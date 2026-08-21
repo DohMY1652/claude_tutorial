@@ -7,6 +7,7 @@
 #include <vector>
 #include <array>
 #include <set>
+#include <chrono>
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -54,6 +55,10 @@ private:
   };
   std::vector<BoardCmd> targets_;   // targets_[bid], bid = 1..NUM_BOARDS
   std::mutex cmd_mtx_;
+  // PWM 워치독 — targets_ 가 영구 래치라 컨트롤러가 죽으면 마지막 명령이 계속 나간다.
+  std::chrono::steady_clock::time_point last_cmd_{};
+  bool cmd_seen_{false}, wd_tripped_{false};
+  int  wd_timeout_ms_{200}, wd_vent_index_{0}, wd_admit_index_{3};
 
   uint8_t current_mode_{0};
   uint8_t control_type_{0};

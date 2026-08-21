@@ -95,6 +95,25 @@ float q_static(const PlantParams& p, float u_pct, float Pin, float Pout, float z
   return a * Pin * ph;
 }
 
+float u_of_area(const PlantParams& p, float area_req, float Pin, float z)
+{
+  const float A_max = std::max(1e-12f, p.A_max);
+  if (area_req >= A_max) return 100.0f;
+  const double sigma = std::pow(std::clamp((double)area_req / (double)A_max, 1e-9, 1.0 - 1e-9),
+                                1.0 / std::max(1e-9, (double)p.alpha_shape));
+  const double F_req = std::log(sigma / (1.0 - sigma)) / std::max(1e-9, (double)p.k_shape);
+  const double I_req = F_req - (double)p.C_z * z - (double)p.C_p * Pin + (double)p.C_k;
+  return (float)std::clamp(I_req / std::max(1e-9, (double)p.I_MAX) * 100.0, 0.0, 100.0);
+}
+
+float valve_invert(const PlantParams& p, float q_req, float Pin, float Pout, float z)
+{
+  if (q_req <= 0.0f) return 0.0f;
+  const float ph = phi(Pin, Pout);
+  if (ph < 1e-9f) return 0.0f;
+  return u_of_area(p, q_req / std::max(1e-9f, Pin * ph), Pin, z);
+}
+
 // ============================================================================
 // Bouc-Wen — VirtualPowerpack::step_valve 의 앞부분과 동일
 // ============================================================================
@@ -129,9 +148,10 @@ float valve_dyn(const PlantParams& p, ValveState& vs, float Q_static, float dt)
 // ============================================================================
 // 한 스텝 전진
 // ============================================================================
-void step(const PlantParams& p, ChannelState& s, const std::array<float, 3>& u,
+void step(const ChannelPlant& pv, ChannelState& s, const std::array<float, 3>& u,
           const Exogenous& ex, float V, float dt)
 {
+  const PlantParams& p = pv[V_MICRO];      // 채널 공통 필드용 (is_positive 등)
   // 밸브별 상·하류압. update_linearization 의 배정과 동일하다.
   float pin[3], pout[3];
   if (p.is_positive) {
@@ -146,21 +166,24 @@ void step(const PlantParams& p, ChannelState& s, const std::array<float, 3>& u,
 
   float q[3];
   for (int j = 0; j < 3; ++j) {
-    const float z = step_bw(p, s.v[j], u[j]);
+    const PlantParams& pj = pv[(size_t)j];   // **밸브별 파라미터**
+    const float z = step_bw(pj, s.v[j], u[j]);
     float Qs;
-    if (!p.is_positive && j == V_MACRO && s.P <= p.ejector_p_limit) {
+    if (!pj.is_positive && j == V_MACRO && s.P <= pj.ejector_p_limit) {
       Qs = 0.0f;                       // 이젝터 도달 하한 아래에서는 흡입이 없다
     } else {
-      Qs = q_static(p, u[j], pin[j], pout[j], z);
+      Qs = q_static(pj, u[j], pin[j], pout[j], z);
     }
-    q[j] = valve_dyn(p, s.v[j], Qs, dt);
+    q[j] = valve_dyn(pj, s.v[j], Qs, dt);
   }
 
   // 누설은 상태를 갖지 않는다 — atm 밸브의 z 를 쓴다 (calc_rounds 와 동일한 취급).
+  // 누설은 배기(atm) 밸브의 파라미터로 본다 — calc_rounds 와 같은 취급이다.
+  const PlantParams& pl = pv[V_ATM];
   float q_leak = 0.0f;
-  if (p.leakage_u > 0.0f) {
-    q_leak = p.is_positive ? q_static(p, p.leakage_u, s.P, ex.P_atm, s.v[V_ATM].z)
-                           : q_static(p, p.leakage_u, ex.P_atm, s.P, s.v[V_ATM].z);
+  if (pl.leakage_u > 0.0f) {
+    q_leak = pl.is_positive ? q_static(pl, pl.leakage_u, s.P, ex.P_atm, s.v[V_ATM].z)
+                            : q_static(pl, pl.leakage_u, ex.P_atm, s.P, s.v[V_ATM].z);
   }
 
   const float q_net = p.is_positive
@@ -178,11 +201,12 @@ void step(const PlantParams& p, ChannelState& s, const std::array<float, 3>& u,
 // ============================================================================
 // 밸브 상태 추정 전진 — step() 과 같은 상·하류압 배정을 쓰되 z 는 건드리지 않는다
 // ============================================================================
-void advance_valve_estimate(const PlantParams& p, ChannelState& s,
+void advance_valve_estimate(const ChannelPlant& pv, ChannelState& s,
                             const std::array<float, 3>& u_applied,
                             const Exogenous& ex, float dt,
                             bool integrate_chamber, float V)
 {
+  const PlantParams& p = pv[V_MICRO];
   float pin[3], pout[3];
   if (p.is_positive) {
     pin[V_MICRO] = ex.P_micro; pout[V_MICRO] = s.P;
@@ -195,20 +219,22 @@ void advance_valve_estimate(const PlantParams& p, ChannelState& s,
   }
   float q[3];
   for (int j = 0; j < 3; ++j) {
+    const PlantParams& pj = pv[(size_t)j];
     float Qs;
-    if (!p.is_positive && j == V_MACRO && s.P <= p.ejector_p_limit)
+    if (!pj.is_positive && j == V_MACRO && s.P <= pj.ejector_p_limit)
       Qs = 0.0f;
     else
-      Qs = q_static(p, u_applied[(size_t)j], pin[j], pout[j], s.v[(size_t)j].z);
-    q[j] = valve_dyn(p, s.v[(size_t)j], Qs, dt);
+      Qs = q_static(pj, u_applied[(size_t)j], pin[j], pout[j], s.v[(size_t)j].z);
+    q[j] = valve_dyn(pj, s.v[(size_t)j], Qs, dt);
   }
   if (!integrate_chamber) return;
 
   // 챔버압도 함께 전진 — step() 과 **같은 식**이다 (누설 포함, 등온 이상기체).
+  const PlantParams& pl = pv[V_ATM];
   float q_leak = 0.0f;
-  if (p.leakage_u > 0.0f) {
-    q_leak = p.is_positive ? q_static(p, p.leakage_u, s.P, ex.P_atm, s.v[V_ATM].z)
-                           : q_static(p, p.leakage_u, ex.P_atm, s.P, s.v[V_ATM].z);
+  if (pl.leakage_u > 0.0f) {
+    q_leak = pl.is_positive ? q_static(pl, pl.leakage_u, s.P, ex.P_atm, s.v[V_ATM].z)
+                            : q_static(pl, pl.leakage_u, ex.P_atm, s.P, s.v[V_ATM].z);
   }
   const float q_net = p.is_positive
       ? (q[V_MICRO] + q[V_MACRO] - q[V_ATM] - q_leak)
@@ -280,10 +306,10 @@ float Rng::normal()
 // ============================================================================
 // Solver
 // ============================================================================
-Solver::Solver(const PlantParams& pp, const Params& pr, uint32_t seed)
-: pp_(pp), pr_(pr), rng_(seed)
+Solver::Solver(const ChannelPlant& pv, const Params& pr, uint32_t seed)
+: pv_(pv), pr_(pr), rng_(seed)
 {
-  pp_.finalize();
+  for (auto& t : pv_) t.finalize();
   pr_.NP = std::max(1, pr_.NP);
   pr_.K  = std::max(2, pr_.K);
   pr_.substeps = std::clamp(pr_.substeps, 1, 8);
@@ -366,15 +392,15 @@ float Solver::rollout_cost(const ChannelState& x0, const Exogenous& ex,
       if (pr_.taper_in_rollout) {
         float pin_j;
         const float p_rail = ex.P_micro + ex.dP_micro_dt * (float)k * pr_.Ts;
-        if (pp_.is_positive)
+        if (pv_[V_MICRO].is_positive)
           pin_j = (j == V_MICRO) ? p_rail : (j == V_MACRO) ? ex.P_macro : s.P;
         else
           pin_j = (j == V_ATM) ? ex.P_atm : s.P;
-        const float uc = pp_.u_crack(pin_j, s.v[j].z);
+        const float uc = pv_[(size_t)j].u_crack(pin_j, s.v[j].z);
         // 테이퍼는 실제 컨트롤러와 같이 **최종 목표** 기준으로 판정한다
         // (스테이지 레퍼런스가 아니다 — 실기에서는 cfg_.ref_value 를 쓴다).
         const float tp = std::clamp(std::abs(ex.P_ref - s.P)
-                                        / std::max(1e-3f, pp_.cmd_taper_kpa),
+                                        / std::max(1e-3f, pv_[V_MICRO].cmd_taper_kpa),
                                     0.0f, 1.0f);
         u_out = (u_raw <= uc) ? 0.0f : uc + (u_raw - uc) * tp;
       }
@@ -389,7 +415,7 @@ float Solver::rollout_cost(const ChannelState& x0, const Exogenous& ex,
     const float V = std::max(1e-12f, ex.V0 + ex.Vdot * (float)k * pr_.Ts);
     // 레일 궤적 — 명목 기반 1차 예측. 상수 가정이 만드는 ≈5~34 kPa 오차를 없앤다.
     exk.P_micro = ex.P_micro + ex.dP_micro_dt * (float)k * pr_.Ts;
-    for (int sub = 0; sub < pr_.substeps; ++sub) step(pp_, s, u_app, exk, V, dt);
+    for (int sub = 0; sub < pr_.substeps; ++sub) step(pv_, s, u_app, exk, V, dt);
 
     if (ramp) gap *= decay;
     const float ref_k = ramp ? (ex.P_ref - gap) : ex.P_ref;

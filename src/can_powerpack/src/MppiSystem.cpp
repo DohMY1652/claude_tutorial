@@ -11,7 +11,7 @@ namespace mppi {
 // ============================================================================
 void SysParams::finalize()
 {
-  for (auto& c : ch) c.finalize();
+  for (auto& c : ch) for (auto& t : c) t.finalize();
   line.finalize();
 }
 
@@ -54,7 +54,8 @@ void sys_step(const SysParams& p, SysState& s, const float* u,
 
   // ── ① 채널 ───────────────────────────────────────────────────────────────
   for (int g = 0; g < n; ++g) {
-    const PlantParams& cp = p.ch[(size_t)g];
+    const ChannelPlant& cpv = p.ch[(size_t)g];
+    const PlantParams&  cp  = cpv[V_MICRO];     // 채널 공통 필드용
     const bool  pos = (g < p.n_pos);
     const float P   = s.P_ch[(size_t)g];
 
@@ -75,18 +76,20 @@ void sys_step(const SysParams& p, SysState& s, const float* u,
 
     float q[3];
     for (int j = 0; j < 3; ++j) {
+      const PlantParams& pj = cpv[(size_t)j];   // **밸브별 파라미터**
       ValveState& vs = s.v[(size_t)s.iv_ch(g, j)];
-      const float z = step_bw(cp, vs, uu[j]);
+      const float z = step_bw(pj, vs, uu[j]);
       float Qs;
-      if (!pos && j == V_MACRO && P <= cp.ejector_p_limit) Qs = 0.0f;
-      else Qs = q_static(cp, uu[j], pin[j], pout[j], z);
-      q[j] = valve_dyn(cp, vs, Qs, dt);
+      if (!pos && j == V_MACRO && P <= pj.ejector_p_limit) Qs = 0.0f;
+      else Qs = q_static(pj, uu[j], pin[j], pout[j], z);
+      q[j] = valve_dyn(pj, vs, Qs, dt);
     }
 
+    const PlantParams& pl = cpv[V_ATM];
     float q_leak = 0.0f;
-    if (cp.leakage_u > 0.0f) {
-      q_leak = pos ? q_static(cp, cp.leakage_u, P, p.P_atm, s.v[(size_t)s.iv_ch(g, V_ATM)].z)
-                   : q_static(cp, cp.leakage_u, p.P_atm, P, s.v[(size_t)s.iv_ch(g, V_ATM)].z);
+    if (pl.leakage_u > 0.0f) {
+      q_leak = pos ? q_static(pl, pl.leakage_u, P, p.P_atm, s.v[(size_t)s.iv_ch(g, V_ATM)].z)
+                   : q_static(pl, pl.leakage_u, p.P_atm, P, s.v[(size_t)s.iv_ch(g, V_ATM)].z);
     }
 
     const float q_net = pos ? (q[V_MICRO] + q[V_MACRO] - q[V_ATM] - q_leak)
@@ -273,7 +276,8 @@ float SystemSolver::rollout(const SysState& x0, const SysExo& ex,
     // 테이퍼 대상이 아니다: 목표가 챔버압이 아니라 레일압이다).
     if (mp_.taper_in_rollout) {
       for (int g = 0; g < n; ++g) {
-        const PlantParams& cp = sp_.ch[(size_t)g];
+        const ChannelPlant& cpv = sp_.ch[(size_t)g];
+        const PlantParams&  cp  = cpv[V_MICRO];
         const bool  pos = (g < sp_.n_pos);
         const float P   = s.P_ch[(size_t)g];
         const float tp  = std::clamp(std::abs(ex.P_ref[(size_t)g] - P)
@@ -281,8 +285,8 @@ float SystemSolver::rollout(const SysState& x0, const SysExo& ex,
         const int   im = sys_i_micro(g), ia = sys_i_atm(n, g);
         const float pin_mi = pos ? s.P_pos : P;
         const float pin_at = pos ? P : sp_.P_atm;
-        const float uc_mi = cp.u_crack(pin_mi, s.v[(size_t)s.iv_ch(g, V_MICRO)].z);
-        const float uc_at = cp.u_crack(pin_at, s.v[(size_t)s.iv_ch(g, V_ATM)].z);
+        const float uc_mi = cpv[V_MICRO].u_crack(pin_mi, s.v[(size_t)s.iv_ch(g, V_MICRO)].z);
+        const float uc_at = cpv[V_ATM].u_crack(pin_at, s.v[(size_t)s.iv_ch(g, V_ATM)].z);
         u_app[(size_t)im] = (u_app[(size_t)im] <= uc_mi) ? 0.0f
                           : uc_mi + (u_app[(size_t)im] - uc_mi) * tp;
         u_app[(size_t)ia] = (u_app[(size_t)ia] <= uc_at) ? 0.0f

@@ -73,8 +73,8 @@ struct SysParams {
   int n_ch{12};
   int n_pos{6};                        // 앞쪽 n_pos 개가 양압 채널
 
-  std::vector<PlantParams> ch;         // 채널별 13-parameter (n_ch 개)
-  PlantParams line;                    // 라인 밸브 2개 공용
+  std::vector<ChannelPlant> ch;        // 채널별 × 밸브별 13-parameter (n_ch 개)
+  PlantParams line;                    // 라인 밸브 2개 공용 (별도 피팅 필요)
 
   // 레일
   float V_pos_m3{500e-6f}, V_neg_m3{500e-6f};

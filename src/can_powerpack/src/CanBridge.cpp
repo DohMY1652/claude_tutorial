@@ -80,6 +80,13 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
   }
 
   targets_.resize(NUM_BOARDS + 1);
+  // 워치독: 0 이면 끔. 실기에서는 반드시 켤 것.
+  wd_timeout_ms_  = this->declare_parameter<int>("pwm_watchdog_ms", 200);
+  wd_vent_index_  = this->declare_parameter<int>("pwm_watchdog_vent_index",  0);   // board1 v1
+  wd_admit_index_ = this->declare_parameter<int>("pwm_watchdog_admit_index", 3);   // board2 v1
+  RCLCPP_INFO(get_logger(),
+    "PWM 워치독: %d ms (0=끔). 시한 초과 시 채널 밸브 폐쇄 + 라인 밸브(idx %d, %d) 전개",
+    wd_timeout_ms_, wd_vent_index_, wd_admit_index_);
   sensors_snapshot_.assign(PWM_BOARDS + 1, 0);
   current_snapshot_.resize(PWM_BOARDS + 1, {0.0, 0.0, 0.0});
   analog_snapshot_.assign(NUM_BOARDS - ANALOG_BOARD_START + 1, 0);  // 9 values (boards 17..25)
@@ -158,6 +165,12 @@ void CanBridge::close_can() {
 void CanBridge::on_cmd_pwm(const std_msgs::msg::UInt16MultiArray::SharedPtr msg) {
   {
     std::lock_guard<std::mutex> lk(cmd_mtx_);
+    last_cmd_ = std::chrono::steady_clock::now();
+    cmd_seen_ = true;
+    if (wd_tripped_) {
+      wd_tripped_ = false;
+      RCLCPP_INFO(get_logger(), "PWM 워치독 복구 — 명령 수신 재개");
+    }
     const int n = std::min((int)msg->data.size() / 3, PWM_BOARDS);
     for (int i = 0; i < n; ++i) {
       int bid = i + 1;
@@ -272,6 +285,50 @@ void CanBridge::sensor_routine() {
 
 // TX: boards 1..18 packed into two CAN FD frames. Boards 19..25 are analog-only (no TX).
 void CanBridge::tx_routine() {
+  // ── PWM 워치독 ───────────────────────────────────────────────────────────
+  // targets_ 는 영구 래치다 — pp_controller 가 죽거나 Ctrl-C 되면 마지막 PWM 이 CAN
+  // 주기로 계속 나간다. 밸브가 열린 채로 남으면 실기에서 위험하다.
+  //
+  // 그리고 **"전부 0" 은 안전 상태가 아니다**: board1 v1(양압 릴리프)이 0 이면 릴리프가
+  // **닫혀** 펌프가 양압 레일을 무한정 올린다. 펌프 피팅에서 확립한 안전 상태와 같이
+  //   · 채널 밸브 → 0 (닫힘, 챔버 압력 동결)
+  //   · 라인 밸브 2개 → **전개** (레일을 대기로 되돌린다)
+  //   · MacroSwitch → 0 (이젝터 정지)
+  // 로 간다.
+  if (wd_timeout_ms_ > 0) {
+    bool trip = false;
+    {
+      std::lock_guard<std::mutex> lk(cmd_mtx_);
+      if (cmd_seen_) {
+        const double age_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - last_cmd_).count();
+        trip = (age_ms > (double)wd_timeout_ms_);
+      }
+      if (trip) {
+        for (int bid = 1; bid <= PWM_BOARDS; ++bid) {
+          targets_[bid].v1 = 0; targets_[bid].v2 = 0; targets_[bid].v3 = 0;
+        }
+        auto open_slot = [&](int flat) {
+          if (flat < 0) return;
+          const int bid = flat / 3 + 1, v = flat % 3;
+          if (bid < 1 || bid > PWM_BOARDS) return;
+          const uint16_t FULL = 4095;
+          if (v == 0) targets_[bid].v1 = FULL;
+          else if (v == 1) targets_[bid].v2 = FULL;
+          else targets_[bid].v3 = FULL;
+        };
+        open_slot(wd_vent_index_);
+        open_slot(wd_admit_index_);
+      }
+    }
+    if (trip && !wd_tripped_) {
+      wd_tripped_ = true;
+      RCLCPP_ERROR(get_logger(),
+        "PWM 워치독: %d ms 동안 board/pwm_cmd 가 없다 — 채널 밸브 폐쇄 + 라인 밸브 전개. "
+        "pp_controller 가 죽었는지 확인할 것.", wd_timeout_ms_);
+    }
+  }
+
   std::lock_guard<std::mutex> lk(cmd_mtx_);
 
   heartbeat_cnt_++;

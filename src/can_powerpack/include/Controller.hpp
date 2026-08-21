@@ -190,6 +190,9 @@ public:
     // "닫힘"으로 볼 유효면적 비율 (A_eff / A_max). 이 면적에 해당하는 전류가 크래킹
     // 임계이고, 그 이하에서는 솔레노이드 자기력이 스풀을 못 들어 유량이 0 이다.
     float valve_crack_area_frac = 1e-6f;
+    // 밸브별 13-parameter (0=micro, 1=macro, 2=atm). build_mpcs 가 채운다.
+    // **이것이 모델의 단일 출처다.** 아래 평면 필드는 하위 호환용으로 micro 값을 담는다.
+    std::array<mppi::PlantParams, 3> pv{};
     // 13-variable proportional valve model parameters
     float I_MAX{0.30f};
     float A_max{0.2845f};
@@ -275,7 +278,7 @@ public:
   // 롤아웃 초기 상태 — 채널 경로와 중앙집중 경로가 **같은 조립 규칙**을 쓰게 한다.
   // prepare() 직후에 부를 것 (z 가 이번 틱 값으로 갱신된 뒤여야 한다).
   mppi::ChannelState rollout_state() const;
-  const mppi::PlantParams& plant_params() const { return mppi_plant_; }
+  const mppi::ChannelPlant& plant_params() const { return mppi_pv_; }
   const Config& cfg() const { return cfg_; }
 
   // macro(탱크 부스트 / 이젝터) 경로 개방 허용 — 생성기(mode 2)가 매 틱 갱신한다.
@@ -331,6 +334,7 @@ private:
   const size_t vol_dot_window_size_ = 5;
 
   int qp_fail_count_{0};
+  int nonfinite_cnt_{0};           // 비유한 명령 차단 횟수 (실기 안전 진단)
   int qp_stat_tick_{0};
 
   // ── MPPI 경로 ────────────────────────────────────────────────────────────
@@ -338,7 +342,7 @@ private:
   // 매 틱 실제 인가 명령 + 측정 압력으로 함께 전진시킨다. z 는 여기 두지 않고
   // z_micro_/z_atm_/z_macro_ 를 단일 출처로 삼아 매 틱 복사해 넣는다.
   std::unique_ptr<mppi::Solver> mppi_;
-  mppi::PlantParams             mppi_plant_{};
+  mppi::ChannelPlant            mppi_pv_{};
   mppi::ChannelState            plant_est_{};
   int   mppi_stat_tick_{0};
   float vol_dot_est_{0.0f};        // compute_input_reference 가 매 틱 갱신 [m³/s]
@@ -553,14 +557,14 @@ private:
   int P_macro_board_id_{3};       // board carrying P_line_macro sensor
   int P_macro_neg_board_id_{4};   // board carrying P_line_macro_neg sensor
 
-  struct ChannelConfig {
-    double pos_ki_micro{0.0};
-    double pos_ki_macro{0.0};
-    double pos_ki_atm{0.0};
-    double neg_ki_micro{0.0};
-    double neg_ki_macro{0.0};
-    double neg_ki_atm{0.0};
-    // 13-variable proportional valve model parameters
+  // 13-variable 비례밸브 모델 파라미터 한 세트.
+  //
+  // **밸브마다 다르다.** `RUNBOOK.md` 의 밸브 피팅은 채널당 3개(micro/atm/macro)를 따로
+  // 맞추고 `valve_fit_solve.py` 가 `channel_config.chN.{micro,atm,macro}.*` 로 쓴다.
+  // 예전에는 로더가 채널당 한 세트만 읽어 세 밸브에 같은 값을 써서 **피팅 결과를 쓸 수
+  // 없었다** (README 8.8 의 "밸브별 파라미터 로더 미완"). 이제 세 세트를 읽고, 없으면
+  // 평면 `chN.*` 로 폴백한다.
+  struct Valve13 {
     double I_MAX{0.30};
     double A_max{0.2845};
     double k_shape{33.09};
@@ -575,6 +579,19 @@ private:
     double zeta_up{1.2};
     double wn_down{45.0};
     double zeta_down{1.0};
+  };
+
+  struct ChannelConfig {
+    double pos_ki_micro{0.0};
+    double pos_ki_macro{0.0};
+    double pos_ki_atm{0.0};
+    double neg_ki_micro{0.0};
+    double neg_ki_macro{0.0};
+    double neg_ki_atm{0.0};
+    // 밸브별 13-parameter. 인덱스는 mppi::ValveIdx 와 동일 (0=micro, 1=macro, 2=atm).
+    std::array<Valve13, 3> v{};
+    double chamber_volume_ml{-1.0};   // 피팅으로 구한 챔버 부피 (<0 이면 미측정)
+    bool   per_valve_loaded{false};   // 진단용 — 피팅 파일이 실제로 로드됐는지
   };
 
   std::vector<ChannelConfig> channel_configs_;
@@ -608,6 +625,9 @@ private:
   std::vector<float> sys_uref_;
   bool  sys_init_{false};
   bool  sys_control_lines_{false};
+  double sys_deadline_us_{1200.0};
+  int    sys_over_budget_{0};
+  long   sys_over_cnt_{0}, sys_skipped_{0};
   int   sys_stat_tick_{0};
   double sys_pred_err_pos_{0.0}, sys_pred_err_neg_{0.0};
   double sys_pred1_pos_{0.0}, sys_pred1_neg_{0.0};

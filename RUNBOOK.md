@@ -239,12 +239,19 @@ cd ~/claude_tutorial && colcon build --packages-select can_powerpack
 3. `pump: {...}` — 기하 피팅 산물. 소기량 × `Cb_in` 축퇴가 남아 개별 값은 배수로 틀릴 수 있다
    (자기검증: 능력경계 12–16% 오차). **참고용.**
 
-### ⚠ 아직 안 된 것 — 밸브별 값이 로드되지 않는다
+### 밸브별 값 로딩 — 이제 된다
 
-`ChannelConfig` 는 채널당 13-parameter 세트가 **하나**뿐이고 micro/atm/macro 에 같은 값을 쓴다
-(로더 `Controller.cpp:856-869`, MPC 로 복사 `Controller.cpp:1274`). 밸브별 피팅 결과를 실제로 쓰려면
-`channel_config.chN.{micro,atm,macro}.*` 3세트를 읽도록 C++ 로더를 확장해야 한다.
-**그때까지 `valve_params.yaml` 은 결과 보관·리포트용이다.**
+`channel_config.chN.{micro,atm,macro}.*` 3세트를 읽고, 없으면 평면 `chN.*` 로 폴백한다.
+피드포워드 역모델·크래킹 임계·Bouc-Wen·MPPI 롤아웃·QP 선형화가 **전부 밸브별 값을 쓴다.**
+
+반영 확인은 기동 로그 한 줄로 한다:
+```
+밸브별 13-parameter: 12/12 채널이 chN.{micro,atm,macro}.* 를 로드했다
+```
+`0/12` 면 병합이 안 된 것이다 (파일 위치·재빌드 확인). 피팅 전이면 `0/N` 이 정상이다.
+
+`chamber_volume_ml` 도 함께 로드해 로그에 찍는다 — 지금은 진단용이고, 실제 부피는
+액추에이터 각도에서 계산된다.
 
 ---
 
@@ -259,7 +266,9 @@ cd ~/claude_tutorial && colcon build --packages-select can_powerpack
    → **여기까지 통과하면** 6채널 → 4모드로 확대.
 5. 펌프: Phase L(펌프 off) → M → F. Phase L 은 τ·R² 를 눈으로 확인하고 넘어간다.
 6. 피팅 결과를 `VirtualPowerpack` 에 넣고 같은 실험을 재현해 실측 궤적과 겹치는지 본다.
-   이게 최종 수용 기준이다.
+   이게 피팅의 최종 수용 기준이다.
+7. **제어기 실험은 4.5절**로 간다 — 피팅 → QP → 채널 MPPI → 중앙집중 MPPI,
+   무액추에이터 1축→6축 → 액추에이터 1축→6축.
 
 ### 시뮬로 예행연습이 필요하면
 
@@ -271,6 +280,150 @@ ros2 run can_powerpack virtual_powerpack --ros-args \
 
 `virtual_powerpack` 은 `board/sensors`·`currents`·`pwm_cmd` 를 실기와 동일 형식으로 낸다.
 `can_bridge` 로 리맵해야 스크립트가 찾는다.
+
+---
+
+## 4.5 실기 제어기 실험 — 순서와 스위치
+
+**내일 진행할 순서다.** 피팅 → QP → 채널 MPPI → 중앙집중 MPPI, 각각 무액추에이터
+1축→6축 → 액추에이터 1축→6축.
+
+### 4.5.0 켜고 끄는 것 — 스위치 한 장 정리
+
+전부 `ros2 launch` 인자로 줄 수 있다. **yaml 을 고치지 않아도 되고, 같은 빌드로 비교할 수
+있다** (빌드를 바꿔 비교하면 원인 분리가 안 된다).
+
+```bash
+ros2 launch can_powerpack control.launch.py \
+     solver:=qp|mppi|mppi_system \
+     num_actuators:=1..6 \
+     actuator_connected:=false|true \
+     overrides:=MPC_parameters.sys_samples=128,MPC_parameters.mppi_estimator=true
+```
+
+| 인자 | 뜻 |
+|---|---|
+| `solver` | `qp` = 선형화 + 응축 qpOASES (예전 것) · `mppi` = 채널별 MPPI (**기본**) · `mppi_system` = 전체 시스템 중앙집중 |
+| `num_actuators` | **축(=채널쌍) 수.** 1 이면 양압 gid 0 + 음압 gid 6 만 활성. 나머지 채널은 목표가 대기압이라 밸브가 닫힌 채 있다 |
+| `actuator_connected` | `false` = 고정 탱크 부피(50 mL), 축 각도 동역학 없음 · `true` = 실제 부피/각도 |
+| `overrides` | 그 밖의 파라미터 |
+
+`control_mode` 는 **2 로 둔다**(yaml 기본). 무액추에이터에서도 mode 2 가 맞다 — 그때는
+TorquePID 가 비활성이고 `τ_ref = m·g·L·sin(angle_ref)` 만 남아 **목표각이 곧 일정한 힘
+지령**이 된다. 그러면 생성기가 그 힘을 양압/음압 챔버로 나눠 전 채널에 `P_ref` 를 주므로
+압력 캐스케이드 전체를 축이 움직이지 않는 상태로 시험할 수 있다.
+
+목표는 TCP 로 준다 (축 개수만큼):
+```bash
+python3 src/can_powerpack/scripts/position_ref_client.py 127.0.0.1 2293 --once 45
+python3 src/can_powerpack/scripts/position_ref_client.py 127.0.0.1 2293 --once 45 45 45 45 45 45
+```
+
+### 4.5.1 0단계 — 피팅부터 (위 1·2절)
+
+1절(밸브 4모드 × 채널)과 2절(펌프 3단계)을 그대로 돌린다. 그 다음 **결과를 반영**한다:
+
+```bash
+cp results_fit/*/valve_params.yaml  src/can_powerpack/config/valve_params.yaml
+cp results_pump/*/pump_params.yaml  src/can_powerpack/config/pump_params.yaml
+colcon build --packages-select can_powerpack --cmake-args -DCMAKE_BUILD_TYPE=Release
+```
+
+**반영됐는지 기동 로그로 반드시 확인한다** — 이게 유일한 확인 수단이다:
+
+```
+밸브별 13-parameter: 12/12 채널이 chN.{micro,atm,macro}.* 를 로드했다
+  ch0 피팅 챔버 부피 128.50 mL
+```
+
+`0/12` 가 나오면 병합이 안 된 것이다 (파일 위치·재빌드 확인). 피팅 전이라면 `0/N` 이
+정상이고 하드코딩 기본값으로 돈다.
+
+> 이번에 로더를 만들었다. 예전에는 채널당 13-parameter 세트가 하나뿐이어서 micro/atm/macro
+> 에 같은 값을 썼고, **피팅 결과를 쓸 수 없었다.** 이제 피드포워드 역모델·크래킹 임계·
+> Bouc-Wen·MPPI 롤아웃·QP 선형화가 전부 밸브별 값을 쓴다.
+
+펌프 Phase L 이 구한 레일 부피·누설은 `pump_params.yaml` 이 **컨트롤러 쪽에도**
+(`MPC_parameters.rail_volume_*` / `rail_leak_*`) 쓴다 — 중앙집중 MPPI 가 레일을 예측하는 데
+필요하다.
+
+### 4.5.2 1단계 — 무액추에이터, 1축 → 6축
+
+목적: 압력 캐스케이드만 검증한다. 축이 움직이지 않으므로 부피가 고정이고 위험이 가장 낮다.
+
+```bash
+# 축 1개, 예전 QP 부터
+ros2 launch can_powerpack control.launch.py \
+     solver:=qp num_actuators:=1 actuator_connected:=false
+python3 src/can_powerpack/scripts/position_ref_client.py 127.0.0.1 2293 --once 30
+# 안정되면 45, 그다음 다시 20 등으로 몇 번 왕복
+```
+
+그 축 1개에서 **세 솔버를 차례로** 돌려 비교한다 (`solver:=` 만 바꾼다):
+`qp` → `mppi` → `mppi_system`.
+
+문제가 없으면 `num_actuators` 를 **1 → 2 → 3 → 6** 으로 올리며 각 단계에서 세 솔버를 반복한다.
+축을 늘릴 때마다 레일 부하가 커지므로 **레일 압력을 반드시 함께 본다**(아래 4.5.4).
+
+### 4.5.3 2단계 — 액추에이터 연결, 1축 → 6축
+
+`actuator_connected:=true` 로 바꾸고 같은 순서를 반복한다. 이때부터 **축이 실제로 움직인다.**
+
+- 각도 목표는 작게 시작한다 (예 10° → 20° → 45°).
+- 엔코더 캘리브레이션이 **board 20·21·22 만 있고 나머지가 없다**(README 0절). 축을 6개까지
+  늘리려면 그 전에 2점 캘리브레이션을 해야 한다. 안 하면 각도가 틀린 상태로 위치 제어를
+  하게 된다 — 1단계(무액추에이터)는 각도를 힘 지령으로만 쓰므로 영향이 적지만
+  2단계는 직접 영향을 받는다.
+
+### 4.5.4 무엇을 보면서 돌리나
+
+기동 직후 확인할 로그:
+
+| 로그 | 정상 | 벗어나면 |
+|---|---|---|
+| `밸브별 13-parameter: N/M` | 피팅 후 `12/12` | `0/12` = 병합 실패 |
+| `MPC 솔버 = ...` | 의도한 솔버 | 인자 오타 |
+| `PWM 워치독: 200 ms` | 켜져 있어야 한다 | `0` 이면 안전장치 없음 |
+| `펌프 테이블 완료 ... 능력경계` | 피팅값 반영 확인 | — |
+
+돌면서 10 초마다 나오는 것:
+
+| 로그 | 정상 | 벗어나면 |
+|---|---|---|
+| `틱 간격이 가정과 다르다` | **안 나와야 한다** | 나오면 실제 주기가 `period_ms` 와 다르다 — 컨트롤러는 dt 를 항상 `period_ms` 로 쓰므로 그만큼 모델 오차다. `period_ms` 를 실측에 맞춘다 |
+| `MPPI: ... us 최대` | 틱 예산의 60% 이하 | 넘으면 `mppi_substeps`→1, 그다음 `mppi_samples` 를 내린다 |
+| `중앙집중 MPPI 데드라인: N회 초과` | 0 | 나오면 `sys_samples` 를 줄이거나 `period_ms` 를 올린다 (250 Hz 도 무방) |
+| `레일 예측오차` | < 2 kPa | 크면 레일 부피·누설 피팅값을 의심 |
+| `관측기: 평균 \|잔차\|` | < 2 kPa | 크면 모델이 플랜트를 못 따라간다 |
+| `[SAFETY] chN ... latched` | 안 나와야 한다 | 과압 래치. 목표를 낮추고 원인 확인 |
+| `비유한 값이다` | 절대 안 나와야 한다 | 즉시 중단하고 보고할 것 |
+
+### 4.5.5 안전 — 실기에서 바뀐 것
+
+- **PWM 워치독 신설.** `board/pwm_cmd` 가 200 ms 이상 끊기면 브리지가 **채널 밸브를 닫고
+  라인 밸브 2개를 전개**한다. 예전에는 `targets_` 가 영구 래치라 컨트롤러가 죽으면
+  마지막 PWM 이 계속 나갔다. 그리고 **"전부 0" 은 안전 상태가 아니다** — board1 v1 이 0 이면
+  릴리프가 닫혀 펌프가 양압 레일을 무한정 올린다.
+- **비유한 값 차단.** 솔버가 NaN/Inf 를 내면 해당 밸브를 0 으로 떨어뜨리고 한 번 경고한다.
+  예전에는 uint16 변환이 정의되지 않아 임의의 PWM 이 나갈 수 있었다.
+- **중앙집중 솔버 데드라인.** 한 번의 solve 가 예산(기본 틱의 60%)을 넘기면 다음 틱들을
+  건너뛰고 Δu=0(순수 피드포워드)로 간다. MPPI 는 워밍 스타트 기반이라 한 틱 쉬어도 이어서
+  개선한다. 제어 루프가 멈추는 것보다 낫다.
+- 기존 과압 보호(채널별 히스테리시스 래치)와 5초 밸브 잠금은 그대로다.
+- **비상 정지**: `Ctrl-C` 로 컨트롤러를 끄면 워치독이 200 ms 뒤 안전 상태로 간다.
+  즉시 멈추려면 펌프 전원을 끄는 것이 가장 확실하다.
+
+### 4.5.6 솔버별 알아둘 것
+
+| | 상태 | 실기에서 주의 |
+|---|---|---|
+| `qp` | 예전 기준선. 초킹 구간에서 `A_scalar=0` 이라 Δu≈0 — 사실상 피드포워드+적분항이다 | 가장 보수적이라 **먼저 돌릴 것**. 문제가 나면 배관·피팅·센서 쪽 문제다. 시뮬 IAE 분산이 넓다(12.8~20.1) — Δu 가 없어 하네스 타이밍에 좌우되기 때문이다. 실기에서도 반복 측정할 것 |
+| `mppi` | **기본. 시뮬에서 가장 좋다** (QP 대비 IAE −62%, 정착 −54%) | 실시간 여유 큼(채널당 0.3 ms). 가장 먼저 시도할 개선 후보 |
+| `mppi_system` | 구현·모델 검증됨(레일 예측 0.3 kPa)이나 시뮬 성능은 채널별보다 나쁘고 **타이밍 스파이크 미해결** | 기본 `sys_samples: 128` (256 보다 측정상 더 좋고 싸다). 데드라인이 루프를 지킨다 —
+계측상 초과 49회 / 건너뜀 75틱(0.75%)이었다. 라인 밸브는 기본적으로 MPPI 가 잡지 않는다(`sys_control_lines: false`) — 잡게 하면 시뮬에서 레일이 불안정했다 |
+
+실기 데이터가 시뮬과 다를 수 있으므로 세 개를 다 돌려 보는 것이 목적이다. 비교는
+같은 축 수·같은 목표 궤적에서 하고, 하네스가 비결정론적이니 **한 번으로 판정하지 말 것.**
 
 ---
 
