@@ -102,14 +102,39 @@ for f in valve_params.yaml pump_params.yaml; do
   fi
 done
 
+hdr "5.5 엔코더 캘리브레이션 (액추에이터 붙이기 전 필수)"
+# 실측 gain 은 세 보드 모두 음수인데 일반 기본값은 양수다 → 미측정 보드는 각도가
+# 반대 방향으로 읽힌다. 위치 제어에서는 오차 부호가 뒤집혀 목표에서 멀어진다.
+CFG="${WS}/src/can_powerpack/config/powerpack_config.yaml"
+ENC="${WS}/src/can_powerpack/config/encoder_params.yaml"
+missing=""
+for bid in 17 18 19 20 21 22; do
+  found=0
+  for f in "$CFG" "$ENC"; do
+    [ -f "$f" ] && grep -qE "\"${bid}\"[[:space:]]*:[[:space:]]*\{[^}]*raw_0deg" "$f" && found=1
+  done
+  [ "$found" -eq 0 ] && missing="${missing}${missing:+, }${bid}"
+done
+if [ -z "$missing" ]; then
+  ok "board 17~22 모두 실측 2점 있음"
+else
+  bad "board ${missing} 실측값 없음 → 일반 기본값(gain **양수**)으로 돈다."
+  echo "     실측된 보드는 gain 이 모두 **음수**다 → 그 축은 각도가 **반대 방향**으로 읽힌다."
+  echo "     위치 제어 전에 캘리브레이션할 것 (RUNBOOK.md 0.5절):"
+  echo "         ros2 run can_powerpack can_bridge_node --ros-args -r __ns:=/pack2 \\"
+  echo "              --params-file src/can_powerpack/config/powerpack_config.yaml -p num_actuators:=6"
+  echo "         python3 src/can_powerpack/scripts/encoder_calib.py --axes 0 1 2 3 4 5"
+  echo "     무액추에이터 실험(4.5절 1단계)에는 영향 없다 — 각도를 쓰지 않는다."
+fi
+
 hdr "6. 남은 노드 (실기 전 반드시 비어 있어야 한다)"
-N=$(pgrep -c -f 'pp_controller|can_bridge_node|virtual_powerpack' 2>/dev/null || true)
+N=$(pgrep -c -x 'pp_controller|can_bridge_node|virtual_powerpack' 2>/dev/null || true)
 N=${N:-0}
 if [ "$N" -eq 0 ]; then
   ok "제어기·브리지 프로세스 없음"
 else
   bad "${N}개가 돌고 있다 — board/pwm_cmd 에 두 주인이 생긴다. 종료할 것:"
-  pgrep -a -f 'pp_controller|can_bridge_node|virtual_powerpack' | sed 's/^/       /'
+  pgrep -a -x 'pp_controller|can_bridge_node|virtual_powerpack' | sed 's/^/       /'
 fi
 
 hdr "다음"

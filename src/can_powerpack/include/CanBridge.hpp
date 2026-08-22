@@ -59,6 +59,7 @@ private:
   std::chrono::steady_clock::time_point last_cmd_{};
   bool cmd_seen_{false}, wd_tripped_{false};
   int  wd_timeout_ms_{200}, wd_vent_index_{0}, wd_admit_index_{3};
+  void apply_safe_state();     // 채널 폐쇄 + 라인 밸브 전개 (초기화·워치독 공용)
 
   uint8_t current_mode_{0};
   uint8_t control_type_{0};
@@ -72,7 +73,9 @@ private:
   // 보드별 엔코더 캘리브레이션 (index = board_id, [0]은 미사용). 기본값은 encoder_offset/encoder_gain,
   // EncoderCalibration.boards.<id> 로 보드별 override 가능.
   std::array<double, NUM_BOARDS + 1> enc_offset_{};   // orig_mV at 0 degrees
-  std::array<double, NUM_BOARDS + 1> enc_gain_{};     // deg/mV
+  std::array<double, NUM_BOARDS + 1> enc_gain_{};
+  // 실측 2점(raw_0deg/raw_90deg)으로 캘리브레이션됐는지 — 기동 경고에 쓴다
+  std::array<bool, NUM_BOARDS + 1> enc_measured_{};     // deg/mV
   std::mutex sensor_mtx_;
 
   // board/sensors  : boards 1..18 pressure (18 values, index 0 = board 1)
@@ -81,6 +84,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_currents_;
   // board/analog   : boards 17..25 encoder angle [deg] (9 values, index 0 = board 17)
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_analog_;
+  rclcpp::Publisher<std_msgs::msg::UInt16MultiArray>::SharedPtr pub_analog_raw_;
   // board/pwm_cmd  : boards 1..18 PWM (18*3 values, index (bid-1)*3 = board bid)
   rclcpp::Subscription<std_msgs::msg::UInt16MultiArray>::SharedPtr sub_pwm_cmd_;
 

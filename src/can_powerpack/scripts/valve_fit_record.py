@@ -17,7 +17,7 @@ v2 는 두 모드에 모두 나오므로 독립 2회 피팅 → 교차검증이 
   · pp_controller 를 띄우지 말 것. 같은 board/pwm_cmd 에 발행하고 중재가 없어서 500 Hz 로 덮어쓴다
     (valve_operate:false 도 소용없다 — 그 경우 전부 0을 발행한다). 시작 시 자동 검사한다.
   · can_bridge_node 만 기동:
-      ros2 run can_powerpack can_bridge_node --ros-args --namespace pack2 \
+      ros2 run can_powerpack can_bridge_node --ros-args -r __ns:=/pack2 \
           --params-file <powerpack_config.yaml>
   · 라인압은 외부 레귤레이터로 사람이 유지한다. 이 스크립트는 **감시만** 하고 제어하지 않는다.
   · 이젝터는 쓰지 않는다. board 4 라인에 외부 진공을 직접 인가하고 MacroSwitch 는 닫아 둔다.

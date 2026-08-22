@@ -55,7 +55,7 @@ def _launch_setup(context, *_args, **_kwargs):
     virt_cfg = os.path.join(pkg_share, 'config', 'virtual_powerpack.yaml')
     # 머신 생성 파라미터 파일들 — 있으면 손으로 쓴 설정 **뒤에** 병합해 덮어쓴다
     fitted = [os.path.join(pkg_share, 'config', n)
-              for n in ('valve_params.yaml', 'pump_params.yaml')]
+              for n in ('valve_params.yaml', 'pump_params.yaml', 'encoder_params.yaml')]
     fitted = [f for f in fitted if os.path.exists(f)]
 
     actuator_connected = LaunchConfiguration('actuator_connected').perform(context) == 'true'

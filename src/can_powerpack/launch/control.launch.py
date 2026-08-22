@@ -12,7 +12,7 @@ def _setup(context, *_a, **_k):
     # 머신 생성 파라미터 — 있으면 손으로 쓴 설정 **뒤에** 병합해 덮어쓴다
     _share = os.path.dirname(os.path.dirname(config_path))
     fitted = [os.path.join(_share, 'config', n)
-              for n in ('valve_params.yaml', 'pump_params.yaml')]
+              for n in ('valve_params.yaml', 'pump_params.yaml', 'encoder_params.yaml')]
     fitted = [f for f in fitted if os.path.exists(f)]
 
     monitor_path = os.path.join(pkg_prefix, 'lib', 'can_powerpack', 'pp_monitor.py')

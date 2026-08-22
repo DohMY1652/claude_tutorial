@@ -76,8 +76,9 @@ dt 를 **항상 `period_ms` 로 가정**한다. 실기에서는 CAN 이 그 주�
 실측에 맞춘다. (개발 기계 시뮬에서는 2.09 ms 였다 — 가정 2.0 대비 +4.3%.)
 
 **③ 센서·엔코더 캘리브레이션.** yaml 의 값은 이 하드웨어 기준이다. 압력 보드는 1~16 이
-있고 **엔코더 board 20·21·22 만 있다**(6축인데 3축). 액추에이터를 붙여 축을 늘리기 전에
-2점 캘리브레이션이 필요하다 (README 0절).
+있고 **엔코더는 board 17·18·19 만 있다**(6축인데 3축) — 20·21·22 는 일반 기본값으로 돈다.
+그 기본값은 실측된 세 보드와 **gain 부호가 반대**여서 축 3·4·5 의 각도가 반대 방향으로
+읽힌다. 액추에이터를 붙이기 전에 2점 캘리브레이션이 필요하다 (**0.5절**).
 
 ### 그 기계의 Claude Code 에 맥락 주기
 
@@ -125,7 +126,7 @@ false` 도 해결책이 아니다 — 그 경우 pp_controller 가 500 Hz 로 �
 
 ```bash
 ros2 run can_powerpack can_bridge_node \
-     --ros-args --namespace pack2 --params-file config/powerpack_config.yaml
+     --ros-args -r __ns:=/pack2 --params-file config/powerpack_config.yaml
 ```
 
 `run_powerpack.sh` 는 pp_controller 를 같이 띄우므로 **쓰지 않는다.**
@@ -141,6 +142,124 @@ python3 scripts/can_monitor.py            # 압력이 정상 범위인지 눈으
 `board/sensors`·`board/currents` 는 **mV** 다 (kPa 아님). 전류는 `mA = mV/10`.
 
 ---
+
+---
+
+## 0.5 엔코더 캘리브레이션 (액추에이터 붙이기 전 1회)
+
+밸브·펌프 피팅과 **독립**이고, **액추에이터를 붙이는 실험(4.5절 2단계) 전에 반드시** 끝내야 한다.
+무액추에이터 실험(4.5절 1단계)에는 필요 없다 — 각도를 안 쓰기 때문이다.
+
+### 왜 — 6축인데 실측이 3개뿐이고, 기본값은 부호가 반대다
+
+`config/powerpack_config.yaml` 의 `EncoderCalibration.boards` 에는 **board 17·18·19 만** 있다.
+20·21·22 는 일반 기본값(`encoder_offset: 1740.0`, `encoder_gain: 0.07570`)으로 돈다.
+
+문제는 정확도가 아니라 **부호**다. 실측된 세 보드에서 계산되는 gain 은 전부 **음수**다:
+
+| board | 축 | raw 0° → 90° | offset [mV] | gain [deg/mV] |
+|---|---|---|---|---|
+| 17 | 0 | 1200 → 2470 | 3827.84 | **−0.072549** |
+| 18 | 1 | 860 → 2000 | 4159.95 | **−0.080822** |
+| 19 | 2 | 2115 → 3155 | 2934.07 | **−0.088594** |
+| (기본값) | 3·4·5 | — | 1740.00 | **+0.075703** |
+
+반전증폭 때문에 raw 가 커지면 `orig_mV` 가 작아지므로, 각도가 커질 때 gain 은 음수가 되는 게
+정상이다. 기본값만 **양수** — 즉 **축 3·4·5 는 지금 각도가 반대 방향으로 읽힌다.**
+
+위치 제어(`control_mode: 2`)에서 각도 부호가 뒤집히면 오차 부호도 뒤집혀서 제어기가 목표에서
+**멀어지는 방향으로** 구동한다. 되돌아오지 않고 포화까지 간다. 그래서 이건 정밀도 문제가 아니라
+**안전 문제**다. 캘리브레이션 없이 축 3·4·5 에 액추에이터를 붙이지 말 것.
+
+브리지가 기동할 때 활성 엔코더 중 실측값이 없는 보드가 있으면 이 내용을 `ERROR` 로 찍는다:
+
+```
+엔코더 캘리브레이션 없음: board 20, 21, 22 — 일반 기본값(...)으로 돈다.
+실측된 보드들은 gain 이 모두 **음수**인데 이 기본값은 **양수**다 → ...
+```
+
+### 무엇을 재는가 — raw 2점만
+
+`CanBridge` 와 같은 식이다 (`src/CanBridge.cpp`):
+
+```
+orig_mV = (4125 − raw·3300/4095) / 0.825      (반전증폭 역산)
+offset  = orig_mV(0°)
+gain    = 90 / (orig_mV(90°) − orig_mV(0°))
+angle   = (orig_mV − offset) · gain
+```
+
+그래서 yaml 에는 **raw 두 점만** 적는다. offset/gain 은 브리지가 기동 시에 계산한다 —
+값이 두 곳에서 갈릴 여지를 없앤다. 스크립트가 화면에 보여주는 offset/gain 은 참고용이다.
+
+`board/analog` 은 **이미 캘리브레이션이 적용된 각도**라 캘리브레이션 자체에 쓸 수 없다.
+그래서 브리지가 `board/analog_raw` (UInt16MultiArray, 생 ADC) 를 함께 발행한다.
+
+### 준비
+
+브리지 **하나만** 띄운다. `pp_controller` 는 절대 띄우지 않는다.
+
+```bash
+ros2 run can_powerpack can_bridge_node --ros-args -r __ns:=/pack2 \
+  --params-file src/can_powerpack/config/powerpack_config.yaml \
+  -p num_actuators:=6
+```
+
+* `num_actuators:=6` 이 있어야 board 17~22 가 모두 활성화된다 (`ANALOG_BOARD_START = 17`).
+* 브리지는 기동 즉시 **안전 상태**(채널 밸브 전부 폐쇄 + 릴리프·급기 라인 밸브 전개)로 간다.
+  레일이 대기압으로 열려 있어 축을 손으로 움직일 수 있다.
+* **펌프는 끈다.** 압력이 걸리면 축이 손으로 안 움직이고 위험하다.
+
+### 절차
+
+```bash
+python3 src/can_powerpack/scripts/encoder_calib.py --axes 0 1 2 3 4 5
+```
+
+축마다: 0° 기준 자세로 두고 Enter → 2초 평균 → 90° 자세로 두고 Enter → 2초 평균.
+`s` 로 건너뛰고 `q` 로 끝낸다. 이미 실측값이 있는 축 0·1·2 도 다시 재면 검증이 된다
+(기존 raw 와 크게 다르면 그 사이에 축을 손댔다는 뜻이다).
+
+0°/90° 는 **기계적 기준 자세**여야 한다 — 지그·스토퍼·각도기. 두 점이 정확한 만큼만
+전 구간이 정확하다.
+
+두 개의 게이트가 잘못된 값을 막는다:
+
+| 게이트 | 기본값 | 걸리면 |
+|---|---|---|
+| `--max-std` | 8 LSB | 자세가 안 잡혔거나 진동 중이다 → 다시 잰다 |
+| `--min-span` | 200 LSB | 기준 자세가 잘못됐거나 그 구간에서 엔코더가 안 움직인다 → **저장하지 않는다** |
+
+결과는 `config/encoder_params.yaml` 에 쓰인다. `launch/control.launch.py` 와
+`virtual.launch.py` 가 `powerpack_config.yaml` **뒤에** 병합하므로 손으로 쓴 설정을 덮어쓴다.
+파일이 없으면 그냥 넘어간다.
+
+### 끝나고 확인
+
+```bash
+colcon build --packages-select can_powerpack --cmake-args -DCMAKE_BUILD_TYPE=Release
+```
+
+**재빌드가 필요하다** — launch 는 `install/.../share` 의 config 를 읽는다.
+
+브리지를 다시 띄우고:
+
+1. 기동 로그에 `엔코더 board N: offset ... gain ... (실측)` 이 6줄 나오고
+   `엔코더 캘리브레이션 없음` ERROR 이 **사라졌는지**.
+2. `ros2 topic echo /pack2/board/analog` 로 두 기준 자세에서 각도가 0°/90° 근처인지.
+3. 축을 0° → 90° 로 움직일 때 각도가 **증가**하는지 (부호 확인. 감소하면 두 점이 뒤바뀐 것이다).
+
+### 시뮬로 예행연습
+
+시뮬도 `board/analog_raw` 를 발행하므로 하드웨어 없이 스크립트를 돌려볼 수 있다.
+시뮬 축은 안 움직이니 `--min-span` 에서 거부되는 것이 정상이다 — 수신·표본추출 경로만 본다.
+
+```bash
+ros2 run can_powerpack virtual_powerpack --ros-args -r __ns:=/pack2 \
+  --params-file src/can_powerpack/config/virtual_powerpack.yaml -p num_actuators:=6 &
+python3 src/can_powerpack/scripts/encoder_calib.py --axes 0 --seconds 1.0 \
+  --out /tmp/enc_test.yaml
+```
 
 ## 1. 파트 A — 밸브 36개
 
@@ -468,10 +587,12 @@ python3 src/can_powerpack/scripts/position_ref_client.py 127.0.0.1 2293 --once 3
 `actuator_connected:=true` 로 바꾸고 같은 순서를 반복한다. 이때부터 **축이 실제로 움직인다.**
 
 - 각도 목표는 작게 시작한다 (예 10° → 20° → 45°).
-- 엔코더 캘리브레이션이 **board 20·21·22 만 있고 나머지가 없다**(README 0절). 축을 6개까지
-  늘리려면 그 전에 2점 캘리브레이션을 해야 한다. 안 하면 각도가 틀린 상태로 위치 제어를
-  하게 된다 — 1단계(무액추에이터)는 각도를 힘 지령으로만 쓰므로 영향이 적지만
-  2단계는 직접 영향을 받는다.
+- **엔코더 캘리브레이션을 먼저 끝냈는지 확인한다 (0.5절).** 실측값은 board 17·18·19 뿐이고
+  20·21·22 는 일반 기본값으로 도는데, 그 기본값은 **gain 부호가 반대**다 → 축 3·4·5 는
+  각도가 거꾸로 읽힌다. 위치 제어에서 각도 부호가 뒤집히면 오차 부호도 뒤집혀 제어기가
+  목표에서 **멀어지는 방향으로** 구동하고 포화까지 간다. 1단계(무액추에이터)는 각도를
+  쓰지 않아 무해했지만 2단계는 직접 맞는다. 브리지 기동 로그에
+  `엔코더 캘리브레이션 없음: board ...` ERROR 가 있으면 **여기서 멈추고 0.5절을 먼저 한다.**
 
 ### 4.5.4 무엇을 보면서 돌리나
 

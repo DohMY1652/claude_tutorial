@@ -24,7 +24,7 @@ v1(micro)만 레일에 붙으므로 채널 PWM 을 전부 0 으로 두면 끊긴
 ── 전제 조건 ────────────────────────────────────────────────────────────────
   · pp_controller 를 띄우지 말 것 (같은 board/pwm_cmd 에 중재 없이 발행). 시작 시 검사한다.
   · can_bridge_node 만 기동:
-      ros2 run can_powerpack can_bridge_node --ros-args --namespace pack2 \
+      ros2 run can_powerpack can_bridge_node --ros-args -r __ns:=/pack2 \
           --params-file src/can_powerpack/config/powerpack_config.yaml
   · 펌프 on/off 는 **수동 스위치**다. 프롬프트에서 직접 조작한다 (타이밍 정확도는 불필요).
   · 채널 밸브는 전부 닫힌 상태로 유지된다 (스크립트가 매 사이클 0 을 발행).

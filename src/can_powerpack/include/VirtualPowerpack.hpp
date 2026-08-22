@@ -250,6 +250,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::UInt16MultiArray>::SharedPtr    pub_sensors_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr   pub_currents_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr   pub_analog_;
+  rclcpp::Publisher<std_msgs::msg::UInt16MultiArray>::SharedPtr    pub_analog_raw_;
   rclcpp::Subscription<std_msgs::msg::UInt16MultiArray>::SharedPtr sub_pwm_cmd_;
   rclcpp::TimerBase::SharedPtr sim_timer_;
 };

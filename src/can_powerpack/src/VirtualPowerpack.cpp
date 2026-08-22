@@ -237,6 +237,8 @@ VirtualPowerpack::VirtualPowerpack(const rclcpp::NodeOptions& opts)
   pub_sensors_  = create_publisher<std_msgs::msg::UInt16MultiArray>("board/sensors",  10);
   pub_currents_ = create_publisher<std_msgs::msg::Float64MultiArray>("board/currents", 10);
   pub_analog_   = create_publisher<std_msgs::msg::Float64MultiArray>("board/analog",   10);
+  // raw ADC — scripts/encoder_calib.py 를 실기 전에 시뮬로 리허설할 수 있게 한다
+  pub_analog_raw_ = create_publisher<std_msgs::msg::UInt16MultiArray>("board/analog_raw", 10);
   sub_pwm_cmd_  = create_subscription<std_msgs::msg::UInt16MultiArray>(
       "board/pwm_cmd", rclcpp::QoS(10),
       std::bind(&VirtualPowerpack::on_pwm_cmd, this, std::placeholders::_1));
@@ -672,14 +674,20 @@ void VirtualPowerpack::publish_state()
   pub_currents_->publish(msg_c);
 
   // ── board/analog : boards 17~25 각도 [deg], raw ADC 왕복 후 발행 ─────────
+  // raw 도 함께 낸다 (CanBridge 와 동일 포맷) — scripts/encoder_calib.py 를 실기 전에
+  // 시뮬로 리허설할 수 있게 한다. 다른 도구들과 같은 방식이다.
   std_msgs::msg::Float64MultiArray msg_a;
+  std_msgs::msg::UInt16MultiArray msg_ar;
   msg_a.data.assign(NUM_ANALOG, 0.0);
+  msg_ar.data.assign(NUM_ANALOG, 0);
   for (int a = 0; a < num_actuators_ && a < NUM_ANALOG; ++a) {
     const int bid = ANALOG_BOARD_START + a;
     const uint16_t raw = deg_to_raw_adc(bid, actuators_[(size_t)a].theta_deg);
-    msg_a.data[(size_t)a] = raw_adc_to_deg(bid, raw);
+    msg_a.data[(size_t)a]  = raw_adc_to_deg(bid, raw);
+    msg_ar.data[(size_t)a] = raw;
   }
   pub_analog_->publish(msg_a);
+  pub_analog_raw_->publish(msg_ar);
 
   // 1초마다 상태 로그
   if (tick_ % (1000 / std::max(1, period_ms_)) == 0) {

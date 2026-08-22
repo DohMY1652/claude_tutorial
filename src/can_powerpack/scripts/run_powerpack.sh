@@ -6,12 +6,12 @@ CONFIG=$SHARE/config/powerpack_config.yaml
 MONITOR=$(ros2 pkg prefix can_powerpack)/lib/can_powerpack/pp_monitor.py
 
 ros2 run can_powerpack can_bridge_node \
-    --ros-args --namespace pack2 --params-file "$CONFIG" \
+    --ros-args -r __ns:=/pack2 --params-file "$CONFIG" \
     >/tmp/can_bridge.log 2>&1 &
 BRIDGE_PID=$!
 
 ros2 run can_powerpack pp_controller \
-    --ros-args --namespace pack2 --params-file "$CONFIG" \
+    --ros-args -r __ns:=/pack2 --params-file "$CONFIG" \
     >/tmp/pp_ctrl.log 2>&1 &
 CTRL_PID=$!
 

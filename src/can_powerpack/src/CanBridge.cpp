@@ -73,10 +73,38 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
       double orig_mv_90deg = raw_to_orig_mv(raw_90deg);
       enc_offset_[bid] = orig_mv_0deg;
       enc_gain_[bid]   = 90.0 / (orig_mv_90deg - orig_mv_0deg);
+      enc_measured_[bid] = true;
     } else {
       enc_offset_[bid] = declare_double_flexible(this, base + ".offset", enc_offset_[bid]);
       enc_gain_[bid]   = declare_double_flexible(this, base + ".gain",   enc_gain_[bid]);
+      enc_measured_[bid] = false;
     }
+  }
+
+  // ── 캘리브레이션 안 된 엔코더 경고 ──────────────────────────────────────
+  // **부호가 문제다.** 실측된 board 17·18·19 는 gain 이 모두 **음수**다
+  // (−0.0725 / −0.0808 / −0.0886 deg/mV — raw 가 커지면 orig_mV 가 줄어드는 반전증폭).
+  // 반면 기본값 `encoder_gain` 은 +0.0757 로 **부호가 반대**다. 즉 실측값이 없는 보드는
+  // 각도가 **반대 방향으로** 읽힌다. 위치 제어(control_mode 2)에서 각도 부호가 뒤집히면
+  // 오차 부호가 뒤집혀 목표에서 멀어지는 방향으로 구동된다 — 포화까지 간다.
+  // 그래서 활성 엔코더 중 미측정 보드가 있으면 강하게 경고한다.
+  {
+    std::string bad;
+    for (int bid : active_encoder_boards_)
+      if (bid >= ANALOG_BOARD_START && bid <= NUM_BOARDS && !enc_measured_[bid])
+        bad += (bad.empty() ? "" : ", ") + std::to_string(bid);
+    if (!bad.empty()) {
+      RCLCPP_ERROR(get_logger(),
+        "엔코더 캘리브레이션 없음: board %s — 일반 기본값(offset %.1f, gain %+.6f)으로 돈다. "
+        "실측된 보드들은 gain 이 모두 **음수**인데 이 기본값은 **양수**다 → 각도가 "
+        "반대 방향으로 읽힐 수 있다. 위치 제어 전에 "
+        "scripts/encoder_calib.py 로 2점 캘리브레이션할 것 (RUNBOOK.md 0.5절).",
+        bad.c_str(), enc_offset_default, enc_gain_default);
+    }
+    for (int bid : active_encoder_boards_)
+      if (bid >= ANALOG_BOARD_START && bid <= NUM_BOARDS && enc_measured_[bid])
+        RCLCPP_INFO(get_logger(), "엔코더 board %d: offset %.2f mV, gain %+.6f deg/mV (실측)",
+                    bid, enc_offset_[bid], enc_gain_[bid]);
   }
 
   targets_.resize(NUM_BOARDS + 1);
@@ -84,6 +112,12 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
   wd_timeout_ms_  = this->declare_parameter<int>("pwm_watchdog_ms", 200);
   wd_vent_index_  = this->declare_parameter<int>("pwm_watchdog_vent_index",  0);   // board1 v1
   wd_admit_index_ = this->declare_parameter<int>("pwm_watchdog_admit_index", 3);   // board2 v1
+
+  // **초기값을 안전 상태로 둔다.** targets_ 는 0 으로 시작하는데, 0 은 릴리프 밸브가
+  // **닫힌** 상태다 — 컨트롤러가 한 번도 붙지 않은 채 펌프가 돌면 양압 레일이 무한정
+  // 오른다 (엔코더 캘리브레이션처럼 브리지만 띄우는 작업에서 실제로 그렇게 된다).
+  // 워치독의 안전 상태와 같은 곳에서 시작한다: 채널 폐쇄 + 라인 밸브 전개.
+  apply_safe_state();
   RCLCPP_INFO(get_logger(),
     "PWM 워치독: %d ms (0=끔). 시한 초과 시 채널 밸브 폐쇄 + 라인 밸브(idx %d, %d) 전개",
     wd_timeout_ms_, wd_vent_index_, wd_admit_index_);
@@ -96,6 +130,10 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
   pub_sensors_  = this->create_publisher<std_msgs::msg::UInt16MultiArray>("board/sensors",  10);
   pub_currents_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("board/currents", 10);
   pub_analog_   = this->create_publisher<std_msgs::msg::Float64MultiArray>("board/analog",    10);
+  // 엔코더 **raw ADC**. board/analog 은 캘리브레이션이 적용된 각도라 캘리브레이션 자체에는
+  // 쓸 수 없다. can_monitor.py 처럼 CAN 을 직접 읽으면 can_bridge_node 와 핸들이 충돌하므로
+  // 여기서 토픽으로 낸다 → scripts/encoder_calib.py 가 이것을 받는다.
+  pub_analog_raw_ = this->create_publisher<std_msgs::msg::UInt16MultiArray>("board/analog_raw", 10);
 
   // Single flat PWM subscriber: board/pwm_cmd
   // Index (bid-1)*3 .. (bid-1)*3+2 = board bid v1/v2/v3
@@ -125,6 +163,27 @@ CanBridge::~CanBridge() {
   running_ = false;
   if (rx_thread_.joinable()) rx_thread_.join();
   close_can();
+}
+
+// 안전 상태 — 채널 밸브 폐쇄 + 라인 밸브 2개 전개.
+// **"전부 0" 은 안전이 아니다**: board1 v1 이 0 이면 릴리프가 닫혀 펌프가 양압 레일을
+// 무한정 올린다. 초기화와 워치독 트립이 같은 상태를 쓴다.
+// 호출자가 cmd_mtx_ 를 잡고 있거나(워치독) 아직 스레드가 없을 때(생성자) 부른다.
+void CanBridge::apply_safe_state() {
+  for (int bid = 1; bid <= PWM_BOARDS; ++bid) {
+    targets_[bid].v1 = 0; targets_[bid].v2 = 0; targets_[bid].v3 = 0;
+  }
+  auto open_slot = [&](int flat) {
+    if (flat < 0) return;
+    const int bid = flat / 3 + 1, v = flat % 3;
+    if (bid < 1 || bid > PWM_BOARDS) return;
+    const uint16_t FULL = 4095;
+    if (v == 0) targets_[bid].v1 = FULL;
+    else if (v == 1) targets_[bid].v2 = FULL;
+    else targets_[bid].v3 = FULL;
+  };
+  open_slot(wd_vent_index_);
+  open_slot(wd_admit_index_);
 }
 
 void CanBridge::init_can() {
@@ -281,6 +340,12 @@ void CanBridge::sensor_routine() {
     msg_a.data[i] = (orig_mv - enc_offset_[board_id]) * enc_gain_[board_id];
   }
   pub_analog_->publish(msg_a);
+
+  // raw ADC 도 함께 낸다 (활성 여부와 무관하게 전부 — 캘리브레이션 대상이 아직
+  // 활성화되지 않았을 수 있다).
+  std_msgs::msg::UInt16MultiArray msg_ar;
+  msg_ar.data.assign(a_raw.begin(), a_raw.end());
+  pub_analog_raw_->publish(msg_ar);
 }
 
 // TX: boards 1..18 packed into two CAN FD frames. Boards 19..25 are analog-only (no TX).
@@ -304,22 +369,7 @@ void CanBridge::tx_routine() {
             std::chrono::steady_clock::now() - last_cmd_).count();
         trip = (age_ms > (double)wd_timeout_ms_);
       }
-      if (trip) {
-        for (int bid = 1; bid <= PWM_BOARDS; ++bid) {
-          targets_[bid].v1 = 0; targets_[bid].v2 = 0; targets_[bid].v3 = 0;
-        }
-        auto open_slot = [&](int flat) {
-          if (flat < 0) return;
-          const int bid = flat / 3 + 1, v = flat % 3;
-          if (bid < 1 || bid > PWM_BOARDS) return;
-          const uint16_t FULL = 4095;
-          if (v == 0) targets_[bid].v1 = FULL;
-          else if (v == 1) targets_[bid].v2 = FULL;
-          else targets_[bid].v3 = FULL;
-        };
-        open_slot(wd_vent_index_);
-        open_slot(wd_admit_index_);
-      }
+      if (trip) apply_safe_state();
     }
     if (trip && !wd_tripped_) {
       wd_tripped_ = true;

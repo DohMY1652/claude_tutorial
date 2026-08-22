@@ -157,6 +157,7 @@ install(PROGRAMS
   scripts/dashboard.py
   scripts/ctrl_eval.py
   scripts/preflight.sh
+  scripts/encoder_calib.py
   scripts/can_monitor.py
   scripts/can_control.py
   scripts/can_test.py
