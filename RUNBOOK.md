@@ -8,6 +8,104 @@
 
 ---
 
+## 0.0 다른 컴퓨터에서 시작하기 (실기 기계 최초 설정)
+
+개발은 32코어 기계에서 했고 **실기는 다른 컴퓨터에서 한다.** 넘어가는 방법과, 그 기계에서
+달라지는 것들이다.
+
+### 코드 가져오기
+
+바이너리는 옮길 수 없다 (`-march=native` 를 쓴다). **저장소를 받아 그 기계에서 빌드한다.**
+`build/`·`install/` 은 gitignore 돼 있어 클론이 깨끗하다 (추적 파일 135개).
+
+```bash
+git clone https://github.com/DohMY1652/claude_tutorial.git ~/claude_tutorial
+cd ~/claude_tutorial
+git checkout feat/mppi-controller        # ← 이 브랜치다 (master 아님)
+```
+
+> 경로를 `~/claude_tutorial` 로 맞추는 것을 권한다 — `scripts/run_powerpack.sh` 와 이 문서의
+> 명령이 그 경로를 쓴다.
+
+### 필요한 것
+
+| | |
+|---|---|
+| ROS 2 | foxy (`source /opt/ros/foxy/setup.bash`) |
+| 빌드 | `colcon`, `libeigen3-dev` |
+| qpOASES | **받을 것 없다** — `src/qpoases_vendor` 로 워크스페이스에 들어 있다 |
+| Python | `numpy`, `pyyaml` (피팅 코드용. scipy 는 필요 없다) |
+| **Kvaser canlib** | **없으면 `can_bridge_node` 가 아예 빌드되지 않는다 → 실기 불가.** `find_library(canlib)` 로 조건 빌드다 |
+
+```bash
+source /opt/ros/foxy/setup.bash
+colcon build --packages-select qpoases_vendor can_powerpack \
+             --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
+```
+
+### 사전 점검 — 스크립트가 대신 해 준다
+
+```bash
+bash src/can_powerpack/scripts/preflight.sh
+```
+
+코어 수·ROS·canlib·빌드 산출물·피팅 파일·남은 노드를 확인하고, **코어 수에 맞는 실시간
+설정을 권고**한다. 실기 기계에서 처음 할 일이다.
+
+### 기계가 달라서 바뀌는 것 — 세 가지
+
+**① 실시간 예산.** 이 저장소의 성능 수치는 32코어에서 측정했다. 스레드 풀은
+`min(12, 코어수)` 개를 만들고 워커 `i` 를 CPU `i` 에 고정한다. **코어가 적으면 워커가 모든
+코어를 점유해 ROS 실행기·CAN 수신 스레드와 경합하고, 그게 지터가 된다.** 코어 2개를
+남기도록 줄이는 것을 권한다 (preflight 가 구체적인 값을 알려준다):
+
+```bash
+ros2 launch can_powerpack control.launch.py \
+     overrides:=enable_thread_pinning=false     # 가장 간단한 회피
+# 또는 cpu_pins 를 줄인다 (yaml 또는 overrides)
+```
+
+표본 수도 낮춰 시작한다: `overrides:=MPC_parameters.mppi_samples=64,MPC_parameters.sys_samples=64`.
+그리고 로그의 `MPPI: ... us 최대` 가 틱 예산의 60% 를 넘으면 `mppi_substeps`→1, 그다음
+`period_ms` 를 4(250 Hz)로 올린다.
+
+**② 실제 틱 간격.** 컨트롤러는 rclcpp 타이머 없이 `board/sensors` 도착 이벤트로 돌면서
+dt 를 **항상 `period_ms` 로 가정**한다. 실기에서는 CAN 이 그 주기를 정한다.
+`틱 간격이 가정과 다르다` 경고가 나오면 그 괴리가 곧 모델 오차이므로 `period_ms` 를
+실측에 맞춘다. (개발 기계 시뮬에서는 2.09 ms 였다 — 가정 2.0 대비 +4.3%.)
+
+**③ 센서·엔코더 캘리브레이션.** yaml 의 값은 이 하드웨어 기준이다. 압력 보드는 1~16 이
+있고 **엔코더 board 20·21·22 만 있다**(6축인데 3축). 액추에이터를 붙여 축을 늘리기 전에
+2점 캘리브레이션이 필요하다 (README 0절).
+
+### 그 기계의 Claude Code 에 맥락 주기
+
+세션이 직접 연결되지는 않는다. **문서가 그 역할을 한다** — 그래서 전부 커밋해 뒀다.
+그 기계에서 Claude Code 를 열고 이렇게 시작하면 된다:
+
+```
+브랜치 feat/mppi-controller 다. RUNBOOK.md 0.0 절과 4.5 절, MPPI.md 를 읽고
+preflight.sh 를 돌려서 이 기계에 맞는 설정을 알려줘. 그 다음 실기 피팅부터 진행한다.
+```
+
+읽을 것과 순서:
+
+| 문서 | 내용 |
+|---|---|
+| `RUNBOOK.md` **0.0** | 이 절 — 기계 설정 |
+| `RUNBOOK.md` **1·2** | 밸브·펌프 피팅 절차 |
+| `RUNBOOK.md` **3** | 피팅 결과를 컨트롤러에 반영·확인 |
+| `RUNBOOK.md` **4.5** | **제어기 실험 순서와 스위치** (오늘 할 것) |
+| `RUNBOOK.md` **6** | 증상별 조치표 |
+| `MPPI.md` | MPPI 제어기 설명서. 10절에 "무엇을 시도해 안 됐는지" |
+| `README.md` 0절 | 현재 상태·아직 추정값인 파라미터 |
+
+이 저장소는 **왜 그렇게 했는지**를 코드 주석과 문서에 남기는 방식으로 쓰여 있다. 값을
+바꾸기 전에 그 근거를 먼저 읽는 편이 빠르다.
+
+---
+
 ## 0. 시작 전 (매번)
 
 ```bash

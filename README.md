@@ -11,6 +11,10 @@ ROS 2 (foxy) 패키지. 6개 공압 액추에이터의 위치를 제어하며, �
 
 ---
 
+> **다른 컴퓨터(실기 기계)에서 시작한다면 [`RUNBOOK.md`](RUNBOOK.md) 0.0 절부터.**
+> 클론·빌드·기계별로 달라지는 것(실시간 예산·틱 간격·캘리브레이션)과
+> `scripts/preflight.sh` 사전 점검이 거기 있다.
+>
 > **실기에서 피팅을 진행할 때는 [`RUNBOOK.md`](RUNBOOK.md) 를 볼 것.** 이 문서는 배경·이론·경과이고,
 > 런북은 순서와 손이 할 일만 담은 절차서다.
 >
@@ -966,6 +970,7 @@ src/can_powerpack/
   scripts/pump_fit_*.py              펌프 파라미터 피팅 도구 (5절)
   include/Mppi.hpp, src/Mppi.cpp     채널 MPC 의 MPPI 솔버 (MPPI.md)
   scripts/ctrl_eval.py               제어 성능 평가 하네스 (qp vs mppi A/B)
+  scripts/preflight.sh               실기 기계 사전 점검 (RUNBOOK 0.0)
   config/valve_params.yaml           밸브 피팅 산물 (머신 생성, launch 가 뒤에 병합)
   config/pump_params.yaml            펌프 피팅 산물 (머신 생성, 측정 테이블이 1차 산출물)
   scripts/can_monitor.py             센서 모니터 (캘리브레이션 테이블이 yaml 과 일치)
