@@ -380,6 +380,13 @@ def plot_fit(rec, params, seg, outpath):
 
 
 def main():
+    # `| tee` 처럼 stdout 이 파이프면 Python 이 블록 버퍼링(8 KB)으로 바뀌어, 수십 분짜리
+    # 실행에서 화면에 아무것도 안 뜬다 (로그 파일도 0 바이트). 진행 상황을 봐야 하는
+    # 도구이므로 줄 단위로 흘려보낸다.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:
+        pass
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('indir', help='valve_fit_record.py 출력 디렉터리')
