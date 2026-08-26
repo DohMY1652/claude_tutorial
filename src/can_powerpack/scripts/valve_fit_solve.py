@@ -389,7 +389,12 @@ def main():
     print('Step 1 — CSV 로드')
     runs = load_runs(args.indir)
 
-    # (mode, gid, valve) → {extra_ml: record}
+    # (mode, gid, valve) → {extra_ml: [(line_kpa, record), ...]}
+    #
+    # 예전에는 extra_ml 하나당 record 하나였다. 그래서 라인압을 바꿔 가며 여러 회차를
+    # 넣어도 **마지막 것만 남고** 나머지가 조용히 사라졌다 — C_p(상류압이 스풀을 돕는 항)
+    # 는 라인압이 변해야 식별되는데, 그 데이터가 버려지고 있었다. 이제 라인압별로 모두
+    # 모아 하나의 다중 세그먼트 피팅에 넣는다 (vm.fit / global_sse 는 원래 리스트를 받는다).
     print('\nStep 1b — 기록 재구성')
     recs = defaultdict(dict)
     for run in runs:
@@ -407,9 +412,11 @@ def main():
                 rec = build_record(run['rows'], mode, gid, valve, args.decimate, fv_side)
                 if rec is None:
                     continue
-                recs[(mode, gid, valve)][run['extra_ml']] = rec
+                line_kpa = float(run['meta'].get('line_kpa', 0.0))
+                recs[(mode, gid, valve)].setdefault(run['extra_ml'], []).append((line_kpa, rec))
                 print(f'  {mode} gid{gid} {valve}: {len(rec["t"])} 샘플 '
-                      f'(유효 {int(rec["mask"].sum())}), ΔV={run["extra_ml"]:.0f}')
+                      f'(유효 {int(rec["mask"].sum())}), ΔV={run["extra_ml"]:.0f}, '
+                      f'라인 {line_kpa:.0f} kPa')
     if not recs:
         raise SystemExit('재구성할 기록이 없다 — CSV 의 phase/valve 태그를 확인할 것')
 
@@ -426,8 +433,19 @@ def main():
             if valve not in ('v1', 'v3') or gid in volumes:
                 continue
             if 0.0 in by_v and args.extra_volume_ml in by_v:
-                v_ml, r, n, sd = solve_volume(by_v[0.0], by_v[args.extra_volume_ml],
-                                              args.extra_volume_ml)
+                # 이중 부피법은 **부피만 다른 두 회차**를 비교한다 — 라인압이 다르면
+                # 조건이 둘 다 달라져 비율이 부피비가 아니게 된다. 같은 라인압끼리 짝짓는다.
+                a, b = dict(by_v[0.0]), dict(by_v[args.extra_volume_ml])
+                common = sorted(set(a) & set(b))
+                if common:
+                    lk = common[0]
+                    r0, r1 = a[lk], b[lk]
+                    print(f'  gid{gid}: 이중 부피법 라인압 {lk:.0f} kPa 짝 사용')
+                else:
+                    r0, r1 = by_v[0.0][0][1], by_v[args.extra_volume_ml][0][1]
+                    print(f'  gid{gid}: 경고 — ΔV 회차와 라인압이 일치하는 짝이 없다 '
+                          f'({sorted(a)} vs {sorted(b)}). 첫 회차끼리 비교한다.')
+                v_ml, r, n, sd = solve_volume(r0, r1, args.extra_volume_ml)
                 if v_ml:
                     volumes[gid] = v_ml
                     vol_diag[gid] = dict(ratio=r, n_bins=n, ratio_std=sd)
@@ -448,33 +466,52 @@ def main():
         if gid not in volumes:
             print(f'  {mode} gid{gid} {valve}: 부피 미확정 — 건너뜀')
             continue
-        rec = by_v.get(0.0) or next(iter(by_v.values()))
+        rec_list = by_v.get(0.0) or next(iter(by_v.values()))
         v_m3 = volumes[gid] * 1e-6
-
-        rate = rec['rate']
         sign = +1 if mode.startswith('pos') else -1
         flow_sign = sign if valve in ('v1', 'v3') else -sign   # 중립밸브는 반대 방향
-        q_meas = vm.q_from_dpdt(rate * flow_sign, v_m3, args.n_poly)
 
-        seg = vm.prepare_segment(rec['t'], rec['I'], rec['p_in'], rec['p_out'], q_meas)
-        seg['mask'] = rec['mask']
-        seg['q0'] = 0.0                                     # 스윕 시작 시 밸브 폐쇄
-        seg['q_ref'] = float(np.mean(np.abs(seg['Q'][rec['mask']]))) if rec['mask'].any() else 0.0
+        segs, lines = [], []
+        for line_kpa, r_ in sorted(rec_list):
+            q_meas = vm.q_from_dpdt(r_['rate'] * flow_sign, v_m3, args.n_poly)
+            sg = vm.prepare_segment(r_['t'], r_['I'], r_['p_in'], r_['p_out'], q_meas)
+            sg['mask'] = r_['mask']
+            sg['q0'] = 0.0                                  # 스윕 시작 시 밸브 폐쇄
+            sg['q_ref'] = (float(np.mean(np.abs(sg['Q'][r_['mask']])))
+                           if r_['mask'].any() else 0.0)
+            segs.append(sg); lines.append(line_kpa)
+        rec = sorted(rec_list)[0][1]      # 오리피스 진단·플롯용 대표 회차
+        seg = segs[0]
 
         warm_vec = warm_start.get((gid, valve))
         base = [vm.BASE_INITIAL, warm_vec] if warm_vec is not None else None
 
-        print(f'\n  {mode} gid{gid} {valve} (V={volumes[gid]:.2f} mL)'
+        print(f'\n  {mode} gid{gid} {valve} (V={volumes[gid]:.2f} mL, '
+              f'라인 {[f"{x:.0f}" for x in lines]} kPa × {len(segs)} 회차)'
               + ('  [웜스타트 있음]' if warm_vec is not None else ''))
-        params, err, r2, diag = vm.fit([seg], base=base, n_samples=args.samples,
+        if len({round(x) for x in lines}) < 2:
+            print('    ! 라인압이 한 종류뿐이다 — C_p(상류압 항)와 C_k(스프링 예압)가 '
+                  '축퇴해 각각 식별되지 않는다. C_p 가 탐색 상한(2.0e-3)에 붙어 나오면 '
+                  '그 신호다. 라인압을 바꿔 가며 회차를 늘릴 것.')
+        params, err, r2, diag = vm.fit(segs, base=base, n_samples=args.samples,
                                        n_starts=args.starts, seed=args.seed)
-        sens = vm.sensitivity(params, [seg])
+        sens = vm.sensitivity(params, segs)
         weak = [k for k, v in sens.items() if v < 1e-4]
         print(f'    SSE={err:.4g}  R²={r2:.4f}' + (f'  식별성 낮음: {weak}' if weak else ''))
 
+        deg, p_ref = cp_ck_degeneracy(params, segs)
+        if not (deg > 1e-3):
+            print(f'    ! C_p/C_k 축퇴 (이 방향 ΔSSE {deg:.1e}, P_ref={p_ref:.0f} kPa abs). '
+                  f'상류압이 사실상 한 점이라 두 파라미터가 분리되지 않는다 — C_p 가 상한 '
+                  f'{vm.PARAM_BOUNDS["C_p"][1]:.1e} 에 붙어 나오면 그 값은 데이터가 아니라 '
+                  f'경계다. 라인압을 바꿔 가며 회차를 늘릴 것.')
+        else:
+            print(f'    C_p/C_k 분리도 {deg:.3f} (P_ref={p_ref:.0f} kPa abs)')
+
         fits[(mode, gid, valve)] = dict(params=params, sse=err, r2=r2,
                                         sens=sens, weak=weak, diag=diag,
-                                        volume_ml=volumes[gid])
+                                        volume_ml=volumes[gid],
+                                        cp_ck_deg=float(deg), lines_kpa=list(lines))
 
         d_mm = ORIFICE_MM.get((mode, valve))
         if d_mm:
@@ -485,8 +522,10 @@ def main():
                 orif[(mode, valve)] = oc
 
         if not args.no_plots:
-            png = os.path.join(outdir, f'fit_{mode}_ch{gid}_{valve}.png')
-            plot_fit(rec, params, seg, png)
+            for (line_kpa, r_), sg in zip(sorted(rec_list), segs):
+                png = os.path.join(outdir,
+                                   f'fit_{mode}_ch{gid}_{valve}_line{int(round(line_kpa))}.png')
+                plot_fit(r_, params, sg, png)
 
     # ── Step 5: 출력 ──
     print('\nStep 5 — 결과 저장')
@@ -497,6 +536,34 @@ def main():
     if not args.no_plots:
         print(f'  fit_*.png ({len(fits)}개)')
     return 0
+
+
+def cp_ck_degeneracy(params, segs):
+    """C_p·Pin − C_k 축퇴 정도. 반환: (상대 SSE 변화, 보상 기준압 P_ref [kPa abs]).
+
+    C_p 를 두 배로 올리고 C_k 를 그만큼(δ·P_ref) 보상하면, 상류압이 P_ref 하나뿐인
+    데이터에서는 F_net = I + C_z·z + C_p·Pin − C_k 가 **정확히** 그대로다. 즉 SSE 가
+    전혀 안 변하고, 두 파라미터는 데이터로 분리되지 않는다. 상류압이 여러 값이면
+    그만큼 SSE 가 움직인다.
+
+    vm.sensitivity() 로는 이걸 잡을 수 없다 — 파라미터를 하나씩 흔들어 국소 곡률만
+    보기 때문이다. 합성 데이터 계측: 단일 라인압에서도 C_p 민감도는 6e-2 로 멀쩡해
+    보였지만, 이 방향으로는 SSE 변화가 0.00e+00 이었다. 실기 피팅의 C_p 가 탐색 상한
+    2.0e-3 에 정확히 걸려 나온 것이 바로 이 축퇴의 결과다.
+    """
+    i_p = vm.PARAM_NAMES.index('C_p')
+    i_k = vm.PARAM_NAMES.index('C_k')
+    pin = np.concatenate([(s['P_in'][s['mask']] if s['mask'].any() else s['P_in'])
+                          for s in segs])
+    p_ref = float(np.mean(pin))
+    base = vm.global_sse(params, segs)
+    if not (base > 0):
+        return float('nan'), p_ref
+    q = np.array(params, dtype=float)
+    d = q[i_p] if q[i_p] > 0 else 1e-4
+    q[i_p] += d
+    q[i_k] += d * p_ref
+    return abs(vm.global_sse(q, segs) - base) / base, p_ref
 
 
 def write_yaml(outdir, fits, volumes, orif, args):
@@ -515,6 +582,8 @@ def write_yaml(outdir, fits, volumes, orif, args):
         entry['_fit'] = dict(mode=mode, r2=float(round(fit['r2'], 5)),
                              sse=float(f"{fit['sse']:.6g}"),
                              volume_ml=float(round(fit['volume_ml'], 3)),
+                             lines_kpa=[float(x) for x in fit.get('lines_kpa', [])],
+                             cp_ck_deg=float(fit.get('cp_ck_deg', float('nan'))),
                              weak_params=fit['weak'])
         ch[f'ch{gid}'][valve_role[valve]] = entry
     for gid, v in volumes.items():

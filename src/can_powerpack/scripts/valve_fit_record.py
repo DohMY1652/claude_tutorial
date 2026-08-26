@@ -835,7 +835,11 @@ def main():
         except Exception as exc:
             print(f'  경고: 안전 상태 전환 실패 ({exc}) — 밸브를 직접 확인할 것')
 
-        path = os.path.join(outdir, f'{args.mode}_vol{int(args.extra_volume_ml)}.csv')
+        # 파일명에 **라인압을 넣는다.** C_p(상류압 항)를 식별하려면 라인압을 바꿔 가며
+        # 여러 회차를 같은 디렉터리에 모아야 하는데, 예전 이름은 mode+ΔV 뿐이라
+        # 두 번째 회차가 첫 회차를 그대로 덮어썼다.
+        stem = f'{args.mode}_vol{int(args.extra_volume_ml)}_line{int(round(args.line_kpa))}'
+        path = os.path.join(outdir, stem + '.csv')
         with open(path, 'w', newline='') as f:
             w = csv.writer(f)
             w.writerow(CSV_HEADER)
@@ -847,8 +851,7 @@ def main():
                     levels=list(args.levels), log_hz=args.log_hz,
                     config=os.path.abspath(cfg), rows=len(node.rows),
                     recorded_at=datetime.now().isoformat(timespec='seconds'))
-        with open(os.path.join(outdir, f'{args.mode}_vol{int(args.extra_volume_ml)}.meta.yaml'),
-                  'w') as f:
+        with open(os.path.join(outdir, stem + '.meta.yaml'), 'w') as f:
             yaml.safe_dump(meta, f, allow_unicode=True, sort_keys=False)
         print(f'저장: {path}  ({len(node.rows)} 행, 완료 채널 {completed})')
 
