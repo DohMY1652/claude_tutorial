@@ -38,9 +38,9 @@ import valve_fit_model as vm   # noqa: E402
 # 각 밸브 경로의 기하 오리피스 지름 [mm] — PressureRefGen.orifice_mm 와 같은 출처
 ORIFICE_MM = {
     ('pos_micro', 'v1'): 2.3,   # fill   레일 → 양압 챔버
-    ('pos_micro', 'v2'): 4.0,   # vent   양압 챔버 → 대기
+    ('pos_micro', 'v2'): 2.3,   # vent   양압 챔버 → 대기 (실측 2.3 mm)
     ('pos_macro', 'v3'): 1.6,   # boost  탱크 → 양압 챔버
-    ('pos_macro', 'v2'): 4.0,   # vent
+    ('pos_macro', 'v2'): 2.3,   # vent   pos_micro 의 v2 와 같은 물리 밸브다
     ('neg_micro', 'v1'): 4.0,   # suck   음압 챔버 → 음압 레일
     ('neg_micro', 'v2'): 4.0,   # admit  대기 → 음압 챔버
     ('neg_macro', 'v3'): 4.0,   # eject  음압 챔버 → 외부 진공
