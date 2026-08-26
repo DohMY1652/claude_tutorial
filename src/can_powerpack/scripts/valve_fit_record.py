@@ -42,6 +42,7 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
 
 import rclpy
@@ -356,6 +357,45 @@ class Recorder(Node):
 # ══════════════════════════════════════════════════════════════════════════
 # 스윕 시퀀스
 # ══════════════════════════════════════════════════════════════════════════
+# ── 압력 변화율 추정 ────────────────────────────────────────────────────────
+# board/sensors 는 uint16 mV 이고 양압 채널 gain 이 0.250 kPa/mV 이므로 **1 LSB =
+# 0.25 kPa** 다. 10 ms 단순 차분으로 미분하면 양자화만으로 ±25 kPa/s 가 나온다 —
+# settle_eps(기본 2 kPa/s) 의 12 배라 '정착' 판정이 성립할 수가 없었다.
+# → 창 최소자승 기울기를 쓴다. 창을 둘로 나누는 이유는 용도가 반대이기 때문이다:
+#   · 예측 정지는 **지연**이 치명적이다 (지연이 lead_s 보다 크면 예측이 뒤처진다)
+#   · 정착 판정은 지연이 무관하고 **잡음**만 줄이면 된다
+RATE_WIN_S   = 0.05   # 예측 정지용. 지연 ≈ 20 ms < stop_lead
+SETTLE_WIN_S = 0.20   # 정착 판정용. 잡음 ±0.3 kPa/s 까지 내려간다
+MOTION_KPA   = 0.75   # 3 LSB. 이만큼 움직였으면 "반응이 시작됐다"로 본다
+MIN_HOLD_S   = 0.30   # 반응 전에는 이 시간 전까지 정착 판정을 하지 않는다
+
+
+def _ls_slope(buf, win_s):
+    """최근 win_s 초의 (t, p) 표본으로 최소자승 기울기 [kPa/s]. 표본 부족이면 None.
+
+    최소 표본이 2 인 이유: 3 을 요구하면 밸브를 연 뒤 기울기가 나오기까지 한 폴링(10 ms)
+    이 더 걸리고, 그동안 예측 정지가 눈을 감는다. 700 kPa/s 에서 그 10 ms 가 7 kPa 라
+    상한을 넘겼다 (계측: 상한 165 → 최종 168.9). 표본 2 개의 기울기는 단순 차분과 같아
+    잡음이 크지만, 그 값이 쓰이는 것은 첫 폴링 한 번뿐이고 lead 를 곱하면 ±0.75 kPa 다.
+    """
+    if len(buf) < 2:
+        return None
+    t_end = buf[-1][0]
+    pts = [(t, v) for (t, v) in buf if t_end - t <= win_s]
+    n = len(pts)
+    if n < 2:
+        return None
+    t0 = pts[0][0]
+    sx = sy = sxx = sxy = 0.0
+    for t, v in pts:
+        x = t - t0
+        sx += x; sy += v; sxx += x * x; sxy += x * v
+    den = n * sxx - sx * sx
+    if den <= 1e-12:
+        return None
+    return (n * sxy - sx * sy) / den
+
+
 def wait_hold(node, board, timeout, eps_kpa_s, ceiling=None, floor=None,
               lead_s=0.0, stable_for=0.2, poll=0.01):
     """|dP/dt| 가 eps 이하로 stable_for 초 유지되거나, 압력 상/하한에 닿거나, timeout 까지 대기.
@@ -365,31 +405,49 @@ def wait_hold(node, board, timeout, eps_kpa_s, ceiling=None, floor=None,
     한계 전에 멈추는 것이 안전하고, 유량이 0 으로 수렴하는 꼬리는 정보가 적으니 손해도 없다.
 
     **예측 정지가 필수다.** 밸브를 닫아도 2차 동특성(wn≈40 rad/s) 때문에 유량이 수십 ms
-    꼬리를 남긴다. 계측에서 700 kPa/s 로 차오를 때 상한 175 에서 닫아도 193 까지 올라갔다.
-    그래서 현재 압력이 아니라 **lead_s 초 뒤 예상 압력**으로 판정하고, 멈출 때는 호출부가
-    중립밸브를 즉시 열어 제동한다.
+    꼬리를 남긴다. 계측에서 700 kPa/s 로 차오를 때 상한 175 에서 닫아도 193 까지 올라갔다
+    (= 오버슈트 18 kPa → 필요한 선행시간 18/700 ≈ 0.026 s). 그래서 현재 압력이 아니라
+    **lead_s 초 뒤 예상 압력**으로 판정하고, 멈출 때는 호출부가 중립밸브를 즉시 열어 제동한다.
+
+    "아직 안 움직였다" 와 "이미 정착했다" 는 다르다 — 밸브를 연 직후에는 기울기가 0 이지만
+    정착한 것이 아니다. 한 번도 움직인 적이 없으면 MIN_HOLD_S 전까지 정착 판정을 막는다.
+    (크래킹 아래 레벨은 실제로 끝까지 안 움직이며, 그것도 유량 0 이라는 유효한 데이터다.)
 
     반환: 'settled' | 'limit' | 'timeout' | 'tripped'
     """
-    t_end = time.time() + timeout
-    prev_p, prev_t = node.kpa(board), time.time()
+    t0 = time.time()
+    t_end = t0 + timeout
+    p_start = node.kpa(board)
+    buf = deque(maxlen=int(max(SETTLE_WIN_S, RATE_WIN_S) / poll) + 8)
+    buf.append((t0, p_start))
     calm_since = None
-    rate_signed = 0.0
+    moved = False
+
     while time.time() < t_end:
         if node.tripped:
             return 'tripped'
         time.sleep(poll)
         now, p = time.time(), node.kpa(board)
-        dt = now - prev_t
-        if dt > 0:
-            rate_signed = (p - prev_p) / dt
-            prev_p, prev_t = p, now
-        p_lead = p + rate_signed * lead_s
+        buf.append((now, p))
+        if abs(p - p_start) >= MOTION_KPA:
+            moved = True
+
+        # ── 예측 정지 (짧은 창) ──────────────────────────────────────────
+        r_fast = _ls_slope(buf, RATE_WIN_S)
+        p_lead = p + (r_fast * lead_s if r_fast is not None else 0.0)
         if ceiling is not None and max(p, p_lead) >= ceiling:
             return 'limit'
         if floor is not None and min(p, p_lead) <= floor:
             return 'limit'
-        if abs(rate_signed) <= eps_kpa_s:
+
+        # ── 정착 판정 (긴 창) ────────────────────────────────────────────
+        r_slow = _ls_slope(buf, SETTLE_WIN_S)
+        if r_slow is None:
+            continue
+        if not moved and (now - t0) < MIN_HOLD_S:
+            calm_since = None
+            continue
+        if abs(r_slow) <= eps_kpa_s:
             calm_since = calm_since or now
             if now - calm_since >= stable_for:
                 return 'settled'
@@ -423,6 +481,7 @@ def charge_full(node, gid, args, mode):
     닫힘 꼬리까지 여유를 둔다.
     """
     board = gid + args.board_offset
+    p_start = node.kpa(board)
     node.tag.update(phase='charge', valve=mode['target'], level=args.charge_level, sweep='-')
     node.set_valve(board, mode['neutral'], 0.0)
     node.set_valve(board, mode['target'], args.charge_level)
@@ -432,6 +491,17 @@ def charge_full(node, gid, args, mode):
         return   # _trip() 이 이미 target=0, neutral=전개로 안전 상태를 만들어 뒀다
     node.set_valve(board, mode['target'], 0.0)
     time.sleep(0.15)
+
+    # 중립밸브가 흘릴 차압이 실제로 생겼는지 확인한다. 안 생겼으면 이어지는 v2 스윕은
+    # 차압이 없어 기록이 잡음뿐인데, 예전에는 이걸 조용히 넘어갔다.
+    dp = (node.kpa(board) - p_start) * mode['sign']
+    if dp < args.min_charge_kpa:
+        cap = args.charge_ceiling if mode['sign'] > 0 else args.charge_floor
+        hint = ('--charge-level 을 올리거나 --charge-timeout 을 늘릴 것 (라인압 '
+                f'{node.kpa(mode["line_board"]):.1f} kPa abs 까지만 오른다)') if cap is None else \
+               '--charge-level 을 올리거나 --charge-headroom 을 줄일 것'
+        print(f'     ! 충전 부족 (gid {gid}): {p_start:.1f} → {node.kpa(board):.1f} kPa abs '
+              f'(Δ{dp:+.1f} < {args.min_charge_kpa:.1f}, 종료사유 {why}). {hint}.')
 
 
 def sweep_valve(node, gid, args, mode, valve, prep):
@@ -450,6 +520,8 @@ def sweep_valve(node, gid, args, mode, valve, prep):
             node.tag.update(phase='sweep', valve=valve, level=float(lv), sweep=direction)
             node.set_valve(board, valve, float(lv))
             # 대상 밸브(라인→챔버)는 압력 한계에서 멈춘다. 중립 밸브는 대기 방향이라 무해.
+            # 대상 밸브(라인→챔버)만 한계를 본다. 중립 밸브는 대기 방향이라 무해하다.
+            # args.ceiling/floor 가 None 이면 wait_hold 가 한계를 무시하고 정착까지 간다.
             lim = dict(ceiling=args.ceiling, floor=args.floor, lead_s=args.stop_lead) \
                 if valve == mode['target'] else {}
             why = wait_hold(node, board, args.level_hold, args.settle_eps, **lim)
@@ -462,8 +534,47 @@ def sweep_valve(node, gid, args, mode, valve, prep):
     return True
 
 
+def apply_effective_limits(node, args, mode):
+    """이번 채널에서 실제로 필요한 정지 한계를 **측정 라인압에서 유도한다.**
+
+    챔버는 라인압 너머로 갈 수 없다 (양압이면 그 위로 못 오르고, 음압이면 그 아래로
+    못 내려간다). 그러니 라인압이 트립에 못 미치면 상한/하한은 아무것도 보호하지 않고
+    상승·하강 곡선의 끝부분만 잘라낸다 — 13-parameter 피팅은 그 꼬리에서 A_max 와
+    포화 형상을 얻으므로 잘라낼수록 손해다. 그래서 필요할 때만 켠다.
+
+    한계가 필요한 경우는 하나뿐이다: **라인압 자체가 트립을 넘길 수 있을 때.**
+    재피팅 스윕에서 라인을 350 kPa abs 까지 올리면 그렇다 (트립 190).
+    """
+    p_line = node.kpa(mode['line_board'])
+    hard_hi = args.trip_hi_kpa - args.ceiling_margin
+    hard_lo = args.trip_lo_kpa + args.floor_margin
+
+    if mode['sign'] > 0:
+        need = p_line >= hard_hi
+        args.ceiling = hard_hi if need else None
+        args.floor = None                       # 대기 방향 배기는 대기압에서 멈춘다
+        args.charge_ceiling = (hard_hi - args.charge_headroom) if need else None
+        args.charge_floor = None
+    else:
+        need = p_line <= hard_lo
+        args.floor = hard_lo if need else None
+        args.ceiling = None
+        args.charge_floor = (hard_lo + args.charge_headroom) if need else None
+        args.charge_ceiling = None
+
+    if need:
+        print(f'     라인압 {p_line:.1f} kPa abs — 트립({args.trip_hi_kpa:.0f}/'
+              f'{args.trip_lo_kpa:.0f})에 닿을 수 있어 정지 한계를 켠다: '
+              f'스윕 {args.ceiling or args.floor:.1f}, 충전 '
+              f'{args.charge_ceiling or args.charge_floor:.1f} kPa abs')
+    else:
+        print(f'     라인압 {p_line:.1f} kPa abs — 챔버가 여기까지만 오르므로 정지 한계 없이 '
+              f'끝까지 채운다 (트립 {args.trip_hi_kpa:.0f}/{args.trip_lo_kpa:.0f} 는 그대로 백스톱)')
+
+
 def run_channel(node, gid, args, mode):
     print(f'\n  ── gid {gid} (board {gid + args.board_offset}) 시작 ──')
+    apply_effective_limits(node, args, mode)
     # Phase A: 대상 밸브 (라인 ↔ 챔버)
     print(f'     Phase A: {mode["target"]} 스윕 ({len(args.levels)*2-1} 레벨)')
     if not sweep_valve(node, gid, args, mode, mode['target'], to_neutral):
@@ -528,7 +639,12 @@ def main():
     ap.add_argument('--charge-timeout', type=float, default=6.0)
     ap.add_argument('--settle-eps', type=float, default=2.0, help='정착 판정 |dP/dt| [kPa/s]')
     ap.add_argument('--trip-hi-kpa', type=float, default=190.0,
-                    help='과압 트립 [kPa abs]. pressure_safety_limit_kpa 와 같은 값.')
+                    help='과압 트립 [kPa abs]. 기본값은 pressure_safety_limit_kpa 와 같다 — '
+                         '**액추에이터가 붙어 있을 때의 안전값**이므로 기본을 올리지 않는다. '
+                         '액추에이터를 떼고 피팅할 때는 챔버가 라인압까지 올라가도 무방하므로 '
+                         '이 값을 라인압 위로 올릴 것 (예: 라인 350 kPa abs 스윕이면 '
+                         '--trip-hi-kpa 500). 그러면 정지 한계가 아예 켜지지 않아 각 레벨의 '
+                         '상승 곡선을 끝까지 기록한다 — A_max 와 포화 형상이 그 꼬리에 있다.')
     ap.add_argument('--trip-lo-kpa', type=float, default=20.0, help='과진공 트립 [kPa abs]')
     ap.add_argument('--rail-target-kpa', type=float, default=None,
                     help='음압 실기용: 외부 정압원이 없을 때 펌프+라인밸브로 대체 라인압을 만든다. '
@@ -543,8 +659,16 @@ def main():
                     help='중립밸브 스윕 전 충전 개도 [%%]. 100 은 너무 빨라 정밀 정지가 안 된다.')
     ap.add_argument('--charge-headroom', type=float, default=25.0,
                     help='충전은 스윕 상한보다 이만큼 더 안쪽에서 멈춘다 [kPa]')
-    ap.add_argument('--stop-lead', type=float, default=0.10,
-                    help='예측 정지 선행 시간 [s]. 밸브 닫힘 꼬리(wn≈40 rad/s → ~50 ms)보다 크게.')
+    ap.add_argument('--stop-lead', type=float, default=0.035,
+                    help='예측 정지 선행 시간 [s]. 실측 근거: 700 kPa/s 로 차오를 때 상한 175 '
+                         '에서 닫아 193 까지 올라갔으므로 밸브 꼬리는 18/700 ≈ 0.026 s 고, '
+                         '여기에 폴링 주기 0.010 s 를 더해 0.035 로 잡았다. '
+                         '**크게 잡으면 안 된다** — 선행거리(lead×상승률)가 충전 구간보다 '
+                         '커지면 밸브를 여는 즉시 정지 조건이 성립한다 (구 기본값 0.10 은 '
+                         'Phase B 충전 구간 38.7 kPa 를 상승률 387 kPa/s 에서 이미 삼켰다).')
+    ap.add_argument('--min-charge-kpa', type=float, default=10.0,
+                    help='Phase B 충전 후 최소 차압 [kPa]. 미달이면 경고한다 — 중립밸브가 '
+                         '흘릴 압력이 없으면 그 레벨의 기록은 잡음뿐이다.')
     ap.add_argument('--line-tol-kpa', type=float, default=10.0)
     ap.add_argument('--dry-run', action='store_true',
                     help='밸브 명령을 발행하지 않고 시퀀스·기록·안전 경로만 확인')
@@ -558,11 +682,11 @@ def main():
                     help='0점 보정 전 대기압 복귀 시간')
     args = ap.parse_args()
 
-    # 스윕 정지 한계 — 트립보다 안쪽에서 멈춘다
-    args.ceiling = args.trip_hi_kpa - args.ceiling_margin
-    args.floor = args.trip_lo_kpa + args.floor_margin
-    args.charge_ceiling = args.ceiling - args.charge_headroom
-    args.charge_floor = args.floor + args.charge_headroom
+    # 정지 한계는 **채널마다** apply_effective_limits() 가 측정 라인압에서 정한다.
+    # 여기서는 표시용 상한만 계산해 둔다 (라인압이 트립에 닿을 때 쓰이는 값).
+    args.ceiling = args.floor = args.charge_ceiling = args.charge_floor = None
+    _hi = args.trip_hi_kpa - args.ceiling_margin
+    _lo = args.trip_lo_kpa + args.floor_margin
 
     cfg = args.config
     if cfg is None:
@@ -591,9 +715,10 @@ def main():
     print(f'채널   : {gids}   (board {[g + args.board_offset for g in gids]})')
     print(f'인가   : board {mode["line_board"]} @ {args.line_kpa:.1f} kPa abs (외부 레귤레이터, 수동)')
     print(f'대상   : {mode["target"]} + {mode["neutral"]}    추가 부피 {args.extra_volume_ml:.0f} mL')
-    print(f'한계   : 스윕 정지 {args.ceiling:.1f} / {args.floor:.1f}, '
-          f'충전 정지 {args.charge_ceiling:.1f} / {args.charge_floor:.1f}, '
-          f'트립 {args.trip_hi_kpa:.1f} / {args.trip_lo_kpa:.1f} kPa abs')
+    print(f'한계   : 트립 {args.trip_hi_kpa:.1f} / {args.trip_lo_kpa:.1f} kPa abs. '
+          f'정지 한계는 라인압이 트립에 닿을 때만 켜진다 '
+          f'(그때 스윕 {_hi:.1f} / {_lo:.1f}, 충전 {_hi - args.charge_headroom:.1f} / '
+          f'{_lo + args.charge_headroom:.1f})')
     print(f'출력   : {outdir}')
     print(f'설정   : {cfg}  (네임스페이스 키 {ns_key})')
     if args.dry_run and args.publish_in_dry_run:
