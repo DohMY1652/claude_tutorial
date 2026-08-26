@@ -316,10 +316,41 @@ def orifice_coeff(rec, volume_m3, n_poly, d_mm):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+_FONT_DONE = []
+
+
+def _setup_cjk_font(matplotlib):
+    """플롯 라벨이 한글이라 CJK 글꼴이 없으면 글리프마다 UserWarning 이 쏟아지고
+    PNG 에는 □ 만 남는다. 설치된 것 중 하나를 골라 쓴다 (한 번만 수행).
+
+    Noto Sans CJK 는 Pan-CJK 라 JP/SC/TC 면(face)에도 한글이 들어 있다 —
+    KR 면이 따로 안 잡혀도 그대로 쓸 수 있다.
+    피팅 결과에는 아무 영향이 없다. 글꼴이 없어도 계산은 정상이다.
+    """
+    if _FONT_DONE:
+        return _FONT_DONE[0]
+    from matplotlib import font_manager as fm
+    have = {f.name for f in fm.fontManager.ttflist}
+    for cand in ('NanumGothic', 'NanumBarunGothic', 'Malgun Gothic', 'AppleGothic',
+                 'Noto Sans CJK KR', 'Noto Sans KR',
+                 'Noto Sans CJK JP', 'Noto Sans CJK SC', 'Noto Sans CJK TC',
+                 'UnDotum', 'Baekmuk Gulim'):
+        if cand in have:
+            matplotlib.rcParams['font.family'] = cand
+            matplotlib.rcParams['axes.unicode_minus'] = False   # 마이너스 글리프도 없다
+            _FONT_DONE.append(cand)
+            return cand
+    print('  참고: 한글 글꼴이 없어 플롯 라벨만 깨진다 (피팅 결과에는 영향 없음).\n'
+          '        sudo apt install fonts-nanum && rm -rf ~/.cache/matplotlib 로 해결된다.')
+    _FONT_DONE.append(None)
+    return None
+
+
 def plot_fit(rec, params, seg, outpath):
     try:
         import matplotlib
         matplotlib.use('Agg')
+        _setup_cjk_font(matplotlib)
         import matplotlib.pyplot as plt
     except ImportError:
         return False
