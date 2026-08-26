@@ -558,6 +558,18 @@ def main():
                                    f'fit_{mode}_ch{gid}_{valve}_line{int(round(line_kpa))}.png')
                 plot_fit(r_, params, sg, png)
 
+        # ── 밸브 하나 끝날 때마다 중간 저장 ────────────────────────────────
+        # 예전에는 Step 5 에서 한 번에만 썼다. 밸브 하나가 40~90 분이라, 중간에
+        # 프로세스가 죽거나 Ctrl+C 하면 **디스크에 아무것도 안 남았다** (실제로 그렇게
+        # 90 분치를 잃었다). 매번 전체를 덮어쓰므로 파일은 항상 "지금까지 끝난 것 전부"다.
+        # 저장 실패가 피팅을 중단시키면 안 되므로 예외는 삼킨다.
+        try:
+            write_yaml(outdir, fits, volumes, orif, args)
+            write_report(outdir, fits, volumes, vol_diag, orif, args, runs)
+            print(f'    중간 저장 완료 ({len(fits)}개 밸브) → {outdir}')
+        except Exception as exc:
+            print(f'    경고: 중간 저장 실패 ({exc}) — 계속 진행한다')
+
     # ── Step 5: 출력 ──
     print('\nStep 5 — 결과 저장')
     write_yaml(outdir, fits, volumes, orif, args)
