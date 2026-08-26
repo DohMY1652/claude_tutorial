@@ -129,6 +129,36 @@ public:
   double flow_in(double Ppos_abs, double Pneg_abs) const    // 흡입 [kg/s]
   { return ready_ ? std::max(0.0, interp2(in_, Ppos_abs, Pneg_abs)) : 0.0; }
 
+  // 실측 능력경계(pump_fit_solve.py Phase F)로 cap 테이블을 덮어쓴다. 측정 구간
+  // 안은 실측을, 밖은 기하 시뮬레이션 외삽을 그대로 쓴다. 5-파라미터 슬라이더-크랭크는
+  // 소기량×Cb_in 축퇴가 남아 데드헤드 외삽이 부정확하지만(자기검증 ~15%), 측정 구간
+  // 안에서는 직접 측정이 언제나 우선한다. 두 벡터가 비었거나 길이가 안 맞으면,
+  // 또는 build() 전이면 아무것도 안 하고 기하 테이블을 그대로 둔다.
+  void override_cap_measured(std::vector<double> pneg_gauge, std::vector<double> ppos_max_gauge)
+  {
+    if (pneg_gauge.empty() || pneg_gauge.size() != ppos_max_gauge.size() || cap_x_.size() < 2)
+      return;
+    std::vector<size_t> idx(pneg_gauge.size());
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+    std::sort(idx.begin(), idx.end(),
+             [&](size_t a, size_t b) { return pneg_gauge[a] < pneg_gauge[b]; });
+    std::vector<double> mx, my;
+    for (size_t k = 0; k < idx.size(); ++k) {
+      const double x = pneg_gauge[idx[k]], y = ppos_max_gauge[idx[k]];
+      // 거의 같은 음압 셋포인트(±0.5 kPa, 반복 측정)는 평균으로 합친다.
+      if (!mx.empty() && std::abs(x - mx.back()) < 0.5e3) my.back() = 0.5 * (my.back() + y);
+      else { mx.push_back(x); my.push_back(y); }
+    }
+    const double lo = mx.front(), hi = mx.back();
+    std::vector<double> nx, ny;
+    for (size_t i = 0; i < cap_x_.size(); ++i)
+      if (cap_x_[i] < lo) { nx.push_back(cap_x_[i]); ny.push_back(cap_y_[i]); }
+    for (size_t k = 0; k < mx.size(); ++k) { nx.push_back(mx[k]); ny.push_back(my[k]); }
+    for (size_t i = 0; i < cap_x_.size(); ++i)
+      if (cap_x_[i] > hi) { nx.push_back(cap_x_[i]); ny.push_back(cap_y_[i]); }
+    cap_x_ = std::move(nx); cap_y_ = std::move(ny);
+  }
+
   // 능력경계 보간: 음압 셋포인트(게이지) → 유지 가능한 최대 양압(게이지)
   double cap_ppos(double pneg_gauge) const
   {

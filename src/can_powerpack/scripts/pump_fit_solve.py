@@ -113,13 +113,21 @@ def solve_volumes(runs, args):
 
     vols, leaks, diag = {}, {}, {}
     for rail in ('pos', 'neg'):
+        other = 'neg' if rail == 'pos' else 'pos'
+        # "맨몸" 후보: ΔV→none (진짜 맨몸) 또는 ΔV→other (반대쪽 레일에만 부피를 추가한
+        # 회차 — 이 레일의 부피는 그대로이므로 물리적으로 맨몸과 동등하다). 진짜 맨몸이
+        # 게이트를 통과하면 그걸 쓰고, 기각됐을 때만 대체로 넘어간다.
+        bare_tag, bare = 'none', taus.get((rail, 'none'))
+        if not bare and (rail, other) in taus:
+            bare_tag, bare = other, taus[(rail, other)]
+            print(f'  {rail} 레일: 맨몸(ΔV→none) 감쇠가 기각돼 ΔV→{other} 회차의 {rail} 레일 '
+                  f'감쇠로 대체한다 (그 회차는 {rail} 레일에 ΔV 를 추가하지 않아 맨몸과 동등)')
+        extra = taus.get((rail, rail))
         override = getattr(args, f'volume_{rail}_ml')
         if override:
             vols[rail] = override
             diag[rail] = dict(method='지정값')
         else:
-            bare = taus.get((rail, 'none'))
-            extra = taus.get((rail, rail))
             if not (bare and extra):
                 print(f'  {rail} 레일: 이중 부피법 불가 (bare={bool(bare)}, extra={bool(extra)})')
                 continue
@@ -132,10 +140,9 @@ def solve_volumes(runs, args):
             vols[rail] = v
             diag[rail] = dict(method='이중 부피법', tau_bare=bare['tau'],
                               tau_extra=extra['tau'], ratio=r, extra_ml=extra_ml,
-                              r2_bare=bare['r2'], r2_extra=extra['r2'])
-        tau = taus.get((rail, 'none'))
-        if tau:
-            leaks[rail] = pm.leak_from_tau(tau['tau'], vols[rail])
+                              r2_bare=bare['r2'], r2_extra=extra['r2'], bare_src=bare_tag)
+        if bare and rail in vols:
+            leaks[rail] = pm.leak_from_tau(bare['tau'], vols[rail])
         print(f'  {rail} 레일: V = {vols.get(rail, float("nan")):.1f} mL, '
               f'leak = {leaks.get(rail, float("nan")):.5f} LPM/kPa')
     return vols, leaks, diag

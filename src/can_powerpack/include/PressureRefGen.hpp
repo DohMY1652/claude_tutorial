@@ -176,6 +176,12 @@ public:
   { pneu::pump_piston_avg(p_.pump, Ppos_abs, Pneg_abs, mdot_out_avg, mdot_in_avg); }
   double cap_ppos(double pneg_sp_gauge) const { return pump_.cap_ppos(pneg_sp_gauge); }
 
+  // 실측 능력경계(pump_frontier_measured, Pa gauge)로 cap_ppos 테이블을 덮어쓴다.
+  // build_pump_table() 이후에 불러야 한다. 빈 벡터면 아무것도 안 한다.
+  void apply_measured_frontier(const std::vector<double>& pneg_gauge_pa,
+                               const std::vector<double>& ppos_max_gauge_pa)
+  { pump_.override_cap_measured(pneg_gauge_pa, ppos_max_gauge_pa); }
+
 private:
 
   void decide_rail_setpoint(const std::vector<std::vector<double>>& F_preview,

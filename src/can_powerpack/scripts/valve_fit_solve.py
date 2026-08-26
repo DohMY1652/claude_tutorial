@@ -54,6 +54,35 @@ ORIFICE_ROLE = {
 }
 
 
+def load_warm_start(path):
+    """valve_params.yaml 형식에서 (gid, valve) → 13-parameter 벡터를 뽑는다.
+
+    channel_config.chN.{micro,atm,macro} 의 값을 vm.PARAM_NAMES 순서로 재배열한다.
+    없는 채널/키는 조용히 건너뛴다 — 호출부가 못 찾으면 BASE_INITIAL 단독으로 돈다.
+    """
+    valve_key = {'v1': 'micro', 'v2': 'atm', 'v3': 'macro'}
+    with open(path) as f:
+        d = yaml.safe_load(f)
+    cc = d.get('/pack2/pp_controller', {}).get('ros__parameters', {}).get('channel_config', {})
+    out = {}
+    for ch_name, ch in cc.items():
+        if not ch_name.startswith('ch'):
+            continue
+        try:
+            gid = int(ch_name[2:])
+        except ValueError:
+            continue
+        for valve, key in valve_key.items():
+            block = ch.get(key)
+            if not block:
+                continue
+            try:
+                out[(gid, valve)] = np.array([float(block[n]) for n in vm.PARAM_NAMES])
+            except KeyError:
+                continue
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Step 1 — 로드
 # ══════════════════════════════════════════════════════════════════════════
@@ -80,12 +109,44 @@ def load_runs(indir):
     return runs
 
 
-def build_record(rows, mode, gid, valve, decimate=1):
+def reject_glitches(rate, window=9, k=10.0):
+    """dP/dt 의 순간 글리치(짧은 튐)를 검출해 불리언 마스크로 반환한다 (True=정상).
+
+    로컬 이동중앙값 대비 크게 벗어나는 점만 잡는다 — 진짜 빠른 밸브 전이는 이웃 샘플도
+    같이 움직이므로 안 걸리고, 실기 CAN/센서 순간 글리치처럼 **한두 샘플만** 튀는 것만
+    잡힌다. scipy 가 없어(레포 관례) 순수 파이썬 루프로 구현 — 채널당 수만 샘플이라
+    피팅 1회 준비 단계에서 문제되지 않는다.
+    """
+    n = rate.size
+    if n < window:
+        return np.ones(n, dtype=bool)
+    half = window // 2
+    med = np.empty(n)
+    for i in range(n):
+        lo, hi = max(0, i - half), min(n, i + half + 1)
+        med[i] = np.median(rate[lo:hi])
+    resid = rate - med
+    mad = np.median(np.abs(resid - np.median(resid))) * 1.4826
+    if mad < 1e-9:
+        return np.ones(n, dtype=bool)
+    return np.abs(resid) <= k * mad
+
+
+def build_record(rows, mode, gid, valve, decimate=1, fixed_volume_side='chamber'):
     """한 (모드, 채널, 밸브) 의 **연속** 기록을 만든다.
 
     히스테리시스 상태 z 가 레벨을 넘어 이어져야 하므로 세그먼트를 쪼개지 않고,
     첫 sweep 부터 마지막 sweep 까지 통째로 쓴다. 반대 밸브로 초기화하는 구간은
     mask 로 잔차에서 제외한다 (그 구간의 dP/dt 는 다른 밸브가 만든 것이므로).
+
+    fixed_volume_side: 'chamber'(기본, 기존 전제 — 챔버가 고정부피) | 'line'
+      (음압 v1 전용 대안: 펌프로 라인압을 만드는 대신, **라인/레일 쪽에 고정부피 탱크를
+      붙이고 챔버는 외부 레귤레이터로 일정압을 유지**한다. 이러면 유량을 역산할 dP/dt 는
+      챔버가 아니라 그 고정부피 탱크(라인)에서 나와야 한다 — 그래서 이 모드에서는
+      `rate`/`p_ch` 필드에 **라인 압력**을 담는다(이름은 그대로 두되 의미만 바꿔, `_blocks`/
+      `solve_volume`/`orifice_coeff` 등 "고정부피 쪽 압력"을 쓰는 다운스트림 코드를
+      그대로 재사용한다). v2(대기↔챔버)는 이 방식으로 특성화가 안 된다 — 챔버가 레귤레이터로
+      고정돼 있으면 v2 유량이 챔버압에 안 나타난다. v1/v3 (라인↔챔버) 에만 쓸 것.
     """
     sel = [r for r in rows if r['mode'] == mode and int(r['gid']) == gid]
     if not sel:
@@ -97,7 +158,7 @@ def build_record(rows, mode, gid, valve, decimate=1):
     seg = sel[lo:hi]
 
     t = np.array([float(r['t']) for r in seg])
-    p_ch = np.array([float(r['P_ch_abs']) for r in seg])
+    p_ch_raw = np.array([float(r['P_ch_abs']) for r in seg])
     p_atm = np.array([float(r['P_atm']) for r in seg])
     mask = np.array([r['phase'] == 'sweep' and r['valve'] == valve for r in seg])
 
@@ -108,8 +169,19 @@ def build_record(rows, mode, gid, valve, decimate=1):
     # 상/하류압은 (모드, 밸브) 로 유일하게 정해진다
     line_key = {'pos_micro': 'P_line_pos', 'pos_macro': 'P_macro',
                 'neg_micro': 'P_line_neg', 'neg_macro': 'P_macro_neg'}[mode]
-    p_line = np.array([float(r[line_key]) for r in seg])
+    p_line_raw = np.array([float(r[line_key]) for r in seg])
     sign = +1 if mode.startswith('pos') else -1
+
+    if fixed_volume_side == 'line':
+        if valve not in ('v1', 'v3'):
+            raise ValueError("fixed_volume_side='line' 은 v1/v3(라인↔챔버) 에만 쓸 수 있다 "
+                             f"(valve={valve})")
+        # 압력 신호를 맞바꾼다: "p_ch"(고정부피 쪽) = 실제 라인/레일 압력,
+        # "p_line"(레귤레이터 쪽) = 실제 챔버 압력(외부 레귤레이터로 일정압).
+        p_ch, p_line = p_line_raw, p_ch_raw
+    else:
+        p_ch, p_line = p_ch_raw, p_line_raw
+
     if valve in ('v1', 'v3'):                       # 라인 ↔ 챔버
         p_in, p_out = (p_line, p_ch) if sign > 0 else (p_ch, p_line)
     else:                                           # 챔버 ↔ 대기
@@ -120,16 +192,22 @@ def build_record(rows, mode, gid, valve, decimate=1):
 
     # dP/dt 는 **원본 해상도**에서 계산한다. 부피 산출과 오리피스 계수는 이 전해상도 값을 쓰고,
     # 피팅만 데시메이션한다 (밸브 동특성 wn≈40 rad/s 대비 200 Hz 는 과잉).
+    # (fixed_volume_side='line' 이면 위에서 이미 p_ch 가 라인압으로 바뀌어 있어 그대로 맞다.)
     rate_full = vm.dpdt(t, p_ch)
+    # full['mask'] 는 그대로 둔다 — 이중부피법(_blocks/solve_volume)과 B절 오리피스 계산이
+    # 이걸 써서 연속구간을 찾는데, 여기에 글리치 마스크를 섞으면 그 연속성이 끊겨 부피·
+    # 크래킹 임계 추정이 같이 나빠진다(실측: 부피오차 2.9%→18.4%로 회귀 확인). 글리치
+    # 제거는 **13-parameter 피팅용** mask 에만 적용한다.
     full = dict(t=t, p_ch=p_ch, p_in=p_in, p_out=p_out, rate=rate_full,
                 mask=mask, level=lvl, sweep=dirs)
+    fit_mask = mask & reject_glitches(rate_full)
     if decimate > 1:
         sl = slice(None, None, decimate)
         t, p_ch, p_in, p_out = t[sl], p_ch[sl], p_in[sl], p_out[sl]
         cur, ucmd, lvl, dirs = cur[sl], ucmd[sl], lvl[sl], dirs[sl]
-        mask, rate = mask[sl], rate_full[sl]
+        mask, rate = fit_mask[sl], rate_full[sl]
     else:
-        rate = rate_full
+        mask, rate = fit_mask, rate_full
     return dict(t=t, p_ch=p_ch, p_in=p_in, p_out=p_out, I=cur, u=ucmd, rate=rate,
                 mask=mask, level=lvl, sweep=dirs, gid=gid, mode=mode, valve=valve,
                 full=full)
@@ -283,8 +361,17 @@ def main():
     ap.add_argument('--samples', type=int, default=200, help='1단계 난수 탐색 샘플 수')
     ap.add_argument('--decimate', type=int, default=2,
                     help='피팅 전 데시메이션 배율. dP/dt 는 원본 해상도에서 먼저 계산한다.')
+    ap.add_argument('--fixed-volume-side', default='chamber', choices=['chamber', 'line'],
+                    help="'chamber'(기본, 기존 전제) | 'line' — 음압 v1/v3 전용: 펌프 대신 "
+                         "라인/레일 쪽에 고정부피 탱크, 챔버는 외부 레귤레이터로 일정압. "
+                         "target 밸브(v1/v3)에만 적용되고 neutral(v2)은 항상 'chamber' 로 "
+                         "돈다 — v2 는 이 방식으로 특성화가 안 된다.")
     ap.add_argument('--starts', type=int, default=3)
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--warm-start-yaml', default=None,
+                    help='valve_params.yaml 형식 파일. 있으면 (gid,valve) 가 일치하는 '
+                         '13-parameter 를 BASE_INITIAL 과 함께 추가 탐색 시작점으로 쓴다 '
+                         '(채널별 국소해 실패 완화용 웜스타트).')
     ap.add_argument('--only-gid', type=int, default=None)
     ap.add_argument('--only-valve', default=None, choices=['v1', 'v2', 'v3'])
     ap.add_argument('--out', default=None, help='기본 <indir>')
@@ -293,6 +380,11 @@ def main():
 
     outdir = args.out or args.indir
     os.makedirs(outdir, exist_ok=True)
+
+    warm_start = {}
+    if args.warm_start_yaml:
+        warm_start = load_warm_start(args.warm_start_yaml)
+        print(f'웜스타트: {args.warm_start_yaml} 에서 (gid,valve) {len(warm_start)}개 로드')
 
     print('Step 1 — CSV 로드')
     runs = load_runs(args.indir)
@@ -311,7 +403,8 @@ def main():
             for valve in (target, neutral):
                 if args.only_valve and valve != args.only_valve:
                     continue
-                rec = build_record(run['rows'], mode, gid, valve, args.decimate)
+                fv_side = args.fixed_volume_side if valve == target else 'chamber'
+                rec = build_record(run['rows'], mode, gid, valve, args.decimate, fv_side)
                 if rec is None:
                     continue
                 recs[(mode, gid, valve)][run['extra_ml']] = rec
@@ -368,8 +461,12 @@ def main():
         seg['q0'] = 0.0                                     # 스윕 시작 시 밸브 폐쇄
         seg['q_ref'] = float(np.mean(np.abs(seg['Q'][rec['mask']]))) if rec['mask'].any() else 0.0
 
-        print(f'\n  {mode} gid{gid} {valve} (V={volumes[gid]:.2f} mL)')
-        params, err, r2, diag = vm.fit([seg], n_samples=args.samples,
+        warm_vec = warm_start.get((gid, valve))
+        base = [vm.BASE_INITIAL, warm_vec] if warm_vec is not None else None
+
+        print(f'\n  {mode} gid{gid} {valve} (V={volumes[gid]:.2f} mL)'
+              + ('  [웜스타트 있음]' if warm_vec is not None else ''))
+        params, err, r2, diag = vm.fit([seg], base=base, n_samples=args.samples,
                                        n_starts=args.starts, seed=args.seed)
         sens = vm.sensitivity(params, [seg])
         weak = [k for k, v in sens.items() if v < 1e-4]

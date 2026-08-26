@@ -26,7 +26,8 @@ v2 는 두 모드에 모두 나오므로 독립 2회 피팅 → 교차검증이 
   · 임계 초과 시 해당 채널 중립밸브(v2) 전개 + 대상밸브 폐쇄 후 중단.
   · 종료(정상·예외·Ctrl-C) 시 전 채널 v2 를 열어 대기압으로 되돌린 뒤 전부 0.
     "전부 0" 은 양압 채널에서 압력이 갇히는 상태라 안전 상태가 아니다.
-  · CanBridge 에는 워치독이 없다 — 마지막 명령이 250 Hz 로 영구히 나간다.
+  · 실기 CanBridge 는 200ms PWM 워치독이 있다(가상 하드웨어에는 없다) — 그래서
+    상태 변화 여부와 무관하게 _tick() 이 log_hz 로 계속 재발행한다.
 
 사용 예:
   python3 valve_fit_record.py --mode pos_micro --line-kpa 250
@@ -128,6 +129,8 @@ class Recorder(Node):
         self.rows = []
         self.t0 = time.time()
         self.tripped = None
+        self._shutting_down = threading.Event()
+        self._last_flush_t = 0.0
 
         self.create_timer(1.0 / args.log_hz, self._tick)
 
@@ -185,6 +188,22 @@ class Recorder(Node):
             self._pwm = [0] * PWM_LEN
         self.flush()
 
+    def keepalive_flush(self):
+        """워치독 유지용 재발행 — flush_hz 로 속도를 제한한다.
+
+        실제 상태 변화(set_valve/brake/...)는 이 함수를 거치지 않고 매번 즉시 flush() 한다 —
+        새 명령은 지연 없이 나가야 한다. 여기서 속도를 낮추는 건 상태가 그대로인데도
+        log_hz(기본 200Hz)로 반복 발행하던 부분뿐이다. 실기에서 CAN ID 가 높은 보드
+        (board14+)는 우선순위가 낮아, 버스가 이 재발행으로 계속 바쁘면 그 보드로 가는
+        새 명령이 경합으로 밀리는 현상이 확인됐다 — board11~13(문제 적음)보다 board14~16
+        (R² 뚜렷이 나쁨)에서 패턴이 뚜렷했고, 사람이 can_control.py 로 같은 값을 하나씩
+        수동으로 주면(버스가 한가할 때) 전부 정상 반응해 경합이 원인임을 확인했다.
+        """
+        now = time.time()
+        if now - self._last_flush_t >= 1.0 / self.args.flush_hz:
+            self._last_flush_t = now
+            self.flush()
+
     def flush(self):
         """48개를 매번 전부 발행한다 — 대상 외 밸브가 명시적으로 0 으로 유지되도록."""
         if self.args.dry_run and not self.args.publish_in_dry_run:
@@ -205,8 +224,36 @@ class Recorder(Node):
 
     # ── 기록 타이머 (+ 과압 트립) ─────────────────────────────────────────
     def _tick(self):
-        if not (self._sens_seen and self._cur_seen):
+        # 상태 변화가 없어도 log_hz 로 계속 재발행한다. set_valve/brake 등은 상태가
+        # 바뀔 때만 flush() 하므로, wait_hold 의 유지 구간(최대 수 초)처럼 상태가
+        # 고정된 동안은 여기서 재발행하지 않으면 실기 CanBridge 의 200ms PWM
+        # 워치독(가상 하드웨어에는 없다)이 타임아웃돼 라인 밸브를 개방시킨다.
+        if self._shutting_down.is_set():
             return
+        if not (self._sens_seen and self._cur_seen):
+            self.keepalive_flush()
+            return
+
+        if self.args.rail_target_kpa is not None:
+            # 펌프가 도는 동안 양압 레일이 같이 올라가지 않도록 릴리프(board1 v1)는
+            # 상시 개방(배기)한다. 음압 레일(board2 v1, admit)은 비례제어로 목표 압력을
+            # 유지한다 — P 가 목표보다 낮으면(진공이 더 세면) admit 을 더 열어 대기를
+            # 들여보내고, 목표보다 높으면 닫아 펌프가 더 당기게 둔다.
+            # set_valve() 를 쓰지 않고 _pwm 을 직접 갱신한다 — set_valve() 는 호출마다
+            # lock+flush() 를 한 번 더 일으키는데, 이걸 200Hz 로 board1/board2 에 매번
+            # 하면 채널 밸브용 flush() 와 락을 놓고 경합해 채널 명령 발행이 밀린다
+            # (실기 재현: can_control.py 수동 명령은 정상인데 이 스크립트로 자동화하면
+            # 음압 채널 밸브가 레벨마다 들쭉날쭉하게 반응했다).
+            p_neg = self.kpa(BOARD_LINE_NEG)
+            err = self.args.rail_target_kpa - p_neg
+            admit_pct = max(0.0, min(100.0, self.args.rail_kp * err))
+            with self._lock:
+                self._pwm[(BOARD_LINE_POS - 1) * PWM_PER_BOARD + VALVE_IDX['v1']] = 4095
+                self._pwm[(BOARD_LINE_NEG - 1) * PWM_PER_BOARD + VALVE_IDX['v1']] = \
+                    int(round(admit_pct * PCT_TO_PWM))
+
+        self.keepalive_flush()
+
         gid = self.tag['gid']
         if gid < 0:
             return
@@ -357,7 +404,12 @@ def to_neutral(node, gid, args, mode):
     node.tag.update(phase='reset', valve=mode['neutral'], level=100.0, sweep='-')
     node.set_valve(board, mode['target'], 0.0)
     node.set_valve(board, mode['neutral'], 100.0)
-    wait_hold(node, board, args.reset_timeout, args.settle_eps)
+    why = wait_hold(node, board, args.reset_timeout, args.settle_eps)
+    if why == 'tripped':
+        # _trip() 이 이미 중립밸브(v2)를 안전 상태로 전개해 뒀다 — 여기서 다시 닫으면
+        # 그 안전조치를 무효화하고 트립 순간의 잔류 유동이 갇힌 채로 압력이 계속 오른다
+        # (실기 재현: 둘 다 닫힌 채 190→197 kPa 로 계속 상승).
+        return
     node.set_valve(board, mode['neutral'], 0.0)
     time.sleep(0.15)
 
@@ -374,8 +426,10 @@ def charge_full(node, gid, args, mode):
     node.tag.update(phase='charge', valve=mode['target'], level=args.charge_level, sweep='-')
     node.set_valve(board, mode['neutral'], 0.0)
     node.set_valve(board, mode['target'], args.charge_level)
-    wait_hold(node, board, args.charge_timeout, args.settle_eps,
-              ceiling=args.charge_ceiling, floor=args.charge_floor, lead_s=args.stop_lead)
+    why = wait_hold(node, board, args.charge_timeout, args.settle_eps,
+                    ceiling=args.charge_ceiling, floor=args.charge_floor, lead_s=args.stop_lead)
+    if why == 'tripped':
+        return   # _trip() 이 이미 target=0, neutral=전개로 안전 상태를 만들어 뒀다
     node.set_valve(board, mode['target'], 0.0)
     time.sleep(0.15)
 
@@ -464,6 +518,11 @@ def main():
     ap.add_argument('--board-offset', type=int, default=5, help='channel_board_offset')
     ap.add_argument('--levels', type=float, nargs='*', default=DEFAULT_LEVELS)
     ap.add_argument('--log-hz', type=float, default=200.0)
+    ap.add_argument('--flush-hz', type=float, default=20.0,
+                    help='상태 변화가 없을 때의 board/pwm_cmd 재발행(워치독 유지용) 속도. '
+                         'log_hz 와 분리 — CSV 기록 해상도는 그대로 두고 CAN 재발행만 줄여서 '
+                         'CAN ID 가 높은 보드(board14+)의 버스 경합을 줄인다. '
+                         '워치독 200ms 대비 충분히 빠르면 됨(기본 20Hz=50ms).')
     ap.add_argument('--level-hold', type=float, default=3.0, help='레벨당 최대 유지 [s]')
     ap.add_argument('--reset-timeout', type=float, default=4.0)
     ap.add_argument('--charge-timeout', type=float, default=6.0)
@@ -471,6 +530,12 @@ def main():
     ap.add_argument('--trip-hi-kpa', type=float, default=190.0,
                     help='과압 트립 [kPa abs]. pressure_safety_limit_kpa 와 같은 값.')
     ap.add_argument('--trip-lo-kpa', type=float, default=20.0, help='과진공 트립 [kPa abs]')
+    ap.add_argument('--rail-target-kpa', type=float, default=None,
+                    help='음압 실기용: 외부 정압원이 없을 때 펌프+라인밸브로 대체 라인압을 만든다. '
+                         '설정하면 board1 v1(양압 릴리프)을 상시 개방하고 board2 v1(admit)을 '
+                         '비례제어로 이 값[kPa abs]에 맞춘다. 펌프는 수동으로 켜 둘 것.')
+    ap.add_argument('--rail-kp', type=float, default=5.0,
+                    help='--rail-target-kpa 의 비례이득 [%%/kPa]. admit_pct = kp*(target-P_measured).')
     ap.add_argument('--ceiling-margin', type=float, default=25.0,
                     help='트립 대비 여유. 스윕은 trip_hi − 이 값에서 멈춘다.')
     ap.add_argument('--floor-margin', type=float, default=8.0)
@@ -662,8 +727,15 @@ def main():
             yaml.safe_dump(meta, f, allow_unicode=True, sort_keys=False)
         print(f'저장: {path}  ({len(node.rows)} 행, 완료 채널 {completed})')
 
-        node.destroy_node()
+        # spinner 스레드가 rclpy.spin(node) 로 계속 도는 중에 이 스레드에서 destroy_node() 를
+        # 부르면 콜백(_tick·_on_sensors·_on_currents 전부, sleep 가드로는 못 막는다) 이 파괴된
+        # 노드를 참조해 rclpy/rcl 레벨에서 abort 된다(재현: "terminate called ... IOT
+        # instruction"). shutdown() 을 먼저 불러 spin() 이 반환하게 하고, 스레드가 실제로
+        # 끝난 뒤에 destroy_node() 를 부른다 — 순서를 바꾸면 다시 재현된다.
+        node._shutting_down.set()
         rclpy.shutdown()
+        spinner.join(timeout=2.0)
+        node.destroy_node()
 
 
 if __name__ == '__main__':

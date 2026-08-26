@@ -469,23 +469,37 @@ def _shrink(func, sim, fsim, sigma, nfev):
 
 def random_search(func, base=None, n_samples=200, seed=0):
     """MATLAB 1단계와 동일: base 에 [0.5,1.5] 배 노이즈, C_z/wn 은 별도 범위로 랜덤화.
-    seed 를 고정해 재현 가능하게 한다 (MATLAB 원본은 재현 불가였다)."""
-    base = BASE_INITIAL if base is None else np.asarray(base, dtype=float)
+    seed 를 고정해 재현 가능하게 한다 (MATLAB 원본은 재현 불가였다).
+
+    `base` 는 단일 벡터 또는 벡터 리스트다. 리스트면 표본을 각 base 에 고르게 나눠 뿌린다 —
+    제너릭 BASE_INITIAL 하나만으로는 채널마다 진짜 최적점이 [0.5,1.5]배 범위 밖에 있을 때
+    Nelder-Mead 가 애초에 나쁜 분지에서 시작해 못 빠져나온다. 이미 잘 피팅된 다른 채널/밸브의
+    파라미터를 추가 base 로 주면(웜스타트) 그 분지 근처에서도 같이 탐색한다.
+    """
+    if base is None:
+        bases = [BASE_INITIAL]
+    elif isinstance(base, (list, tuple)):
+        bases = [np.asarray(b, dtype=float) for b in base]
+    else:
+        bases = [np.asarray(base, dtype=float)]
+
     rng = np.random.RandomState(seed)
     results = []
-    for s in range(n_samples):
-        if s == 0:
-            guess = base.copy()
-        else:
-            guess = base * (0.5 + rng.rand(base.size))
-            guess[4] = (rng.rand() - 0.5) * 0.1        # C_z 부호 랜덤화
-            guess[9] = 10.0 + rng.rand() * 50.0        # wn_up
-            guess[11] = 10.0 + rng.rand() * 50.0       # wn_down
-            # 경계 안으로 투영 — 밖에서 시작하면 벌점 지형에서 헤맨다
-            for j, name in enumerate(PARAM_NAMES):
-                lo, hi = PARAM_BOUNDS[name]
-                guess[j] = min(max(guess[j], lo), hi)
-        results.append((func(guess), guess))
+    per_base = max(1, n_samples // len(bases))
+    for b in bases:
+        for s in range(per_base):
+            if s == 0:
+                guess = b.copy()
+            else:
+                guess = b * (0.5 + rng.rand(b.size))
+                guess[4] = (rng.rand() - 0.5) * 0.1        # C_z 부호 랜덤화
+                guess[9] = 10.0 + rng.rand() * 50.0        # wn_up
+                guess[11] = 10.0 + rng.rand() * 50.0       # wn_down
+                # 경계 안으로 투영 — 밖에서 시작하면 벌점 지형에서 헤맨다
+                for j, name in enumerate(PARAM_NAMES):
+                    lo, hi = PARAM_BOUNDS[name]
+                    guess[j] = min(max(guess[j], lo), hi)
+            results.append((func(guess), guess))
     results.sort(key=lambda r: r[0])
     return results
 

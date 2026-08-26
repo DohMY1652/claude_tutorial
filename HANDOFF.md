@@ -1,0 +1,322 @@
+# HANDOFF — 실기 피팅·제어 실험 경과 (2026-08-23 ~ 08-26)
+
+> **이 문서는 실기(6축 파워팩 하드웨어)에서 실제로 돌려 본 결과와 아직 못 고친 것을 적은
+> 인수인계 기록이다.** 절차는 [`RUNBOOK.md`](RUNBOOK.md), 배경·이론은 [`README.md`](README.md),
+> 채널 MPC 알고리즘은 [`MPPI.md`](MPPI.md).
+>
+> 브랜치 `feat/mppi-controller`. 이 세션 이전 상태는 "피팅 도구는 다 만들었지만 실기 데이터는
+> 하나도 없다" 였고, 이제 **밸브·펌프 실측 피팅 결과가 config 에 들어갔다.** 그런데
+> **제어는 아직 안 된다** — 아래 3절이 그 이유와 지금까지 좁혀 놓은 범위다.
+
+---
+
+## 1. 한눈에 — 지금 상태
+
+| 영역 | 상태 |
+|---|---|
+| 밸브 13-parameter (12채널 × 3밸브) | **실측 피팅 완료** → `config/valve_params.yaml`. 기동 로그 `12/12 채널` 확인됨 |
+| 펌프 레일 부피·누설 | **실측 완료** → `config/pump_params.yaml` (pos 138.6 mL / neg 29.0 mL) |
+| 펌프 실측 능력경계 | **실측 완료 + C++ 반영 경로 신설.** 기동 로그 `실측 능력경계 4 점으로 cap_ppos 덮어씀` |
+| 채널 밸브 구동 | **동작한다** (아래 2-1 크래킹 게이트 버그 수정 후) |
+| 압력 추종 제어 | **안 된다 — 진동/뱅뱅.** 3절 참조 |
+| 하드웨어 응답 속도 | **빠르다.** 전류 20 ms, 압력 상승 8 ms / 정착 150 ms 실측 (3-4 참조) |
+| 엔코더 board 20·21·22 | 캘리브레이션 없음, 기본 gain 부호가 실측 3개와 **반대** (위치 제어 전 필수) |
+| gid11 (board16) | **하드웨어 무응답** — 소프트웨어로 못 고침, 물리 점검 필요 |
+
+---
+
+## 2. 이 세션에서 찾아 고친 결함
+
+### 2-1. 크래킹 게이트가 채널 밸브를 영구히 닫아 놨다 ★ 가장 중요
+
+`AcadosMpc::finish()` 에 이 브랜치에서 추가돼 있던 코드:
+
+```cpp
+auto taper_above_crack = [tp](float u, float u_c) {
+  return (u <= u_c) ? 0.0f : u_c + (u - u_c) * tp;   // ← (u <= u_c) 분기가 문제
+};
+```
+
+`taper_` 는 오차가 크면 1.0 이라 **아무것도 깎지 않아야** 하는데, 그 앞의 조건분기가
+`u ≤ u_crack` 이면 무조건 0 으로 떨어뜨린다. 결과: **레퍼런스는 정상 수신되고 레일 PID 도 정상
+동작하는데 채널 밸브 PWM 만 계속 0**. `board/pwm_cmd` 를 직접 떠서 확인했다 —
+`board5 v1/v2/v3 = [0,0,0]` 인데 `board1 v1 = 39`(레일은 살아 있음).
+
+`git show master:src/can_powerpack/src/Controller.cpp` 로 확인한 결과 **master(위치 제어가
+됐던 버전)에는 이 게이트가 아예 없다** — `u0 = clamp(uref+du, 0, 100)` 을 그대로 낸다.
+master 방식으로 되돌렸고, 그 뒤 밸브가 정상 반응한다.
+
+> `u_crack_` 자체는 계속 계산된다(진단·향후용). 게이트만 없앴다.
+
+### 2-2. `valve_params.yaml` 이 두 노드를 죽였다
+
+생성 스크립트가 "가장 잘된 채널 결과를 전체에 복사"할 때 파이썬에서 **같은 dict 객체를 참조로
+재사용**해서, PyYAML 이 anchor/alias(`&id001` / `*id001`)로 압축해 저장했다.
+ROS 2 의 `rcl_yaml_param_parser` 는 alias 를 지원하지 않는다:
+
+```
+Couldn't parse params file: '.../valve_params.yaml'. Error: Will not support aliasing at line 139
+→ can_bridge_node, pp_controller 둘 다 exit code -6 (SIGABRT)
+```
+
+alias 를 없애자 다음 문제가 나왔다 — `_fit.weak_params: []`(빈 리스트)는 타입을 추론할 수 없어
+**노드 생성 중**(사용자 코드 실행 전) `InvalidParameterValueException: No parameter value set`.
+
+`_fit` 은 사람이 보는 진단 메타데이터(mode / r2 / sse / weak_params)일 뿐 C++ 이 읽지 않으므로
+운영 config 에서는 통째로 제거했다. 피팅 리포트(`results_fit/*/report.md`)에는 그대로 남아 있다.
+
+> **교훈: config 로 나가는 yaml 에 빈 리스트·anchor/alias 를 절대 넣지 말 것.**
+
+### 2-3. 실측 능력경계가 컨트롤러에 도달하지 않았다
+
+`pump_fit_solve.py` 는 `pump_frontier_measured`(Phase F 직접 측정)를 yaml 에 쓰는데,
+**C++ 이 그 키를 읽는 코드가 없었다.** `PressureRefGen` 은 기동 시 `pump.*` 기하값으로
+슬라이더-크랭크를 시뮬레이션해 cap 테이블을 스스로 만든다 — 즉 신뢰도 낮은 기하 피팅만
+반영되고, 신뢰도 높은 실측은 무시되고 있었다.
+
+신설한 경로: `PumpTable::override_cap_measured()` → `PressureRefGen::apply_measured_frontier()`
+→ `Controller.cpp` 가 `build_pump_table()` **직후** 파라미터를 읽어 적용.
+측정 구간 안은 실측으로 덮어쓰고 **밖은 기하 외삽을 그대로 둔다.** 헤더 단독 테스트로 검증:
+
+```
+-65.4 kPa → 334.7 (실측 2점 평균)   -63.8 → 359.5   -36.0 → 385.8   (정확)
+-50.0 kPa → 372.6 (측정 두 점 사이 선형보간)
+-90 / -80 / -20 / 0 kPa → 오버라이드 전과 동일 (측정범위 밖)
+빈 벡터 / 길이불일치 → 무변화
+```
+
+기존 하드코딩은 **1200 kPa** 였다 — 실측(335~386)의 3~4배 과대평가.
+
+### 2-4. 피팅 스크립트 결함들
+
+| 파일 | 결함 | 수정 |
+|---|---|---|
+| `pump_fit_solve.py` | neg 레일 "맨몸" 감쇠로 `leak_none0.csv` 만 봐서, 그 회차 R²=0.71 로 기각되면 부피를 못 구하고 죽었다. `leak_pos100.csv`(양압에만 ΔV) 회차의 neg 감쇠는 R²=0.97 로 정상이고 **neg 부피는 안 건드렸으니 물리적으로 맨몸과 동등**한데 태그만 보고 무시 | "이 레일에 ΔV 가 안 들어간 모든 회차"를 맨몸 후보로 |
+| `valve_fit_record.py` | 종료 시 SIGABRT (`destroy_node()` 가 spinner 의 `flush()` 와 경합) | `_shutting_down` Event + `shutdown()→join()→destroy_node()` 순서 |
+| `valve_fit_record.py` | 트립 후 `to_neutral()`/`charge_full()` 이 안전벤트를 **다시 닫아** 압력이 계속 상승 (실기 재현: 둘 다 닫힌 채 190→197 kPa) | `wait_hold()` 반환값이 `'tripped'` 면 즉시 return |
+| `valve_fit_record.py` | 200 Hz 재발행이 CAN 버스를 점유해 ID 높은 보드(14+)로 가는 새 명령이 우선순위 경합에서 밀렸다 | `keepalive_flush()` + `--flush-hz`(기본 20) 로 재발행만 감속. 실제 상태 변화는 여전히 즉시 발행 |
+| `valve_fit_solve.py` | 단일 `BASE_INITIAL` 에서만 시작해 나쁜 국소최적에 갇힘 | `--warm-start-yaml` + `random_search(base=[...])` 다중 base |
+| `valve_fit_solve.py` | dP/dt 순간 글리치가 피팅을 오염 | `reject_glitches()` (MAD 기반). **단, 글리치 마스크를 `full['mask']` 에 섞으면 이중부피법이 깨진다**(부피오차 2.9%→18.4% 회귀 확인) → 13-parameter 피팅용 `fit_mask` 에만 적용 |
+| `pump_fit_record.py` | 같은 SIGABRT | 동일 수정 |
+
+### 2-5. 센서 재영점
+
+board7(gid2 양압 ch2) offset `1089.0 → 1054.0` (사용자 재측정). `powerpack_config.yaml` 과
+`scripts/can_monitor.py` 양쪽에 반영.
+
+---
+
+## 3. 미해결 — 다음 세션이 이어서 할 일
+
+### 3-1. ★ 압력 추종이 안 된다 (뱅뱅/진동)
+
+`solver:=mppi num_actuators:=1 actuator_connected:=false`, 45° 지령, 레일·매크로 공급 정상.
+ch0 실측 압력이 이렇게 왕복한다:
+
+```
+t=+1s  100.6      t=+4s  553.6      t=+7s  101.1
+t=+2s  101.1      t=+5s  555.8      t=+8s  101.1
+t=+3s  100.3      t=+6s  524.8
+```
+
+과압 세이프티(190 kPa, 해제 175)가 반복 래치돼 벤트를 전개하고, 내려가면 다시 채운다.
+목표는 178 kPa 인데 550 kPa 까지 올라가는 게 문제의 핵심 — **채워 넣는 경로가 너무 세다.**
+
+### 3-2. macro(탱크 부스트)가 1축 저부하에서도 계속 열린다
+
+사용자 지적: *"1축만 하고 있으니 매크로 사용이 필요할 리가 없다."* 맞다. 그런데
+**macro 를 여는 독립 게이트가 두 개** 있고, 둘 중 하나만 막아도 다른 쪽이 연다:
+
+| 게이트 | 기본값 | 위치 | 근거 |
+|---|---|---|---|
+| `PressureRefGen.macro_gate_frac` | **0.02** (2%!) | `Controller.cpp:2685` | 생성기의 축별 유량 부족률 `starve_pos > frac` |
+| `MPC_parameters.macro_micro_sat_pct` | **100** | `Controller.cpp:496` | `u_micro_req >= sat_pct` (micro 포화) |
+
+```cpp
+auto macro_open = [this](float u_micro_req) {
+  return macro_allow_.load(...) || u_micro_req >= cfg_.macro_micro_sat_pct;
+};
+```
+
+`macro_gate_frac=1.1` 만 준 실험에서는 `starve 0/0% [--]` 로 게이트가 닫혔고
+`board5 v3 = 0` 도 확인됐지만, 그때 탱크가 `LOW`(106~240 kPa)로 빠져 있어서
+"게이트가 닫혀서 조용했던 것"과 "탱크가 비어서 힘을 못 썼던 것"이 구분되지 않았다.
+탱크를 교체하고 다시 하니 다시 550 kPa 로 폭주했다.
+
+**다음 실험 (미완 — 사용자가 중단시킴):** 두 게이트를 동시에 끄고 micro 단독으로 추종되는지 본다.
+
+```bash
+ros2 launch can_powerpack control.launch.py \
+  solver:=mppi num_actuators:=1 actuator_connected:=false \
+  overrides:=PressureRefGen.macro_gate_frac=1.1,MPC_parameters.macro_micro_sat_pct=1000
+```
+
+여기서 조용해지면 원인은 macro 게이트 정책이고, 여전히 폭주하면 micro 피드포워드
+역모델(`compute_input_reference`)이나 13-parameter 자체를 의심해야 한다.
+
+`macro_gate_frac` 기본값 0.02 는 재검토 대상이다 — 생성기가 이미 슬루박스 제약 안에서 최적해를
+내는데, 별도 진단식(`mboost = dup − mfill_cap`)이 계산 방식이 달라 2% 를 너무 쉽게 넘긴다.
+
+### 3-3. QP 솔버가 `control_mode=0` 에서 거의 100% 실패한다
+
+```
+[AcadosMpc] gid=0 QP: hot-start 실패 0.0% (cold 로 복구), 완전 실패 100.00% / 5000 호출
+```
+
+`control_mode=2` 에서는 같은 QP 가 ~4% 만 실패한다. `control_mode=0` 경로 전용 문제로 보인다.
+아직 원인 미확인 (사용자 지시로 MPPI 우선 진행).
+
+### 3-4. `control_mode=0`(압력 직접 지정)은 지금 구조상 제어가 안 된다
+
+`RefTcpServer` 는 `control_mode != 1,2` 일 때 `[pos_kpa, neg_kpa]` 를 받아 `mpc_ref_kpa_` 에
+직접 넣는다(→ 새로 만든 `scripts/pressure_ref_client.py`). 그런데 **레일 셋포인트를
+갱신하는 코드가 `control_mode 2` 전용**이다:
+
+```cpp
+// Controller.cpp:2692 — run_optimized_pressure_ref() 안, 즉 mode 2 에서만 실행된다
+pid_pos_.ref = gen_rail_pos_sp_kpa_;
+pid_neg_.ref = gen_rail_neg_sp_kpa_;
+```
+
+mode 0 에서는 `LinePID.pos.ref` / `neg.ref` 가 yaml 고정값(**150 / 20 kPa**)에 박힌 채
+채널 목표와 무관하게 돌아 진동한다. mode 0 을 쓰려면 목표 압력에서 레일 SP 를 유도해
+`LinePID` 에 넘기는 코드가 필요하다.
+
+### 3-5. "PID 모드 900 ms 데드타임"은 오진이었다 — 하드웨어는 빠르다
+
+세션 초반에 `current_mode/control_type` 을 `0,0`(Normal/PID) → `1,1`(Debug/PWM) 로 바꾸고
+**그 모드에서 밸브 13-parameter 전체를 피팅했다.** 이유는 "PID 모드에서 v1 이 ~900 ms
+데드타임을 보인다" 였다.
+
+사용자 요청으로 `can_control.py` 방식(ROS 없이 CAN 직접)으로 재측정한 결과 — Normal(PID) 모드,
+board5 v3 에 4095 스텝:
+
+```
+ t[s]      I3[mA]     P[kPa]
+0.536        0.0     102.35     ← 스텝 직전
+0.538       32.6     101.86     ← 전류 상승 시작 (2 ms)
+0.546      182.0     117.98     ← 압력 상승 시작 (8 ms)
+0.558      241.7     255.46
+0.600      249.8     514.56
+0.688      250.7     590.51     ← 정착 (~150 ms)
+```
+
+**전류 20 ms 정착, 압력 8 ms 반응 / 150 ms 정착. 900 ms 데드타임은 없다.**
+당시 "데드타임"으로 보였던 것은 **양압 레일에 공급압이 없었기 때문**일 가능성이 높다 —
+이 세션에서 board1 을 직접 재보니 101.2 kPa(완전 대기압)였고, v1(micro)에 250 mA 를 1.2 초
+넣어도 압력이 전혀 안 움직였다. v3(macro, 669 kPa 탱크)로 옮겨 붙이자 위처럼 정상 응답했다.
+
+그래서 `current_mode/control_type` 을 **master 기본값 `0,0`(Normal/PID)로 되돌렸다.**
+다만 **`valve_params.yaml` 은 Debug 모드에서 피팅한 값이다** — 두 모드의 크래킹·응답 특성이
+다르면 Normal 모드에서 재피팅이 필요할 수 있다. 이게 3-1 폭주의 원인 후보이기도 하다.
+
+### 3-6. 양압만 쓰고 음압은 대기압에 머문다 (설계 의도 — 유지 결정)
+
+`PressureRefGen::objective()` 의 `J0`(힘 추종)은 `F = P⁺·A − P⁻·A` 만 보므로, 목표 F 를
+만족하는 (P⁺,P⁻) 조합이 **직선 하나 전체**다 — J0 만으로는 어느 쪽을 쓸지 정해지지 않는다.
+실제로 한쪽을 고르는 건 `J2`(가용유량 최대화)이고, 지금 레일 조건에서는 그게 항상 양압이다.
+
+τ ≤ 4.11 N·m(= P⁺ 단독 최대) 구간에서는 P⁻ 가 아예 안 움직이고, 그 위(110~140° 지령,
+τ 4.7~6.9)에서는 P⁻ 가 47~89 kPa 까지 실제로 내려간다. **버그가 아니라 원본 MATLAB 포팅
+그대로의 자기균형 인수인계 설계다.** 사용자 확인 후 원설계 유지로 결정했다
+(균형 사용을 원하면 목적함수에 분배 항을 추가해야 한다).
+
+### 3-7. 그 외 남은 것
+
+- **엔코더 board 20·21·22 캘리브레이션 없음.** 기본 gain 이 실측 3개(모두 음수)와 부호가
+  반대라 그 축은 각도가 거꾸로 읽힌다. 위치 제어(mode 2) 전 필수. `scripts/encoder_calib.py`, RUNBOOK 0.5절
+- **gid11(board16) 하드웨어 무응답.** `--flush-hz` 로 board14·15 는 개선됐지만 board16 은
+  버스가 한가할 때도 무반응 — 배선/탱크 물리 점검 필요
+- **`ORIFICE_MM[('pos_micro','v2')]` 가 4.0 으로 하드코딩.** 실제 2.3 mm (사용자 확인).
+  `valve_fit_solve.py` 에서 수정해야 하나 아직 안 했다
+- **음압 피팅 R² 가 낮다** (최선 0.378). 사용자가 제안한 대안(라인에 100 mL 고정탱크 +
+  채널에 170 kPa 레귤레이터)은 `--fixed-volume-side line` 로 **구현·회귀검증까지 됐지만**
+  양압 센서 문제로 실측은 보류 상태
+- **`results_fit/` · `results_pump/` 는 `.gitignore` 대상** — 원본 CSV 와 피팅 리포트는
+  이 기계 로컬에만 있다. 클론한 쪽에서는 재현할 수 없으니 필요하면 따로 받을 것
+
+---
+
+## 4. 실측 피팅 결과 요약
+
+### 밸브 (`config/valve_params.yaml`, 12채널 × micro/atm/macro)
+
+| 채널 | 밸브 구성 | 출처 |
+|---|---|---|
+| ch0–5 (양압) | v1 fill 2.3 mm, v2 vent 2.3 mm, v3 boost 1.6 mm | pos_micro 채널별 개선 피팅 + pos_macro 는 gid1(board6) 결과 R²=0.7343 을 전체 적용 |
+| ch6–11 (음압) | v1/v2/v3 전부 **같은 4.0 mm 밸브** | gid9 v1 결과 R²=0.378 을 micro/atm/macro 에 동일 적용 |
+
+13-parameter 는 과매개변수(flat manifold)라 **개별 파라미터는 신뢰하지 말 것.**
+믿을 수 있는 건 R² / 크래킹 임계 / 챔버 부피뿐이다 (RUNBOOK 자체 판정 기준).
+
+오리피스 지름과 파라미터 사이에 뚜렷한 경향은 **없었다** — 밸브의 역할(fill/vent/boost)이
+지름보다 지배적이었다.
+
+### 펌프 (`config/pump_params.yaml`)
+
+| 항목 | 값 | 신뢰도 |
+|---|---|---|
+| 레일 부피 pos / neg | 138.6 / 29.0 mL | 이중부피법 실측. 단 neg 의 "맨몸"은 ΔV→pos 회차 대체값(2-4 참조) |
+| 레일 누설 pos / neg | 0.00108 / 0.00005 LPM/kPa | 위와 동일 |
+| 실측 능력경계 | P⁻ −65.4→P⁺ 334.5 / −63.8→359.5 / −36.0→385.8 | **직접 측정. 컨트롤러가 쓰는 유일한 출력** |
+| 기하 (`pump.*`) | 소기량 456.65 mL, 압축비 22.0 | **낮음.** 소기량×Cb_in 축퇴, 데드헤드는 외삽 |
+
+Phase M 은 40점 확보했지만 **양 레일 교차검증(질량보존) 가능한 점이 0개** — pulse 구간에서
+admit 이 완전히 안 닫혔을 가능성. 진행에는 지장 없지만 교차검증은 못 했다.
+
+---
+
+## 5. 지금 상태로 다시 시작하는 방법
+
+```bash
+colcon build --packages-select can_powerpack --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
+
+# 무액추에이터 1축, MPPI (RUNBOOK 4.5.2 의 가장 안전한 시작점)
+ros2 launch can_powerpack control.launch.py \
+     solver:=mppi num_actuators:=1 actuator_connected:=false
+
+# 각도 지령 (control_mode 2 = 각도 → 토크 → 압력. 압력을 직접 주는 게 아니다)
+python3 src/can_powerpack/scripts/position_ref_client.py 127.0.0.1 2293 --once 45
+```
+
+기동 로그에서 반드시 확인할 두 줄:
+
+```
+밸브별 13-parameter: 2/2 채널이 chN.{micro,atm,macro}.* 를 로드했다
+PressureRefGen: 실측 능력경계 4 점으로 cap_ppos 덮어씀 (Phase F)
+```
+
+**실측 압력은 `[RefGen]` 로그로 보지 말 것** — 그건 생성기가 계산한 *레퍼런스*다.
+실측은 토픽을 직접 떠야 한다:
+
+```bash
+ros2 topic echo --once --flow-style /pack2/board/sensors std_msgs/msg/UInt16MultiArray
+# index 0=board1(레일 P+), 2=board3(탱크), 4=board5(ch0), 10=board11(ch6)
+# P = (orig_mV − offset) × gain + 101.325,  orig_mV = (4125 − adc_mV)/0.825
+```
+
+밸브 지령이 실제로 나가는지는 `/pack2/board/pwm_cmd`(index `(board−1)*3 + {0,1,2}` = v1/v2/v3).
+
+### 실험 끝나면 반드시 프로세스를 내릴 것
+
+이 세션에서 여러 번 실수했다 — launch 를 백그라운드로 띄워 놓고 안 죽여서, 사용자가
+"코드를 다 껐는데도 파워팩이 디버그 신호를 받는다 / `can_control.py` 가 안 먹는다" 상황이
+반복됐다. CAN 버스를 물고 있으면 수동 도구가 경합에서 밀린다.
+
+```bash
+pgrep -af "control.launch.py|lib/can_powerpack/"   # 남은 게 없어야 한다
+```
+
+---
+
+## 6. 안전 관련 — 하드코딩된 값들
+
+| 항목 | 값 | 위치 |
+|---|---|---|
+| 과압 트립 / 해제 | 190 / 175 kPa | `pressure_safety_limit_kpa_`, 래치되면 v2 전개 |
+| 채널 정격 | P⁺ ≤ 185 kPa, P⁻ ≥ 27 kPa | `PositionController.axis*.p_pos_max_kpa` 등 |
+| PWM 워치독 | 200 ms (실기만, 가상 없음) | 타임아웃 시 채널 폐쇄 + 라인 밸브(idx 0, 3) 전개 |
+
+**펌프 실험(RUNBOOK 2절)과 밸브 실험의 안전 상태가 정반대다** — 펌프가 도는 동안은
+양 라인 밸브 **전개**가 안전 상태다. "전 밸브 0" 은 릴리프를 닫는 것이라 양압이 무한정 오른다.

@@ -34,7 +34,8 @@ v1(micro)만 레일에 붙으므로 채널 PWM 을 전부 0 으로 두면 끊긴
   board1 v1 을 닫으면 양압 레일이 무한정 올라간다. 안전 상태는 **양 밸브 전개**다.
   · 양압 상한 / 음압 하한 예측 정지 (밸브 닫힘 꼬리를 앞질러 판정) + 도달 시 즉시 전개
   · 종료·예외·Ctrl-C 시 양 밸브 전개로 두 레일을 대기압으로 되돌린 뒤 0
-  · CanBridge 에는 워치독이 없다 — 마지막 명령이 250 Hz 로 영구히 나간다
+  · 실기 CanBridge 는 200ms PWM 워치독이 있다(가상 하드웨어에는 없다) — 그래서
+    상태 변화 여부와 무관하게 _tick() 이 log_hz 로 계속 재발행한다.
 
 사용 예:
   python3 pump_fit_record.py --phase leak
@@ -106,6 +107,7 @@ class RailRecorder(Node):
         self.rows = []
         self.t0 = time.time()
         self.tripped = None
+        self._shutting_down = threading.Event()
 
         self.create_timer(1.0 / args.log_hz, self._tick)
 
@@ -161,6 +163,11 @@ class RailRecorder(Node):
 
     # ── 기록 + 트립 ───────────────────────────────────────────────────────
     def _tick(self):
+        # valve_fit_record.py 와 동일한 이유로, 상태 변화가 없어도 log_hz 로
+        # 계속 재발행한다 (실기 CanBridge 의 200ms PWM 워치독 대응).
+        if self._shutting_down.is_set():
+            return
+        self.flush()
         if not self._seen:
             return
         pp, pn = self.p_pos(), self.p_neg()
@@ -522,7 +529,8 @@ def main():
 
     rclpy.init()
     node = RailRecorder(args, calib)
-    threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
+    spinner = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    spinner.start()
 
     def _sigint(_s, _f):
         raise KeyboardInterrupt
@@ -604,8 +612,12 @@ def main():
             yaml.safe_dump(meta, f, allow_unicode=True, sort_keys=False)
         print(f'저장: {path}  ({len(node.rows)} 행)')
 
-        node.destroy_node()
+        # valve_fit_record.py 와 동일한 이유(SIGABRT 재현) — shutdown() 으로 spin() 을
+        # 먼저 반환시키고 스레드가 끝난 뒤에 destroy_node() 를 부른다.
+        node._shutting_down.set()
         rclpy.shutdown()
+        spinner.join(timeout=2.0)
+        node.destroy_node()
     return 0
 
 

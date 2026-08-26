@@ -728,12 +728,12 @@ std::array<float,3> AcadosMpc::prepare(float dt_ms, float current_time_sec)
 void AcadosMpc::finish(const std::array<float,3>& du3,
                        std::array<uint16_t, MPC_OUT_DIM>& out3)
 {
-  // 테이퍼는 보정까지 포함한 **최종** 명령에 적용한다. uref 만 줄이면 Δu 로 다시
-  // 밀어올려 무력화되기 때문이다.
-  const float tp = taper_;
-  auto taper_above_crack = [tp](float u, float u_c) {
-    return (u <= u_c) ? 0.0f : u_c + (u - u_c) * tp;
-  };
+  // master(위치제어 검증된 버전)는 크래킹 게이트가 전혀 없이 clamp(uref+du,0,100)를
+  // 그대로 냈다. 이 브랜치에서 추가했던 `(u <= u_crack) ? 0 : ...` 분기는 taper_=1
+  // (오차가 커서 전혀 안 깎여야 하는 상황)에도 u가 크래킹 임계값 이하면 무조건 0으로
+  // 떨어뜨려 — 실측 결과 채널 밸브 PWM이 계속 0으로 죽고 압력이 전혀 안 움직였다
+  // (레일 PID는 정상 동작 — 이 게이트만의 문제였다). master 방식으로 되돌린다.
+  (void)taper_;
   // 비유한 값 차단 — **실기 안전에 필수**. 솔버나 모델이 NaN/Inf 를 내면 uint16 변환이
   // 정의되지 않아 임의의 PWM 이 나갈 수 있다. 그런 값은 0(밸브 닫힘)으로 떨어뜨리고
   // 한 번만 경고한다 (500 Hz 로그 폭주 방지).
@@ -746,11 +746,11 @@ void AcadosMpc::finish(const std::array<float,3>& du3,
     return 0.0f;
   };
   std::array<float,3> u0{
-    taper_above_crack(std::clamp(safe(uref_[0] + du3[0], "u_micro"), 0.0f, 100.0f), u_crack_[0]),
-    taper_above_crack(std::clamp(safe(uref_[1] + du3[1], "u_macro"), 0.0f, 100.0f), u_crack_[1]),
-    taper_above_crack(std::clamp(safe(uref_[2] + du3[2], "u_atm"),   0.0f, 100.0f), u_crack_[2]),
+    std::clamp(safe(uref_[0] + du3[0], "u_micro"), 0.0f, 100.0f),
+    std::clamp(safe(uref_[1] + du3[1], "u_macro"), 0.0f, 100.0f),
+    std::clamp(safe(uref_[2] + du3[2], "u_atm"),   0.0f, 100.0f),
   };
-  for (auto& v : u0) if (!std::isfinite(v)) v = 0.0f;   // 테이퍼 이후 한 번 더
+  for (auto& v : u0) if (!std::isfinite(v)) v = 0.0f;   // clamp 이후 한 번 더
   last_u3_ = u0;
 
   // 밸브 내부 상태(q, qd) 추정을 실제 인가 명령 + 측정 압력으로 한 틱 전진시킨다.
@@ -1332,6 +1332,28 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     RCLCPP_INFO(get_logger(), "펌프 능력 테이블 계산 중...");
     const auto t0 = std::chrono::steady_clock::now();
     refgen_->build_pump_table();
+
+    // 실측 능력경계(pump_fit_solve.py Phase F) — 기하 피팅보다 우선한다. 기하는
+    // 5-파라미터 슬라이더-크랭크라 소기량×Cb_in 축퇴가 남아 데드헤드 외삽 오차가
+    // 크다(자기검증 ~15%); 측정 구간 안은 직접 측정으로 덮어쓰고 밖은 기하 외삽을
+    // 그대로 둔다. pump_frontier_measured 가 없으면(빈 벡터) 기하 테이블 그대로.
+    {
+      const auto pneg_kpa = get_param_or<std::vector<double>>(this,
+          "PressureRefGen.pump_frontier_measured.pneg_kpa_gauge", {});
+      const auto ppos_kpa = get_param_or<std::vector<double>>(this,
+          "PressureRefGen.pump_frontier_measured.ppos_max_kpa_gauge", {});
+      if (!pneg_kpa.empty() && pneg_kpa.size() == ppos_kpa.size()) {
+        std::vector<double> pneg_pa(pneg_kpa.size()), ppos_pa(ppos_kpa.size());
+        for (size_t i = 0; i < pneg_kpa.size(); ++i) {
+          pneg_pa[i] = pneg_kpa[i] * 1000.0;
+          ppos_pa[i] = ppos_kpa[i] * 1000.0;
+        }
+        refgen_->apply_measured_frontier(pneg_pa, ppos_pa);
+        RCLCPP_INFO(get_logger(), "PressureRefGen: 실측 능력경계 %zu 점으로 cap_ppos 덮어씀 (Phase F)",
+                    pneg_kpa.size());
+      }
+    }
+
     RCLCPP_INFO(get_logger(), "펌프 테이블 완료 (%.2f s). 능력경계: 음압 %.1f kPa → 양압 %.1f kPa",
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
       gp.Pneg_cap_deep / 1e3, refgen_->cap_ppos(gp.Pneg_cap_deep) / 1e3);
