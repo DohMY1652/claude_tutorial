@@ -183,10 +183,8 @@ public:
     float target_time_constant = 0.2f;
     // macro 를 여는 판정에 쓰는 micro 포화 기준 [%]. 100 = 레일 밸브를 완전히 열었는데도
     // 요구 유량을 못 낼 때만 macro 를 연다 (임의 임계값이 아니라 밸브 물리 한계).
-    float macro_micro_sat_pct = 100.0f;
     // 명령 테이퍼 폭 [kPa]. 오차가 이 안으로 들어오면 **크래킹 임계 위쪽 여유분**을
     // 연속적으로 줄인다. 하드 데드밴드를 대체한다 — 이유는 solve() 주석 참조.
-    float cmd_taper_kpa = 3.0f;
     // "닫힘"으로 볼 유효면적 비율 (A_eff / A_max). 이 면적에 해당하는 전류가 크래킹
     // 임계이고, 그 이하에서는 솔레노이드 자기력이 스풀을 못 들어 유량이 0 이다.
     float valve_crack_area_frac = 1e-6f;
@@ -236,7 +234,6 @@ public:
     float mppi_track_scale_kpa{10.0f};
     float mppi_terminal_mult{5.0f};
     int   mppi_substeps{2};
-    bool  mppi_taper_in_rollout{true};
     // 롤아웃 초기 상태로 필터 전 생값을 쓴다. 측정 지연 가설의 싼 **진단** 스위치.
     // 계측(스텝 4개 평균): 압력 RMSE 5.51 → 5.09, 정상상태 압력오차 0.25 → 0.00 으로
     // 개선되지만 위치 IAE 는 5.30 → 6.43 으로 악화된다. 생값은 양자화 잡음(양압 보드
@@ -281,14 +278,8 @@ public:
   const mppi::ChannelPlant& plant_params() const { return mppi_pv_; }
   const Config& cfg() const { return cfg_; }
 
-  // macro(탱크 부스트 / 이젝터) 경로 개방 허용 — 생성기(mode 2)가 매 틱 갱신한다.
-  //
-  // macro 는 "레일만으로는 이번 스텝 수요를 못 낸다"일 때만 열려야 한다. 판정 경로가
-  // 두 개이고 OR 로 결합된다 (반응성이 절약보다 우선이므로 둘 중 하나만 켜져도 연다):
-  //   ① 생성기: 축별 유량 부족률 > macro_gate_frac  (한 스텝 앞을 보는 계획 기반)
-  //   ② MPC 자체: micro 밸브 명령이 포화 (지금 이 순간의 백스톱, mode 0/1 은 이것만)
-  // 둘 다 물리에서 유도되므로 임의로 정하는 kPa 임계값이 필요 없다.
-  inline void set_macro_allow(bool allow) { macro_allow_ = allow; }
+  // macro 개방 게이트는 없다. 분담량이 곧 개방 여부다 —
+  // compute_input_reference 의 split_demand 주석 참조.
   // 이 채널이 붙은 레일의 압력 변화율 [kPa/s]. 컨트롤러가 12채널 명목 명령으로 한 번
   // 계산해 공유한다 — 롤아웃이 레일을 상수로 두던 오차(≈5~34 kPa)를 없앤다.
   inline void set_rail_rate(float r) { rail_rate_ = r; }
@@ -311,7 +302,6 @@ private:
   // 밸브별 크래킹 임계 [%] — compute_input_reference 가 매 틱 현재 Pin/z 로 갱신한다.
   // 순서는 last_u3_ 와 동일: [0]=micro, [1]=macro, [2]=atm.
   std::array<float,3> u_crack_{0.f, 0.f, 0.f};
-  std::atomic<bool> macro_allow_{false};   // 생성기가 매 틱 갱신 (mode 2)
   std::array<float,3> compute_input_reference(float P_now, float P_micro, float P_macro, float P_macro_neg, float dt_sec, float current_time_sec);
   void build_mpc_qp(const std::vector<float>& A_seq, const std::vector<Eigen::RowVector3f>& B_seq, float P_now, const std::vector<float>& P_ref, Eigen::MatrixXf& P, Eigen::VectorXf& q, Eigen::MatrixXf& A_con, Eigen::VectorXf& LL, Eigen::VectorXf& UL);
   std::array<float,3> solve_qp_first_step(const Eigen::MatrixXf& P, const Eigen::VectorXf& q, const Eigen::MatrixXf& A_con, const Eigen::VectorXf& LL, const Eigen::VectorXf& UL);
@@ -348,7 +338,6 @@ private:
   float vol_dot_est_{0.0f};        // compute_input_reference 가 매 틱 갱신 [m³/s]
   // prepare → finish 사이에 넘겨야 하는 값들
   std::array<float,3> uref_{0.f,0.f,0.f};
-  float taper_{1.0f};
   float dt_sec_{0.004f};
   float P_used_{101.325f};         // 이번 틱에 실제로 쓴 압력 (추정/생/필터 중 하나)
   float rail_rate_{0.0f};          // 레일 압력 변화율 [kPa/s] (컨트롤러가 주입)
@@ -659,8 +648,6 @@ private:
     double leakage_u_pos{0.0};
     double leakage_u_neg{0.0};
     double target_tc{0.2};
-    double macro_micro_sat_pct{100.0};
-    double cmd_taper_kpa{3.0};
     double valve_crack_area_frac{1e-6};
     // 솔버 선택 + MPPI 하이퍼파라미터
     std::string solver{"qp"};
@@ -680,7 +667,6 @@ private:
     double mppi_track_scale_kpa{10.0};
     double mppi_terminal_mult{5.0};
     int    mppi_substeps{2};
-    bool   mppi_taper_in_rollout{true};
     bool   mppi_raw_state{false};
     bool   mppi_estimator{false};
     double obs_gain{0.10};
@@ -810,7 +796,6 @@ private:
 
   // macro 게이트 임계 — 생성기의 축별 **유량 부족률** [0,1] 이 이 값을 넘으면 macro 를 연다.
   // 무차원이라 "레일이 이번 스텝 수요의 몇 %를 못 대면 부스트를 부른다"로 읽힌다.
-  double gen_macro_gate_frac_{0.02};
   std::vector<double> gen_starve_pos_, gen_starve_neg_;   // 진단용 [%]
 
   // gid → MPC 조회 (macro 게이트 설정용)

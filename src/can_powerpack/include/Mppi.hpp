@@ -67,14 +67,11 @@ struct PlantParams {
   float ejector_p_limit{11.325f};
   float leakage_u{0.0f};           // 이 채널 방향의 누설 등가 명령 [%]
   float crack_area_frac{1e-6f};    // "닫힘"으로 볼 A_eff/A_max
-  float cmd_taper_kpa{3.0f};
 
   // ── finalize() 가 채우는 사전계산값 ──────────────────────────────────────
-  // F_crack: A_eff = crack_area_frac·A_max 가 되는 F_net. sigma 가 crack_area_frac 만으로
-  //   정해지므로 **Pin·z 와 무관한 상수**다 → 런타임에 log 를 부를 필요가 없다.
-  //   u_crack(Pin,z) = (F_crack − C_z·z − C_p·Pin + C_k)/I_MAX·100  (Pin·z 에 affine)
   // F_open: 이 F_net 이하이면 A_eff 가 float 0 으로 언더플로한다 → exp/log1p 조기 탈출.
-  float F_crack{0.0f};
+  // u_crack 은 이제 상수 F_crack 이 아니라 u=0 받침 위에서 매번 역산한다
+  // (Mppi.cpp 의 area_eff / PlantParams::u_crack 주석 참조).
   float F_open{0.0f};
   void finalize();
 
@@ -145,7 +142,7 @@ float valve_dyn(const PlantParams& p, ValveState& vs, float Q_static, float dt);
 // 밸브 3개의 파라미터. **밸브마다 다르다** — RUNBOOK.md 의 피팅이 micro/atm/macro 를
 // 따로 맞추고 `valve_fit_solve.py` 가 `channel_config.chN.{micro,atm,macro}.*` 로 쓴다.
 // 인덱스는 ValveIdx (0=micro, 1=macro, 2=atm). 채널 공통 필드(is_positive, leakage_u,
-// ejector_p_limit, cmd_taper_kpa)는 세 원소에 같은 값을 넣는다.
+// ejector_p_limit)는 세 원소에 같은 값을 넣는다.
 using ChannelPlant = std::array<PlantParams, 3>;
 
 // 한 스텝 전진. u 는 **테이퍼·클램프까지 끝난 실제 인가 명령** [%] 3개.
@@ -203,7 +200,6 @@ struct Params {
   float terminal_mult{5.0f};   // 말단 상태 가중 배수
 
   float du_min{-100.f}, du_max{+100.f};  // uref 대비 보정 한계 [%]
-  bool  taper_in_rollout{true};         // 롤아웃도 명령 테이퍼를 통과시킨다
 
   // 비용이 평평할 때(모든 샘플이 같은 궤적 → median−min ≈ 0) 갱신을 하면 Σŵε 가
   // 순수 잡음이 되어 명목이 무작위 보행한다. 그런 틱에는 갱신 대신 명목을 0(=순수

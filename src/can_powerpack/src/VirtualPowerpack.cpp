@@ -292,20 +292,35 @@ double VirtualPowerpack::step_valve(double u_pct, double P_in, double P_out,
   u_pct = std::clamp(u_pct, 0.0, 100.0);
   const double I = u_pct / 100.0 * vp.I_MAX;
 
-  // Bouc-Wen 히스테리시스
+  // Bouc-Wen 히스테리시스 — mppi::step_bw 와 같은 적분(수축조건까지 dI 를 쪼갠다).
+  // 쪼개지 않으면 beta_bw·|dI| ≫ 1 에서 z 가 매 틱 ±1e6 로 튀어 밸브가 릴레이가 된다.
   const double dI     = I - vs.prev_I;
   const double abs_dI = std::abs(dI);
-  vs.z = std::clamp(vs.z + vp.A_bw * dI
-                          - vp.beta_bw  * abs_dI * vs.z
-                          - vp.gamma_bw * dI * std::abs(vs.z), -1e6, 1e6);
+  {
+    const double rate = (vp.beta_bw + vp.gamma_bw) * abs_dI;
+    const int    n    = (rate > 0.25) ? std::min(256, (int)std::ceil(rate / 0.25)) : 1;
+    const double ddI = dI / n, abs_ddI = abs_dI / n;
+    for (int i = 0; i < n; ++i)
+      vs.z = std::clamp(vs.z + vp.A_bw * ddI
+                              - vp.beta_bw  * abs_ddI * vs.z
+                              - vp.gamma_bw * ddI * std::abs(vs.z), -1e6, 1e6);
+  }
   if      (dI >  1e-4) vs.dir = 1;
   else if (dI < -1e-4) vs.dir = 0;
   vs.prev_I = I;
 
   // 유효면적: A_max · sigmoid(k_shape · F_net)^alpha
-  const double F_net    = std::clamp(I + vp.C_z * vs.z + vp.C_p * P_in - vp.C_k, -500.0, 500.0);
-  const double sigma    = 1.0 / (1.0 + std::exp(-vp.k_shape * F_net));
-  const double Area_eff = vp.A_max * std::pow(sigma, vp.alpha_shape);
+  //
+  // **정상폐쇄 밸브는 무전류에서 닫혀 있다** — u=0 의 받침을 뺀다. mppi::area_eff 와
+  // 반드시 같아야 한다 (MppiSystem.hpp "바꿀 때는 반드시 양쪽을 함께 바꿀 것").
+  // 이유는 Mppi.cpp 의 area_eff 주석 참조: 실기 피팅의 C_p 가 상한에 걸려 있어
+  // 고압 레일에서 u=0 인데도 면적이 열려 버린다.
+  auto area_raw = [&](double I_cmd) {
+    const double F = std::clamp(I_cmd + vp.C_z * vs.z + vp.C_p * P_in - vp.C_k, -500.0, 500.0);
+    const double sg = 1.0 / (1.0 + std::exp(-vp.k_shape * F));
+    return vp.A_max * std::pow(sg, vp.alpha_shape);
+  };
+  const double Area_eff = std::max(0.0, area_raw(I) - area_raw(0.0));
 
   // 정적 유량 [LPM]
   const double Q_static = Area_eff * P_in * get_phi(P_in, P_out);

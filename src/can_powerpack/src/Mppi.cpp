@@ -46,14 +46,13 @@ float phi(float Pin, float Pout)
 // ============================================================================
 // PlantParams 사전계산
 // ============================================================================
+// 아래 두 함수는 u_crack 보다 뒤에 정의되므로 전방 선언한다.
+static float area_raw(const PlantParams& p, float u_pct, float Pin, float z);
+static float u_of_area_raw(const PlantParams& p, float area_req, float Pin, float z);
+
 void PlantParams::finalize()
 {
-  // F_crack: A_eff = frac·A_max ⇔ sigmoid(k·F)^alpha = frac
-  //   ⇒ sigma = frac^(1/alpha),  F = logit(sigma)/k     — Pin·z 무관 상수
-  const double frac  = std::clamp((double)crack_area_frac, 1e-30, 1.0 - 1e-12);
   const double alpha = std::max(1e-9, (double)alpha_shape);
-  const double sigma = std::clamp(std::pow(frac, 1.0 / alpha), 1e-12, 1.0 - 1e-12);
-  F_crack = (float)(std::log(sigma / (1.0 - sigma)) / std::max(1e-9, (double)k_shape));
 
   // F_open: alpha·log1p(exp(−k·F)) > 90 이면 A_eff 가 float 0 으로 언더플로한다.
   //   ⇒ exp(−k·F) > expm1(90/alpha)  ⇒  k·F < −log(expm1(90/alpha))
@@ -61,10 +60,12 @@ void PlantParams::finalize()
   F_open = (float)(x_min / std::max(1e-9, (double)k_shape));
 }
 
+// 크래킹 임계 — 받침을 뺀 유효면적이 crack_area_frac·A_max 에 도달하는 명령.
+// 받침 제거 덕분에 이 값은 어떤 상류압에서도 0 이상이다 (= 닫을 수 있는 밸브).
 float PlantParams::u_crack(float Pin, float z) const
 {
-  const float I_req = F_crack - C_z * z - C_p * Pin + C_k;
-  return std::clamp(I_req / std::max(1e-9f, I_MAX) * 100.0f, 0.0f, 100.0f);
+  const float a0 = area_raw(*this, 0.0f, Pin, z);
+  return u_of_area_raw(*this, a0 + crack_area_frac * A_max, Pin, z);
 }
 
 // ============================================================================
@@ -72,7 +73,8 @@ float PlantParams::u_crack(float Pin, float z) const
 //   pow(sigma, alpha) 를 직접 부르면 alpha≈3884 에서 언더플로 전에 큰 비용을 낸다.
 //   log 항등식으로 바꾸면 exp 한 번 + log1p 한 번이고, 조기 탈출까지 붙는다.
 // ============================================================================
-float area_eff(const PlantParams& p, float u_pct, float Pin, float z)
+// 원시 유효면적 — 13-parameter 피팅 모델 식 그대로.
+static float area_raw(const PlantParams& p, float u_pct, float Pin, float z)
 {
   u_pct = std::clamp(u_pct, 0.0f, 100.0f);
   const float I     = u_pct / 100.0f * p.I_MAX;
@@ -86,6 +88,25 @@ float area_eff(const PlantParams& p, float u_pct, float Pin, float z)
   return p.A_max * std::exp(-e);
 }
 
+// 물리 불변식: **정상폐쇄(normally-closed) 비례밸브는 무전류에서 닫혀 있다.**
+//
+// 13-parameter 피팅에서 C_p·Pin(상류압이 스풀을 밀어 올려 돕는 항)과 C_k(스프링 예압)
+// 는 상류압이 거의 변하지 않는 데이터에서 축퇴한다 — 둘의 **차만** 식별되고 각각은 안
+// 된다. 실기 피팅은 실제로 C_p 가 탐색 상한 2.0e-3 에 정확히 걸린 채 끝났다
+// (valve_fit_model.py 의 bounds = 데이터가 이 항을 구속하지 못했다는 신호).
+// 그 값을 mode 2 의 레일 셋포인트(351 kPa abs)로 외삽하면 u=0 에서
+// A_eff/A_max = 0.106 — 즉 **닫을 수 없는 밸브**가 된다. 그러면 챔버는 명령과
+// 무관하게 레일·탱크 압력까지 끌려 올라가고 과압 세이프티가 반복 래치된다
+// (실기 550 kPa, 가상 하드웨어 766 kPa).
+//
+// u=0 의 받침(pedestal)을 빼면 그 외삽 결함만 사라진다. 받침이 이미 0 인 구간
+// — 즉 피팅이 실제로 데이터를 본 구간 — 에서는 모델이 전혀 바뀌지 않는다.
+// area_raw 는 u 에 대해 단조이므로 뺀 뒤에도 단조·연속이다.
+float area_eff(const PlantParams& p, float u_pct, float Pin, float z)
+{
+  return std::max(0.0f, area_raw(p, u_pct, Pin, z) - area_raw(p, 0.0f, Pin, z));
+}
+
 float q_static(const PlantParams& p, float u_pct, float Pin, float Pout, float z)
 {
   const float ph = phi(Pin, Pout);
@@ -95,7 +116,7 @@ float q_static(const PlantParams& p, float u_pct, float Pin, float Pout, float z
   return a * Pin * ph;
 }
 
-float u_of_area(const PlantParams& p, float area_req, float Pin, float z)
+static float u_of_area_raw(const PlantParams& p, float area_req, float Pin, float z)
 {
   const float A_max = std::max(1e-12f, p.A_max);
   if (area_req >= A_max) return 100.0f;
@@ -104,6 +125,12 @@ float u_of_area(const PlantParams& p, float area_req, float Pin, float z)
   const double F_req = std::log(sigma / (1.0 - sigma)) / std::max(1e-9, (double)p.k_shape);
   const double I_req = F_req - (double)p.C_z * z - (double)p.C_p * Pin + (double)p.C_k;
   return (float)std::clamp(I_req / std::max(1e-9, (double)p.I_MAX) * 100.0, 0.0, 100.0);
+}
+
+// 정방향이 받침을 빼므로 역방향은 받침을 더해 되돌린다 — 둘은 정확한 역함수다.
+float u_of_area(const PlantParams& p, float area_req, float Pin, float z)
+{
+  return u_of_area_raw(p, area_req + area_raw(p, 0.0f, Pin, z), Pin, z);
 }
 
 float valve_invert(const PlantParams& p, float q_req, float Pin, float Pout, float z)
@@ -117,14 +144,36 @@ float valve_invert(const PlantParams& p, float q_req, float Pin, float Pout, flo
 // ============================================================================
 // Bouc-Wen — VirtualPowerpack::step_valve 의 앞부분과 동일
 // ============================================================================
+// Bouc-Wen 은 **전류 dI 에 대한 미분방정식**이다. 한 틱의 |dI| 가 크면 오일러
+// 1 스텝이 발산한다: 실기 피팅값에서 beta_bw·|dI| = 444.6 × 0.3 = 133 ≫ 1 이라
+// 감쇠항이 부호를 뒤집으며 z 가 매 틱 ±1e6 클램프까지 튄다. 그러면 C_z·z 가
+// 나머지 모든 항을 압도해 밸브 모델이 명령과 무관한 릴레이가 되고, 압력이
+// 폭주한다 (가상 하드웨어 계측: u=100 에서도 유효면적 0, 775 kPa 도달).
+//
+// **모델을 바꾸는 것이 아니라 같은 모델을 제대로 적분한다** — dI 를 수축조건
+// (beta+gamma)·|δI| ≤ 1/4 를 만족하도록 쪼갠다. 0.25 는 제어 임계값이 아니라
+// 수치 적분 안전계수다. |dI| 가 작은 정상 동작(대부분의 틱)에서는 n=1 이므로
+// 기존 경로와 비트 단위로 같다.
+static int bw_substeps(const PlantParams& p, float abs_dI)
+{
+  const float rate = (p.beta_bw + p.gamma_bw) * abs_dI;
+  if (!(rate > 0.25f)) return 1;
+  return std::min(256, (int)std::ceil(rate / 0.25f));
+}
+
 float step_bw(const PlantParams& p, ValveState& vs, float u_pct)
 {
   const float I      = std::clamp(u_pct, 0.0f, 100.0f) / 100.0f * p.I_MAX;
   const float dI     = I - vs.prevI;
   const float abs_dI = std::abs(dI);
-  vs.z = std::clamp(vs.z + p.A_bw * dI - p.beta_bw * abs_dI * vs.z
-                        - p.gamma_bw * dI * std::abs(vs.z),
-                    -1e6f, 1e6f);
+  const int   n      = bw_substeps(p, abs_dI);
+  const float ddI    = dI / (float)n;
+  const float abs_ddI= abs_dI / (float)n;
+  for (int i = 0; i < n; ++i) {
+    vs.z = std::clamp(vs.z + p.A_bw * ddI - p.beta_bw * abs_ddI * vs.z
+                          - p.gamma_bw * ddI * std::abs(vs.z),
+                      -1e6f, 1e6f);
+  }
   if      (dI >  1e-4f) vs.dir = 1;
   else if (dI < -1e-4f) vs.dir = 0;
   vs.prevI = I;
@@ -386,25 +435,11 @@ float Solver::rollout_cost(const ChannelState& x0, const Exogenous& ex,
 
       const float u_raw = std::clamp(uref[j] + du, 0.0f, 100.0f);
 
-      // 명령 테이퍼 — 플랜트가 실제로 받는 값이다. 목표 근처에서 크래킹 임계 위쪽
-      // 여유분만 줄이므로, 이 불연속을 롤아웃에 넣어야 MPPI 가 그 경계를 안다.
-      float u_out = u_raw;
-      if (pr_.taper_in_rollout) {
-        float pin_j;
-        const float p_rail = ex.P_micro + ex.dP_micro_dt * (float)k * pr_.Ts;
-        if (pv_[V_MICRO].is_positive)
-          pin_j = (j == V_MICRO) ? p_rail : (j == V_MACRO) ? ex.P_macro : s.P;
-        else
-          pin_j = (j == V_ATM) ? ex.P_atm : s.P;
-        const float uc = pv_[(size_t)j].u_crack(pin_j, s.v[j].z);
-        // 테이퍼는 실제 컨트롤러와 같이 **최종 목표** 기준으로 판정한다
-        // (스테이지 레퍼런스가 아니다 — 실기에서는 cfg_.ref_value 를 쓴다).
-        const float tp = std::clamp(std::abs(ex.P_ref - s.P)
-                                        / std::max(1e-3f, pv_[V_MICRO].cmd_taper_kpa),
-                                    0.0f, 1.0f);
-        u_out = (u_raw <= uc) ? 0.0f : uc + (u_raw - uc) * tp;
-      }
-      u_app[(size_t)j] = u_out;
+      // 플랜트(AcadosMpc::finish)는 clamp(uref+du,0,100) 를 **그대로** 낸다.
+      // 롤아웃도 같아야 한다 — 여기에만 명령 테이퍼가 남아 있던 동안 MPPI 는
+      // 실제보다 감쇠된 궤적을 예측했고, 그만큼 더 세게 밀어 오버슈트했다.
+      // 크래킹 아래에서 유량이 0 인 것은 area_eff 가 이미 표현한다.
+      u_app[(size_t)j] = u_raw;
 
       const float d  = (u_raw - uref[j]) * 0.01f;
       const float dd = (u_raw - u_prev[j]) * 0.01f;

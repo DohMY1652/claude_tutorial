@@ -34,7 +34,7 @@
 //
 // ── 1단계 범위 (회귀 위험 최소화) ──────────────────────────────────────────
 // · 제어: 채널 micro 12 + 채널 atm 12 + 라인 밸브 2 = **26개**. macro 12개는 기존
-//   `macro_allow_` 게이트(이산·드물게 동작)에 남겨 차원을 줄인다.
+//   피드포워드(compute_input_reference 의 유량 분배)에 남겨 차원을 줄인다.
 // · 상태: 챔버압 12 + 레일압 2 + 밸브 상태. macro 라인(탱크·이젝터)은 조정되는
 //   자원이고 40 ms 안에 거의 안 변하므로 **외생 상수**로 둔다.
 // · 목적: 챔버 P_ref 12개 추종(기존과 동일) + **레일 밴드 유지**(라인 PID 역할 흡수)
@@ -206,7 +206,6 @@ struct SysMppiParams {
   bool  control_lines{false};
 
   float du_limit_pct{100.f};
-  bool  taper_in_rollout{true};
   float flat_spread{1.0e-3f};
   float flat_decay{0.90f};
 };

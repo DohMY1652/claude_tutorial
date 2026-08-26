@@ -265,7 +265,6 @@ AcadosMpc::AcadosMpc(const Config& cfg) : cfg_(cfg) {
     pr.terminal_mult   = cfg_.mppi_terminal_mult;
     pr.du_min = -cfg_.mppi_du_limit_pct;
     pr.du_max = +cfg_.mppi_du_limit_pct;
-    pr.taper_in_rollout = cfg_.mppi_taper_in_rollout;
 
     // 시드는 채널마다 다르되 **고정**이다 (하네스가 이미 비결정론적이므로).
     mppi_ = std::make_unique<mppi::Solver>(mppi_pv_, pr, (uint32_t)(0x9E37u + cfg_.global_id));
@@ -389,15 +388,22 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   // Update Bouc-Wen hysteresis states from last commanded currents
   // Bouc-Wen 히스테리시스도 **밸브별 파라미터**로 갱신한다 (A_bw/beta/gamma/I_MAX 가
   // 밸브마다 다르다). 예전에는 채널 공용 값을 써서 피팅 결과가 반영되지 않았다.
+  // mppi::step_bw 와 **같은 적분**이어야 한다 — dI 를 수축조건까지 쪼갠다.
+  // (쪼개지 않으면 beta_bw·|dI| ≫ 1 에서 z 가 ±1e6 로 발산한다. Mppi.cpp 주석 참조.)
   auto update_bw = [&](int j, double& z, double& prev_I, int& dir, double u_pct) {
     const auto& p = cfg_.pv[(size_t)j];
     const double I     = u_pct / 100.0 * (double)p.I_MAX;
     const double dI    = I - prev_I;
     const double abs_dI = std::abs(dI);
-    z += (double)p.A_bw * dI
-       - (double)p.beta_bw  * abs_dI * z
-       - (double)p.gamma_bw * dI * std::abs(z);
-    z = std::clamp(z, -1e6, 1e6);
+    const double rate  = ((double)p.beta_bw + (double)p.gamma_bw) * abs_dI;
+    const int    n     = (rate > 0.25) ? std::min(256, (int)std::ceil(rate / 0.25)) : 1;
+    const double ddI = dI / n, abs_ddI = abs_dI / n;
+    for (int i = 0; i < n; ++i) {
+      z += (double)p.A_bw * ddI
+         - (double)p.beta_bw  * abs_ddI * z
+         - (double)p.gamma_bw * ddI * std::abs(z);
+      z = std::clamp(z, -1e6, 1e6);
+    }
     if      (dI >  1e-4) dir = 1;
     else if (dI < -1e-4) dir = 0;
     prev_I = I;
@@ -487,15 +493,23 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   
   float u_mi_req = 0.f, u_ma_req = 0.f, u_at_req = 0.f;
 
-  // macro 개방 판정. 임의의 kPa 오차 임계값 대신 **레일 경로가 포화했는가**를 본다.
-  //   micro(레일) 명령이 포화 = 레일 밸브를 완전히 열었는데도 요구 유량에 못 미친다
-  //                          = 레일만으로는 부족 → macro 를 열 근거가 물리적으로 성립
-  // 이 규칙이 "적게 쓰되 반응성 우선"을 동시에 만족한다: 포화하지 않으면 절대 안 열고
-  // (최소 사용), 포화하는 즉시 오차 크기와 무관하게 연다 (최대 반응성).
-  // 생성기(mode 2)의 축별 부족률 판정과 OR 로 결합된다.
-  auto macro_open = [this](float u_micro_req) {
-    return macro_allow_.load(std::memory_order_relaxed)
-        || u_micro_req >= cfg_.macro_micro_sat_pct;
+  // macro 분담은 **판정이 아니라 나눗셈**이다 — MATLAB update_sources 와 같은 규칙:
+  //     m_fill  = min(요구, 레일이 낼 수 있는 최대)
+  //     m_boost = max(0, 요구 − 레일 최대)
+  // 레일이 감당하면 m_boost 가 0 이라 macro 는 저절로 닫히고, 모자라는 순간 모자란
+  // 만큼만 열린다. "열지 말지"를 정하는 임계값이 필요 없다 — 예전의
+  // macro_gate_frac(0.02) · macro_micro_sat_pct(100) · macro_threshold(50 kPa) 는
+  // 전부 이 한 줄이 대신한다.
+  //
+  // 이전 코드는 게이트가 열리면 micro 와 macro **양쪽에 전량 Q_req 를** 요구했다.
+  // 실제 유량이 의도의 두 배가 되고 macro 상류는 탱크(≈670 kPa)라, 목표 178 kPa 인
+  // 채널이 550 kPa 까지 올라가 과압 세이프티가 반복 래치됐다 (HANDOFF 3-1).
+  auto split_demand = [&](int j_rail, double q_req, double Pin, double Pout, double z,
+                          double& q_rail, double& q_boost) {
+    const double cap = mppi::q_static(cfg_.pv[(size_t)j_rail], 100.0f,
+                                      (float)Pin, (float)Pout, (float)z);
+    q_rail  = std::min(q_req, cap);
+    q_boost = std::max(0.0, q_req - cap);
   };
  
   // Feedforward: 역모델로 필요한 u_pct 계산
@@ -507,11 +521,14 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
                  u_crack(mppi::V_MACRO, (double)P_macro, z_macro_),
                  u_crack(mppi::V_ATM,   (double)P_now,   z_atm_) };
     if ((m_dot_pressure + m_dot_volume) > 0.f) {
-      u_mi_req = valve_invert(mppi::V_MICRO, Q_req, (double)P_micro, (double)P_now, z_micro_)
+      double q_rail = 0.0, q_boost = 0.0;
+      split_demand(mppi::V_MICRO, Q_req, (double)P_micro, (double)P_now, z_micro_,
+                   q_rail, q_boost);
+      u_mi_req = valve_invert(mppi::V_MICRO, q_rail, (double)P_micro, (double)P_now, z_micro_)
                  + ki_mi * pos_error_integral_;
       u_at_req = 0.f;
-      u_ma_req = macro_open(u_mi_req)
-                 ? valve_invert(mppi::V_MACRO, Q_req, (double)P_macro, (double)P_now, z_macro_)
+      u_ma_req = (q_boost > 0.0)
+                 ? valve_invert(mppi::V_MACRO, q_boost, (double)P_macro, (double)P_now, z_macro_)
                    + ki_ma * pos_error_integral_
                  : 0.f;
     } else {
@@ -526,11 +543,14 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
                  u_crack(mppi::V_MACRO, (double)P_now,     z_macro_),
                  u_crack(mppi::V_ATM,   (double)P_abs_atm, z_atm_) };
     if ((m_dot_pressure + m_dot_volume) < 0.f) {
-      u_mi_req = valve_invert(mppi::V_MICRO, Q_req, (double)P_now, (double)P_micro, z_micro_)
+      double q_rail = 0.0, q_boost = 0.0;
+      split_demand(mppi::V_MICRO, Q_req, (double)P_now, (double)P_micro, z_micro_,
+                   q_rail, q_boost);
+      u_mi_req = valve_invert(mppi::V_MICRO, q_rail, (double)P_now, (double)P_micro, z_micro_)
                  + ki_mi * neg_error_integral_;
       u_at_req = 0.f;
-      u_ma_req = macro_open(u_mi_req)
-                 ? valve_invert(mppi::V_MACRO, Q_req, (double)P_now, (double)cfg_.ejector_p_limit, z_macro_)
+      u_ma_req = (q_boost > 0.0)
+                 ? valve_invert(mppi::V_MACRO, q_boost, (double)P_now, (double)cfg_.ejector_p_limit, z_macro_)
                    + ki_ma * neg_error_integral_
                  : 0.f;
     } else {
@@ -713,9 +733,6 @@ std::array<float,3> AcadosMpc::prepare(float dt_ms, float current_time_sec)
   }
   P_used_ = P_now;
 
-  const float err = cfg_.ref_value - P_now;
-  taper_ = std::clamp(std::abs(err) / std::max(1e-3f, cfg_.cmd_taper_kpa), 0.0f, 1.0f);
-
   float dt_sec = dt_ms / 1000.0f;
   if (dt_sec <= 0.0001f) dt_sec = cfg_.Ts;
   dt_sec_ = dt_sec;
@@ -728,12 +745,9 @@ std::array<float,3> AcadosMpc::prepare(float dt_ms, float current_time_sec)
 void AcadosMpc::finish(const std::array<float,3>& du3,
                        std::array<uint16_t, MPC_OUT_DIM>& out3)
 {
-  // master(위치제어 검증된 버전)는 크래킹 게이트가 전혀 없이 clamp(uref+du,0,100)를
-  // 그대로 냈다. 이 브랜치에서 추가했던 `(u <= u_crack) ? 0 : ...` 분기는 taper_=1
-  // (오차가 커서 전혀 안 깎여야 하는 상황)에도 u가 크래킹 임계값 이하면 무조건 0으로
-  // 떨어뜨려 — 실측 결과 채널 밸브 PWM이 계속 0으로 죽고 압력이 전혀 안 움직였다
-  // (레일 PID는 정상 동작 — 이 게이트만의 문제였다). master 방식으로 되돌린다.
-  (void)taper_;
+  // master(위치제어 검증된 버전)와 같이 clamp(uref+du, 0, 100) 를 그대로 낸다.
+  // 명령 테이퍼(cmd_taper_kpa)는 롤아웃까지 포함해 완전히 제거했다 — 사람이 정하는
+  // kPa 임계값이었고, 플랜트에서만 꺼져 있어 롤아웃과 어긋나 있었다.
   // 비유한 값 차단 — **실기 안전에 필수**. 솔버나 모델이 NaN/Inf 를 내면 uint16 변환이
   // 정의되지 않아 임의의 PWM 이 나갈 수 있다. 그런 값은 0(밸브 닫힘)으로 떨어뜨리고
   // 한 번만 경고한다 (500 Hz 로그 폭주 방지).
@@ -928,8 +942,6 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.leakage_u_pos = get_param_or<double>(this, "MPC_parameters.leakage_u_pos", 0.0);
   mpc_.leakage_u_neg = get_param_or<double>(this, "MPC_parameters.leakage_u_neg", 0.0);
   mpc_.target_tc = get_param_or<double>(this, "MPC_parameters.target_time_constant", 0.2);
-  mpc_.macro_micro_sat_pct = get_param_or<double>(this, "MPC_parameters.macro_micro_sat_pct", 100.0);
-  mpc_.cmd_taper_kpa       = get_param_or<double>(this, "MPC_parameters.cmd_taper_kpa",          3.0);
   mpc_.valve_crack_area_frac = get_param_or<double>(this, "MPC_parameters.valve_crack_area_frac", 1e-6);
 
   // ── 솔버 선택 ────────────────────────────────────────────────────────────
@@ -950,7 +962,6 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.mppi_track_scale_kpa = get_param_or<double>(this, "MPC_parameters.mppi_track_scale_kpa", 10.0);
   mpc_.mppi_terminal_mult   = get_param_or<double>(this, "MPC_parameters.mppi_terminal_mult",    5.0);
   mpc_.mppi_substeps        = get_param_or<int>   (this, "MPC_parameters.mppi_substeps",           2);
-  mpc_.mppi_taper_in_rollout= get_param_or<bool>  (this, "MPC_parameters.mppi_taper_in_rollout", true);
   mpc_.mppi_raw_state       = get_param_or<bool>  (this, "MPC_parameters.mppi_raw_state",       false);
   rail_rate_enable_         = get_param_or<bool>  (this, "MPC_parameters.mppi_rail_rate",      false);
   mpc_.mppi_estimator       = get_param_or<bool>  (this, "MPC_parameters.mppi_estimator",       false);
@@ -1232,7 +1243,6 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   gen_neg_ref_kpa_.assign(num_actuators_, sensor_.kpa_atm());
   gen_starve_pos_.assign(num_actuators_, 0.0);
   gen_starve_neg_.assign(num_actuators_, 0.0);
-  gen_macro_gate_frac_ = get_param_or<double>(this, "PressureRefGen.macro_gate_frac", 0.02);
 
   tau_pid_.assign(num_actuators_, TorquePid{});
   tau_integ_.assign(num_actuators_, 0.0);
@@ -1504,9 +1514,48 @@ void Controller::build_mpcs() {
         d.leakage_u       = (float)((gid < num_positive_channels_) ? mpc_.leakage_u_pos
                                                                   : mpc_.leakage_u_neg);
         d.crack_area_frac = (float)mpc_.valve_crack_area_frac;
-        d.cmd_taper_kpa   = (float)mpc_.cmd_taper_kpa;
         d.finalize();
       }
+      // ── 밸브 제어권(authority) 검사 ─────────────────────────────────────
+      // 정상폐쇄 밸브는 상류압이 올라갈수록 C_p·Pin 항 때문에 열리기 쉬워진다.
+      // 그 항이 스프링 예압을 이겨 버리는 상류압을 넘으면 **u=0 에서도 원시 모델이
+      // 열려 있다** — 즉 그 압력 위에서는 밸브를 닫을 수 없고 제어권이 없다.
+      // (area_eff 가 받침을 빼 주므로 폭주하지는 않지만, 그 구간에서 13-parameter
+      //  는 데이터 밖 외삽이라 예측이 맞지 않는다.)
+      //
+      // 실기 피팅(config/valve_params.yaml)이 정확히 이 상태다: C_p 가 탐색 상한
+      // 2.0e-3 에 걸린 채 끝나 micro 의 한계가 135 kPa abs 로 나온다. mode 2 의
+      // 레일 셋포인트는 최대 351 kPa abs 이므로 그 위에서 돌게 된다.
+      // → 압력을 바꿔 가며 스텝을 주는 재피팅이 필요하다 (RUNBOOK 밸브 절).
+      {
+        const double rail_max_abs = 101.325
+            + get_param_or<double>(this, "PressureRefGen.rail.pos_sp_max_kpa", 250.0);
+        const double chamber_max_abs =
+            get_param_or<double>(this, "pressure_safety_limit_kpa", 190.0);
+        static const char* kRole[3] = {"micro", "macro", "atm"};
+        for (int j = 0; j < 3; ++j) {
+          const auto& d = cfg.pv[(size_t)j];
+          // A_eff(u=0) > 0  ⇔  C_p·Pin − C_k > F_open
+          if (d.C_p <= 1e-12f) continue;                    // 압력 의존 없음 = 항상 닫힌다
+          const double p_lim = ((double)d.C_k + (double)d.F_open) / (double)d.C_p;
+          // 이 밸브가 실제로 볼 수 있는 최대 상류압
+          // 이 밸브가 실제로 겪는 최대 상류압:
+          //   양압 micro ← 레일 (컨트롤러가 직접 셋포인트를 정한다)
+          //   그 외      ← 챔버 (과압 세이프티 한계가 상한이다)
+          // 양압 macro 의 상류(탱크)는 컨트롤러 설정에 없어 챔버 기준으로만 본다.
+          const double p_seen = (j == mppi::V_MICRO && gid < num_positive_channels_)
+                              ? rail_max_abs : chamber_max_abs;
+          if (p_lim < p_seen) {
+            RCLCPP_ERROR(get_logger(),
+              "[밸브 검증] ch%d.%s: 상류 %.0f kPa abs 이상에서 u=0 에도 열린다 "
+              "(제어권 상실). 이 밸브가 겪는 최대 상류압은 %.0f kPa abs 다. "
+              "C_p=%.3e 가 피팅 상한(2.0e-3)에 걸렸는지 확인하고, 상류압을 바꿔 가며 "
+              "재피팅할 것. 지금은 u=0 받침을 빼서 안전하게 돌지만 예측은 외삽이다.",
+              gid, kRole[j], p_lim, p_seen, (double)d.C_p);
+          }
+        }
+      }
+
       // 하위 호환용 평면 필드 = micro 밸브
       const auto& m0 = channel_configs_[gid].v[0];
       cfg.I_MAX = (float)m0.I_MAX;           cfg.A_max = (float)m0.A_max;
@@ -1531,8 +1580,6 @@ void Controller::build_mpcs() {
       cfg.leakage_u_neg = (float)mpc_.leakage_u_neg;
 
       cfg.target_time_constant = (float)mpc_.target_tc;
-      cfg.macro_micro_sat_pct  = (float)mpc_.macro_micro_sat_pct;
-      cfg.cmd_taper_kpa        = (float)mpc_.cmd_taper_kpa;
       cfg.valve_crack_area_frac = (float)mpc_.valve_crack_area_frac;
 
       // mppi_system 에서는 채널 솔버를 만들지 않는다 — Δu 를 중앙집중이 낸다.
@@ -1554,7 +1601,6 @@ void Controller::build_mpcs() {
       cfg.mppi_track_scale_kpa = (float)mpc_.mppi_track_scale_kpa;
       cfg.mppi_terminal_mult   = (float)mpc_.mppi_terminal_mult;
       cfg.mppi_substeps        = mpc_.mppi_substeps;
-      cfg.mppi_taper_in_rollout= mpc_.mppi_taper_in_rollout;
       cfg.mppi_raw_state       = mpc_.mppi_raw_state;
       cfg.mppi_estimator       = mpc_.mppi_estimator;
       cfg.obs_gain             = (float)mpc_.obs_gain;
@@ -1596,7 +1642,7 @@ void Controller::build_mpcs() {
     RCLCPP_INFO(get_logger(),
       "MPC 솔버 = MPPI (선형화 없음): K=%d, NP=%d, Ts=%.1f ms (지평 %.0f ms), 서브스텝=%d, "
       "lambda=%.3f(비용 산포 비율), sigma=%.1f%%, beta=%.2f, "
-      "w=(track %.3g, effort %.3g, du %.3g), 오차 기준 %.1f kPa, 말단 ×%.1f, 테이퍼 롤아웃=%s",
+      "w=(track %.3g, effort %.3g, du %.3g), 오차 기준 %.1f kPa, 말단 ×%.1f",
       mpc_.mppi_samples,
       (mpc_.mppi_np > 0 ? mpc_.mppi_np : mpc_.NP),
       (mpc_.mppi_ts_s > 0.0 ? mpc_.mppi_ts_s : mpc_.Ts) * 1000.0,
@@ -1606,8 +1652,7 @@ void Controller::build_mpcs() {
       mpc_.mppi_lambda, mpc_.mppi_sigma_pct, mpc_.mppi_noise_beta,
       (mpc_.mppi_w_track  >= 0.0 ? mpc_.mppi_w_track  : mpc_.Q_value),
       (mpc_.mppi_w_effort >= 0.0 ? mpc_.mppi_w_effort : mpc_.R_value),
-      mpc_.mppi_w_du, mpc_.mppi_track_scale_kpa, mpc_.mppi_terminal_mult,
-      mpc_.mppi_taper_in_rollout ? "on" : "off");
+      mpc_.mppi_w_du, mpc_.mppi_track_scale_kpa, mpc_.mppi_terminal_mult);
   } else {
     RCLCPP_INFO(get_logger(), "MPC 솔버 = QP (선형화 + 응축 qpOASES)");
   }
@@ -1704,7 +1749,6 @@ void Controller::build_system_mppi()
   mp.track_scale_kpa = (float)mpc_.mppi_track_scale_kpa;
   mp.terminal_mult   = (float)mpc_.mppi_terminal_mult;
   mp.du_limit_pct    = (float)mpc_.mppi_du_limit_pct;
-  mp.taper_in_rollout= mpc_.mppi_taper_in_rollout;
   mp.rail_share  = (float)get_param_or<double>(this, "MPC_parameters.sys_rail_share", 0.20);
   mp.control_lines = get_param_or<bool>(this, "MPC_parameters.sys_control_lines", false);
   // 데드라인 [us]. 기본은 틱의 60%. 넘으면 다음 틱들을 건너뛰어 루프를 지킨다.
@@ -2673,19 +2717,11 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     gen_rail_neg_sp_kpa_ = to_abs_kpa(r.rail_neg_sp);
     gen_has_result_ = true;
 
-    // ── macro 게이트: 생성기의 축별 유량 부족률로 구동 ────────────────────
-    // 원래 철학(transient 에서 유량이 부족해 목표에 빠르게 못 갈 때 부스팅)을
-    // 오차 임계값 대신 "레일이 이번 스텝 수요를 감당하는가"로 판정한다. 슬루 박스가
-    // 이미 부스트/이젝터 능력을 포함해 레퍼런스를 만들었으므로, 부족률 > 0 은
-    // "그 능력을 쓸 계획"이라는 뜻이고 이렇게 하면 계획과 밸브 동작이 일치한다.
-    // MPC 쪽 micro 포화 판정과 OR 로 결합된다 (AcadosMpc::set_macro_allow 주석 참조).
+    // 부족률은 **진단값**이다 (MATLAB 도 usage 를 버린다: `[rail_next, ~] = ...`).
+    // macro 개방은 여기서 정하지 않는다 — 내층이 매 틱 유량을 나눠 저절로 결정한다.
     for (int a = 0; a < N; ++a) {
-      const auto& cfg = pos_ctrl_cfg_[(size_t)a];
-      const double sp = r.starve_pos[(size_t)a], sn = r.starve_neg[(size_t)a];
-      if (auto* m = mpc_for_gid(cfg.pos_gid)) m->set_macro_allow(sp > gen_macro_gate_frac_);
-      if (auto* m = mpc_for_gid(cfg.neg_gid)) m->set_macro_allow(sn > gen_macro_gate_frac_);
-      gen_starve_pos_[(size_t)a] = sp * 100.0;
-      gen_starve_neg_[(size_t)a] = sn * 100.0;
+      gen_starve_pos_[(size_t)a] = r.starve_pos[(size_t)a] * 100.0;
+      gen_starve_neg_[(size_t)a] = r.starve_neg[(size_t)a] * 100.0;
     }
 
     // ── 3. 적응 레일 셋포인트를 LinePID 에 넘긴다 ────────────────────
@@ -2731,8 +2767,8 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
         gen_rail_pos_sp_kpa_, gen_rail_neg_sp_kpa_,
         filt_out_[P_macro_board_id_ - 1], r.tank_low ? " LOW" : "",
         gen_starve_pos_[0], gen_starve_neg_[0],
-        r.starve_pos[0] > gen_macro_gate_frac_ ? "B" : "-",
-        r.starve_neg[0] > gen_macro_gate_frac_ ? "E" : "-",
+        r.starve_pos[0] > 0.0 ? "B" : "-",
+        r.starve_neg[0] > 0.0 ? "E" : "-",
         r.sqp_iters);
     }
   }

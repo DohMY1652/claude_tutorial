@@ -272,28 +272,6 @@ float SystemSolver::rollout(const SysState& x0, const SysExo& ex,
       u_line_[1] = ex.u_admit;
     }
 
-    // 명령 테이퍼 — 플랜트가 실제로 받는 값. 채널 밸브에만 적용한다 (라인 밸브는
-    // 테이퍼 대상이 아니다: 목표가 챔버압이 아니라 레일압이다).
-    if (mp_.taper_in_rollout) {
-      for (int g = 0; g < n; ++g) {
-        const ChannelPlant& cpv = sp_.ch[(size_t)g];
-        const PlantParams&  cp  = cpv[V_MICRO];
-        const bool  pos = (g < sp_.n_pos);
-        const float P   = s.P_ch[(size_t)g];
-        const float tp  = std::clamp(std::abs(ex.P_ref[(size_t)g] - P)
-                                       / std::max(1e-3f, cp.cmd_taper_kpa), 0.0f, 1.0f);
-        const int   im = sys_i_micro(g), ia = sys_i_atm(n, g);
-        const float pin_mi = pos ? s.P_pos : P;
-        const float pin_at = pos ? P : sp_.P_atm;
-        const float uc_mi = cpv[V_MICRO].u_crack(pin_mi, s.v[(size_t)s.iv_ch(g, V_MICRO)].z);
-        const float uc_at = cpv[V_ATM].u_crack(pin_at, s.v[(size_t)s.iv_ch(g, V_ATM)].z);
-        u_app[(size_t)im] = (u_app[(size_t)im] <= uc_mi) ? 0.0f
-                          : uc_mi + (u_app[(size_t)im] - uc_mi) * tp;
-        u_app[(size_t)ia] = (u_app[(size_t)ia] <= uc_at) ? 0.0f
-                          : uc_at + (u_app[(size_t)ia] - uc_at) * tp;
-      }
-    }
-
     // sys_step 은 길이 sys_nu 의 배열을 기대한다. 라인 미제어 모드에서는 채널 24개
     // 뒤에 외생 라인 개도 2개를 붙여 넘긴다.
     const float* uptr;
