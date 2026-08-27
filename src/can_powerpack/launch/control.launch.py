@@ -40,13 +40,25 @@ def _setup(context, *_a, **_k):
             overrides[k.strip()] = (vs in ('true', 'True')) if vs in (
                 'true', 'True', 'false', 'False') else vs
 
+    # can_bridge 에도 **자기가 선언한 키만** 넘긴다. overrides 를 통째로 넘기면
+    # MPC_parameters.* 처럼 브리지가 선언하지 않은 파라미터가 섞여 노드가 뜨지 않는다.
+    #
+    # num_actuators 가 특히 중요하다 — 브리지는 이 값으로 활성 엔코더 보드를
+    # (17 .. 17+N-1) 로 정한다. 넘기지 않으면 `num_actuators:=1` 로 1축 시험을 해도
+    # 브리지는 yaml 의 6 을 그대로 써서 board 17~22 를 기대하고, 20~22 에 대해
+    # 캘리브레이션 경고와 수신 없음 오류를 쏟는다 (그 시험에는 쓰이지도 않는 보드다).
+    BRIDGE_KEYS = ('num_actuators', 'can_channel', 'current_mode', 'control_type',
+                   'pwm_watchdog_ms', 'can_rx_watchdog_ms',
+                   'can_tx_fallback_ms', 'can_tx_min_interval_ms', 'can_diag_period_s')
+    bridge_overrides = {k: v for k, v in overrides.items() if k in BRIDGE_KEYS}
+
     can_bridge = Node(
         package='can_powerpack',
         executable='can_bridge_node',
         name='can_bridge',
         namespace='pack2',
         output='log',
-        parameters=[config_path, *fitted],
+        parameters=[config_path, *fitted, bridge_overrides],
     )
 
     controller = Node(

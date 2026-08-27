@@ -155,10 +155,17 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
   // 명령이 오는 동안에는 중복 발행이라 CAN 버스만 더 쓴다 — 실기에서 버스 점유가
   // ID 높은 보드(board14+)의 응답을 밀어낸 전례가 있어(RUNBOOK/HANDOFF) 조정할 수
   // 있게 파라미터로 뺀다. 기본값은 기존 동작 그대로 4 ms 다.
-  const int tx_ms = this->declare_parameter<int>("can_tx_period_ms", 4);
+  tx_fallback_ms_     = this->declare_parameter<int>("can_tx_fallback_ms", 4);
+  tx_min_interval_ms_ = this->declare_parameter<int>("can_tx_min_interval_ms", 0);
+  diag_period_s_      = this->declare_parameter<double>("can_diag_period_s", 5.0);
+  const int tx_ms = tx_fallback_ms_;
   tx_timer_     = this->create_wall_timer(std::chrono::milliseconds(std::max(1, tx_ms)),
                                           std::bind(&CanBridge::tx_routine,     this));
   sensor_timer_ = this->create_wall_timer(2ms, std::bind(&CanBridge::sensor_routine, this));
+  if (diag_period_s_ > 0.0)
+    diag_timer_ = this->create_wall_timer(
+        std::chrono::milliseconds((int)std::lround(diag_period_s_ * 1000.0)),
+        std::bind(&CanBridge::diag_routine, this));
 
   running_ = true;
   rx_thread_ = std::thread(&CanBridge::rx_loop, this);
@@ -231,18 +238,20 @@ void CanBridge::close_can() {
 
 // Single flat PWM command: data[i*3+0..2] → board (i+1) v1/v2/v3
 void CanBridge::on_cmd_pwm(const std_msgs::msg::UInt16MultiArray::SharedPtr msg) {
+  // CAN 수신이 끊긴 동안에는 명령을 **통째로** 무시한다. 컨트롤러는 얼어붙은 센서값을
+  // 보고 있으므로 그 명령을 신뢰할 수 없고, 받아서 targets_ 에 넣으면 수신 워치독이
+  // 넣어 둔 안전 상태를 매 틱 덮어써 무효가 된다.
+  //
+  // **last_cmd_ 도 갱신하지 않는다.** 갱신하면 타이머 폴백이 "방금 명령으로 보냈다"고
+  // 판단해 조기 반환하고, 그러면 안전 상태가 실제로 보드에 송신되지 않는다.
+  // 갱신하지 않으면 PWM 워치독도 함께 걸리는데, 둘 다 같은 안전 상태를 가리키므로 맞다.
+  if (rx_stale_.load(std::memory_order_relaxed)) return;
   {
     std::lock_guard<std::mutex> lk(cmd_mtx_);
     last_cmd_ = std::chrono::steady_clock::now();
     cmd_seen_ = true;
-    if (wd_tripped_) {
-      wd_tripped_ = false;
+    if (wd_tripped_.exchange(false, std::memory_order_relaxed))
       RCLCPP_INFO(get_logger(), "PWM 워치독 복구 — 명령 수신 재개");
-    }
-    // CAN 수신이 끊긴 동안에는 컨트롤러 명령을 받지 않는다 — 받으면 위에서 넣은
-    // 안전 상태를 매 틱 덮어써 무효가 된다. 컨트롤러는 얼어붙은 센서값을 보고 있으므로
-    // 그 명령을 신뢰할 수 없다.
-    if (rx_stale_.load(std::memory_order_relaxed)) return;
     const int n = std::min((int)msg->data.size() / 3, PWM_BOARDS);
     for (int i = 0; i < n; ++i) {
       int bid = i + 1;
@@ -251,7 +260,43 @@ void CanBridge::on_cmd_pwm(const std_msgs::msg::UInt16MultiArray::SharedPtr msg)
       targets_[bid].v3 = msg->data[i*3+2];
     }
   }
-  tx_routine();
+  // 명령마다 즉시 송신한다. can_tx_min_interval_ms 로 이 속도를 낮출 수 있다 —
+  // 밸브 대역이 wn≈40 rad/s(6.4 Hz)라 500 Hz 송신은 78배 과잉이고, 버스가 빡빡하면
+  // 여기를 줄이는 것이 저우선순위 보드를 살리는 가장 큰 수단이다 (500→100 Hz 로
+  // 우리 TX 점유율 12.6% → 2.5%).
+  if (tx_min_interval_ms_ > 0) {
+    const auto now = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point last;
+    { std::lock_guard<std::mutex> lk(cmd_mtx_); last = last_tx_; }
+    if (last.time_since_epoch().count() != 0 &&
+        std::chrono::duration<double, std::milli>(now - last).count()
+            < (double)tx_min_interval_ms_)
+      return;                                   // 다음 타이머 폴백이 보낸다
+  }
+  tx_send();
+}
+
+void CanBridge::diag_routine() {
+  std::string alive, dead;
+  for (int bid = 1; bid <= NUM_BOARDS; ++bid) {
+    const uint32_t now = rx_count_[(size_t)bid].load(std::memory_order_relaxed);
+    const uint32_t d = now - rx_count_prev_[(size_t)bid];
+    rx_count_prev_[(size_t)bid] = now;
+    if (d == 0) {
+      if (bid <= PWM_BOARDS || active_encoder_boards_.count(bid))
+        dead += (dead.empty() ? "" : ", ") + std::to_string(bid);
+    } else {
+      char buf[32];
+      snprintf(buf, sizeof(buf), "%d:%.0fHz", bid, d / diag_period_s_);
+      alive += (alive.empty() ? "" : " ") + std::string(buf);
+    }
+  }
+  RCLCPP_INFO(get_logger(), "CAN 수신 [%s]", alive.c_str());
+  if (!dead.empty())
+    RCLCPP_ERROR(get_logger(),
+      "CAN 수신 없음: board %s — 프레임이 **0** 이다. 0 이면 배선·전원·펌웨어 문제이고, "
+      "다른 보드보다 주파수만 낮으면 버스 경합이다 (ID 가 높을수록 우선순위가 낮다: "
+      "board N = 0x%03X).", dead.c_str(), 0x120 + 20);
 }
 
 void CanBridge::rx_loop() {
@@ -268,6 +313,8 @@ void CanBridge::rx_loop() {
 
     if (stat == canOK && id >= 0x121 && id <= (0x120 + NUM_BOARDS)) {
       int bid = id - 0x120;
+      if (bid >= 0 && bid <= NUM_BOARDS)
+        rx_count_[(size_t)bid].fetch_add(1, std::memory_order_relaxed);
       last_rx_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now().time_since_epoch()).count(),
           std::memory_order_relaxed);
@@ -416,15 +463,31 @@ void CanBridge::tx_routine() {
       }
       if (trip) apply_safe_state();
     }
-    if (trip && !wd_tripped_) {
-      wd_tripped_ = true;
+    if (trip && !wd_tripped_.exchange(true, std::memory_order_relaxed)) {
       RCLCPP_ERROR(get_logger(),
         "PWM 워치독: %d ms 동안 board/pwm_cmd 가 없다 — 채널 밸브 폐쇄 + 라인 밸브 전개. "
         "pp_controller 가 죽었는지 확인할 것.", wd_timeout_ms_);
     }
   }
 
+  // 명령이 최근에 왔으면 그 콜백이 이미 보냈다 — 여기서 또 보내면 **순수 중복**이다.
+  // 실측 버스 점유율이 79% 라 (보드 25개 × 500 Hz + 우리 TX 750/s) 저우선순위 프레임이
+  // 굶는 영역이고, 우리 명령 ID(0x100/0x101)는 최고 우선순위라 그 손해를 전부 보드가 진다.
+  // 타이머는 컨트롤러가 조용할 때의 keepalive 로만 남긴다.
+  {
+    std::lock_guard<std::mutex> lk(cmd_mtx_);
+    if (cmd_seen_) {
+      const double age_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - last_cmd_).count();
+      if (age_ms < (double)tx_fallback_ms_) return;   // 방금 명령으로 보냈다
+    }
+  }
+  tx_send();
+}
+
+void CanBridge::tx_send() {
   std::lock_guard<std::mutex> lk(cmd_mtx_);
+  last_tx_ = std::chrono::steady_clock::now();
 
   heartbeat_cnt_++;
 

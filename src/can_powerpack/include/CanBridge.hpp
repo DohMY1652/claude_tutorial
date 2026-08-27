@@ -73,6 +73,22 @@ private:
   std::atomic<bool> rx_stale_{false};
   int rx_timeout_ms_{200};
 
+  // === 보드별 수신 진단 ===
+  // "보드가 안 붙는다"의 원인을 가르는 유일한 방법이다. 프레임이 **0** 이면 배선·전원·
+  // 펌웨어 문제이고, 프레임은 오는데 기대 주파수보다 낮으면 버스 경합이다
+  // (CAN 은 ID 가 낮을수록 우선이라 board 20~22 = 0x134~0x136 이 가장 먼저 굶는다).
+  std::array<std::atomic<uint32_t>, NUM_BOARDS + 1> rx_count_{};
+  std::array<uint32_t, NUM_BOARDS + 1> rx_count_prev_{};
+  rclcpp::TimerBase::SharedPtr diag_timer_;
+  double diag_period_s_{5.0};
+  void diag_routine();
+
+  // TX 중복 억제 — 타이머는 명령이 없을 때만 보내는 폴백이다.
+  int tx_fallback_ms_{4};
+  int tx_min_interval_ms_{0};                 // 0 = 명령마다 송신
+  std::chrono::steady_clock::time_point last_tx_{};
+  void tx_send();                             // 실제 CAN 기록 (cmd_mtx_ 를 잡는다)
+
   uint8_t current_mode_{0};
   uint8_t control_type_{0};
   uint8_t heartbeat_cnt_{0};
