@@ -71,6 +71,16 @@ def _launch_setup(context, *_args, **_kwargs):
     sim_params.update(_load_params(virt_cfg, f'/{NAMESPACE}/can_bridge'))
     for f in fitted:
         sim_params.update(_load_params(f, f'/{NAMESPACE}/can_bridge'))
+
+    # 가상 플랜트도 컨트롤러와 **같은 밸브 파라미터**를 써야 한다.
+    # valve_params.yaml 은 /pack2/pp_controller 아래에 있어서 can_bridge 섹션만
+    # 읽던 위 루프에는 잡히지 않았고, 그 결과 시뮬 플랜트는 지금까지 피팅값을
+    # 한 번도 쓰지 않고 코드 기본값(A_max 0.2845, alpha_shape 3884.2) 으로 돌았다.
+    # 컨트롤러가 보는 밸브와 시뮬 안의 밸브가 서로 다른 물건이었다는 뜻이다.
+    for f in fitted:
+        if f.endswith('valve_params.yaml'):
+            sim_params.update(_load_params(f, f'/{NAMESPACE}/pp_controller'))
+
     sim_params['actuator_connected'] = actuator_connected
 
     ctrl_overrides = {'actuator_connected': actuator_connected}
@@ -107,10 +117,13 @@ def _launch_setup(context, *_args, **_kwargs):
         parameters=[ctrl_cfg, *fitted, ctrl_overrides],
     )
 
-    actions = [virtual_system, controller]
+    # 시뮬도 실기와 **같은 형식의 CSV** 를 남긴다 — 그래야 둘을 나란히 비교할 수 있다.
+    pkg_prefix = get_package_prefix('can_powerpack')
+    logger_path = os.path.join(pkg_prefix, 'lib', 'can_powerpack', 'pp_logger.py')
+    actions = [virtual_system, controller,
+               ExecuteProcess(cmd=['python3', logger_path], output='log')]
 
     if show_monitor:
-        pkg_prefix = get_package_prefix('can_powerpack')
         monitor_path = os.path.join(pkg_prefix, 'lib', 'can_powerpack', 'pp_monitor.py')
         setup_bash = os.path.normpath(os.path.join(pkg_prefix, '..', 'setup.bash'))
         actions.append(ExecuteProcess(

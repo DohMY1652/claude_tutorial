@@ -217,7 +217,11 @@ private:
   double line_neg_min_kpa_{5.0},   line_neg_max_kpa_{110.0};
 
   ValveParams line_valve_params_;                 // board 1/2/4 라인 밸브
-  std::vector<ValveParams> channel_valve_params_; // [gid]
+  // [gid][0=micro, 1=atm, 2=macro] — 세 밸브는 오리피스도 상류압도 달라
+  // (micro 2.3 mm/레일, macro 1.6 mm/탱크 800 kPa) 같은 파라미터를 쓰면 안 된다.
+  // 채널당 하나만 두던 때는 시뮬 안의 macro 가 micro 로 동작해 탱크에서
+  // 2233 kPa/s 를 쏟아부었다.
+  std::vector<std::array<ValveParams, 3>> channel_valve_params_; // [gid][valve]
   std::vector<double>      channel_tank_ml_;      // [gid] 액추에이터 미연결 시 고정 부피
   std::array<BoardCalib, NUM_BOARDS> calib_{};    // [board_id-1]
 

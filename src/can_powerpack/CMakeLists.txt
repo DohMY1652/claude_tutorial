@@ -167,6 +167,7 @@ install(PROGRAMS
   scripts/live_control.py
   scripts/pp_monitor.py
   scripts/pp_logger.py
+  scripts/pp_results.py
   scripts/position_ref_client.py
   scripts/valve_fit_model.py
   scripts/valve_fit_record.py

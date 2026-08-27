@@ -833,14 +833,14 @@
       # → 혼합 분포를 쓴다: 대부분은 작은 sigma 로 정밀하게, explore_frac 만큼은 큰
       #   sigma 로 임계를 건너뛴다. 데드밴드 플랜트에서 단일 분산으로는 정밀도와
       #   도달성을 동시에 얻을 수 없다.
-      mppi_sigma_pct: 8.0            # 정밀 탐색
-      mppi_sigma_explore_pct: 30.0   # 임계 돌파용
+      mppi_sigma_pct: 3.0            # 정밀 탐색
+      mppi_sigma_explore_pct: 10.0   # 임계 돌파용
       mppi_explore_frac: 0.30        # 큰 sigma 를 쓰는 샘플 비율
 
       # MPPI 의 Δu 한계 [%]. QP 경로의 ±30 을 쓰지 않는 이유가 위와 같다 — uref≈0 에서
       # ±30 이면 크래킹 임계(≈52%)에 도달조차 못 한다. 100 이면 절대 클램프 [0,100] 과
       # 겹쳐 사실상 전권이다.
-      mppi_du_limit_pct: 100.0
+      mppi_du_limit_pct: 12.0
 
       # ── 지평 안 스테이지 레퍼런스의 접근 시상수 [s] ──────────────────────
       # **이 값이 성능을 가장 크게 좌우한다.** ≤0 이면 target_time_constant 를 쓴다.

@@ -131,22 +131,31 @@ VirtualPowerpack::VirtualPowerpack(const rclcpp::NodeOptions& opts)
   const double tank_neg_ml = gpd(this, "tank_volume_neg_ml", 50.0);
 
   for (int gid = 0; gid < num_total_channels_; ++gid) {
-    const std::string pre = "channel_config.ch" + std::to_string(gid) + ".";
-    auto& vp = channel_valve_params_[(size_t)gid];
-    vp.I_MAX       = gpd(this, pre + "I_MAX",       0.30);
-    vp.A_max       = gpd(this, pre + "A_max",       0.2845);
-    vp.k_shape     = gpd(this, pre + "k_shape",     33.09);
-    vp.C_k         = gpd(this, pre + "C_k",         0.0288);
-    vp.C_p         = gpd(this, pre + "C_p",         0.00012);
-    vp.C_z         = gpd(this, pre + "C_z",         0.0);
-    vp.A_bw        = gpd(this, pre + "A_bw",        260649.5);
-    vp.beta_bw     = gpd(this, pre + "beta_bw",     179.0);
-    vp.gamma_bw    = gpd(this, pre + "gamma_bw",    0.06);
-    vp.alpha_shape = gpd(this, pre + "alpha_shape", 3884.2);
-    vp.wn_up       = gpd(this, pre + "wn_up",       40.0);
-    vp.zeta_up     = gpd(this, pre + "zeta_up",     1.2);
-    vp.wn_down     = gpd(this, pre + "wn_down",     45.0);
-    vp.zeta_down   = gpd(this, pre + "zeta_down",   1.0);
+    // 밸브별 키(chN.micro.*) 를 먼저 보고, 없으면 채널 공통 키(chN.*) 로 떨어진다.
+    // 컨트롤러가 읽는 valve_params.yaml 과 같은 계층이라 둘이 어긋날 수 없다.
+    static const char* VN[3] = {"micro", "atm", "macro"};
+    for (int v = 0; v < 3; ++v) {
+      const std::string chp = "channel_config.ch" + std::to_string(gid) + ".";
+      const std::string pre = chp + VN[v] + ".";
+      auto& vp = channel_valve_params_[(size_t)gid][(size_t)v];
+      auto g = [&](const char* key, double defv) {
+        return gpd(this, pre + key, gpd(this, chp + key, defv));
+      };
+      vp.I_MAX       = g("I_MAX",       0.30);
+      vp.A_max       = g("A_max",       0.2845);
+      vp.k_shape     = g("k_shape",     33.09);
+      vp.C_k         = g("C_k",         0.0288);
+      vp.C_p         = g("C_p",         0.00012);
+      vp.C_z         = g("C_z",         0.0);
+      vp.A_bw        = g("A_bw",        260649.5);
+      vp.beta_bw     = g("beta_bw",     179.0);
+      vp.gamma_bw    = g("gamma_bw",    0.06);
+      vp.alpha_shape = g("alpha_shape", 3884.2);
+      vp.wn_up       = g("wn_up",       40.0);
+      vp.zeta_up     = g("zeta_up",     1.2);
+      vp.wn_down     = g("wn_down",     45.0);
+      vp.zeta_down   = g("zeta_down",   1.0);
+    }
 
     channel_tank_ml_[(size_t)gid] = (gid < num_positive_channels_) ? tank_pos_ml : tank_neg_ml;
   }
@@ -406,7 +415,8 @@ void VirtualPowerpack::integrate(const std::array<double, PWM_TOTAL>& pwm, doubl
     const int bid = gid + channel_board_offset_;
     if (bid < 1 || bid > PWM_BOARDS) continue;
 
-    const auto& vp   = channel_valve_params_[(size_t)gid];
+    const auto& vps  = channel_valve_params_[(size_t)gid];
+    const auto& vp_mi = vps[0]; const auto& vp_at = vps[1]; const auto& vp_ma = vps[2];
     const double P_now = P_ch_kpa_[(size_t)gid];
     const int s_mi = valve_slot(bid, 0), s_at = valve_slot(bid, 1), s_ma = valve_slot(bid, 2);
     const double u_mi = u_of(s_mi), u_at = u_of(s_at), u_ma = u_of(s_ma);
@@ -414,17 +424,17 @@ void VirtualPowerpack::integrate(const std::array<double, PWM_TOTAL>& pwm, doubl
     double f_mi, f_at, f_ma;
     if (gid < num_positive_channels_) {
       // 양압: 라인 → 챔버 (micro/macro), 챔버 → 대기 (atm)
-      f_mi = step_valve(u_mi, P_line_pos_kpa_,   P_now,      vp, valves_[(size_t)s_mi], dt_sub);
-      f_ma = step_valve(u_ma, P_line_macro_kpa_, P_now,      vp, valves_[(size_t)s_ma], dt_sub);
-      f_at = step_valve(u_at, P_now,             P_atm_kpa_, vp, valves_[(size_t)s_at], dt_sub);
+      f_mi = step_valve(u_mi, P_line_pos_kpa_,   P_now,      vp_mi, valves_[(size_t)s_mi], dt_sub);
+      f_ma = step_valve(u_ma, P_line_macro_kpa_, P_now,      vp_ma, valves_[(size_t)s_ma], dt_sub);
+      f_at = step_valve(u_at, P_now,             P_atm_kpa_, vp_at, valves_[(size_t)s_at], dt_sub);
       ch_net_flow[(size_t)gid] = f_mi + f_ma - f_at;
       line_pos_draw   += f_mi;
       line_macro_draw += f_ma;
     } else {
       // 음압: 대기 → 챔버 (atm), 챔버 → 진공 라인 (micro/macro=에젝터)
-      f_at = step_valve(u_at, P_atm_kpa_, P_now,                 vp, valves_[(size_t)s_at], dt_sub);
-      f_mi = step_valve(u_mi, P_now,      P_line_neg_kpa_,       vp, valves_[(size_t)s_mi], dt_sub);
-      f_ma = step_valve(u_ma, P_now,      P_line_macro_neg_kpa_, vp, valves_[(size_t)s_ma], dt_sub);
+      f_at = step_valve(u_at, P_atm_kpa_, P_now,                 vp_at, valves_[(size_t)s_at], dt_sub);
+      f_mi = step_valve(u_mi, P_now,      P_line_neg_kpa_,       vp_mi, valves_[(size_t)s_mi], dt_sub);
+      f_ma = step_valve(u_ma, P_now,      P_line_macro_neg_kpa_, vp_ma, valves_[(size_t)s_ma], dt_sub);
       ch_net_flow[(size_t)gid] = f_at - f_mi - f_ma;
       line_neg_fill       += f_mi;
       line_macro_neg_fill += f_ma;
@@ -656,7 +666,7 @@ void VirtualPowerpack::publish_state()
   for (int i = 0; i < PWM_BOARDS * PWM_PER_BOARD; ++i) {
     const int gid = (i / PWM_PER_BOARD + 1) - channel_board_offset_;
     const double I_max = (gid >= 0 && gid < num_total_channels_)
-                         ? channel_valve_params_[(size_t)gid].I_MAX
+                         ? channel_valve_params_[(size_t)gid][(size_t)(i % PWM_PER_BOARD)].I_MAX
                          : line_valve_params_.I_MAX;
     cur_raw[(size_t)i] = std::clamp(
         valve_u_pct_[(size_t)i] / 100.0 * I_max * current_mv_per_amp_, 0.0, 3300.0);

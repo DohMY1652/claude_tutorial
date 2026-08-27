@@ -841,6 +841,26 @@ void AcadosMpc::finish(const std::array<float,3>& du3,
     std::clamp(safe(uref_[2] + du3[2], "u_atm"),   0.0f, 100.0f),
   };
   for (auto& v : u0) if (!std::isfinite(v)) v = 0.0f;   // clamp 이후 한 번 더
+
+  // 명령 저역통과 — 밸브 공진과 MPPI 의 틱 단위 스위칭을 끊는다.
+  //
+  // 이 필터는 선언만 되어 있고 어디서도 호출되지 않았다 (u_lpf_ 사용처 0곳).
+  // 그래서 실기에서 지령이 한 틱에 0↔100 으로 튀었고(계측 10000 %/s), 챔버가
+  // 8.3 Hz 로 peak-to-peak 96 kPa 진동했다 (실기 20260827_195422).
+  // 1차 저역통과는 DC 이득이 1 이라 정상상태 오차를 만들지 않는다 — 느려질 뿐이다.
+  //
+  // 과압 세이프티는 cmds_ 를 직접 덮어쓰므로 이 필터를 지나지 않는다.
+  if (cfg_.cmd_lpf_hz > 0.0f && dt_sec_ > 1e-6f) {
+    if (!u_lpf_init_) { u_lpf_ = u0; u_lpf_init_ = true; }
+    const float a = 1.0f - std::exp(-2.0f * (float)M_PI * cfg_.cmd_lpf_hz * (float)dt_sec_);
+    for (int j = 0; j < 3; ++j) {
+      u_lpf_[(size_t)j] += a * (u0[(size_t)j] - u_lpf_[(size_t)j]);
+      // 완전히 닫으라는 지령에서 지수 꼬리가 남아 밸브가 계속 새는 것을 막는다.
+      if (u0[(size_t)j] <= 0.0f && u_lpf_[(size_t)j] < 0.05f) u_lpf_[(size_t)j] = 0.0f;
+      u0[(size_t)j] = std::clamp(u_lpf_[(size_t)j], 0.0f, 100.0f);
+    }
+  }
+
   last_u3_ = u0;
 
 
@@ -1748,9 +1768,7 @@ void Controller::build_mpcs() {
         static const char* kRole[3] = {"micro", "macro", "atm"};
         for (int j = 0; j < 3; ++j) {
           const auto& d = cfg.pv[(size_t)j];
-          // A_eff(u=0) > 0  ⇔  C_p·Pin − C_k > F_open
           if (d.C_p <= 1e-12f) continue;                    // 압력 의존 없음 = 항상 닫힌다
-          const double p_lim = ((double)d.C_k + (double)d.F_open) / (double)d.C_p;
           // 이 밸브가 실제로 볼 수 있는 최대 상류압
           // 이 밸브가 실제로 겪는 최대 상류압:
           //   양압 micro ← 레일 (컨트롤러가 직접 셋포인트를 정한다)
@@ -1758,13 +1776,28 @@ void Controller::build_mpcs() {
           // 양압 macro 의 상류(탱크)는 컨트롤러 설정에 없어 챔버 기준으로만 본다.
           const double p_seen = (j == mppi::V_MICRO && gid < num_positive_channels_)
                               ? rail_max_abs : chamber_max_abs;
-          if (p_lim < p_seen) {
+
+          // 예전에는 F_open(A_eff 가 float 0 으로 언더플로하는 점) 으로 한계압을
+          // 구했다. 그 기준은 alpha_shape 가 클 때만 뜻이 있다 — alpha=1 이면
+          // 시그모이드가 0 에 닿지 않아 F_open 이 무한히 멀어지고 모든 밸브가
+          // 무조건 걸린다 (실제로 12채널 × 3밸브 전부 ERROR 를 뱉었다).
+          //
+          // 물어야 할 것은 "언제 언더플로하나" 가 아니라 "이 밸브가 겪는 최대
+          // 상류압에서 u=0 받침이 A_max 대비 얼마나 큰가" 다. 받침이 무시할
+          // 수준이면 (area_eff 가 빼 주므로) 아무 문제가 없고, 유의미하게 크면
+          // 그 구간은 데이터 밖 외삽이라 예측을 믿을 수 없다.
+          const double F0 = (double)d.C_p * p_seen - (double)d.C_k;
+          const double x  = (double)d.k_shape * F0;
+          const double lg = (x > 0.0) ? std::log1p(std::exp(-x)) : (-x + std::log1p(std::exp(x)));
+          const double frac = std::exp(-(double)d.alpha_shape * lg);   // = sigmoid(x)^alpha
+          constexpr double kPedestalWarn = 0.01;            // A_max 의 1%
+          if (frac > kPedestalWarn) {
             RCLCPP_ERROR(get_logger(),
-              "[밸브 검증] ch%d.%s: 상류 %.0f kPa abs 이상에서 u=0 에도 열린다 "
-              "(제어권 상실). 이 밸브가 겪는 최대 상류압은 %.0f kPa abs 다. "
-              "C_p=%.3e 가 피팅 상한(2.0e-3)에 걸렸는지 확인하고, 상류압을 바꿔 가며 "
-              "재피팅할 것. 지금은 u=0 받침을 빼서 안전하게 돌지만 예측은 외삽이다.",
-              gid, kRole[j], p_lim, p_seen, (double)d.C_p);
+              "[밸브 검증] ch%d.%s: 최대 상류압 %.0f kPa abs 에서 u=0 받침이 "
+              "A_max 의 %.1f%% 다 (제어권 상실). C_p=%.3e 가 피팅 상한(2.0e-3)에 "
+              "걸렸는지 확인하고 상류압을 바꿔 가며 재피팅할 것. 지금은 받침을 "
+              "빼서 안전하게 돌지만 그 구간 예측은 외삽이다.",
+              gid, kRole[j], p_seen, 100.0 * frac, (double)d.C_p);
           }
         }
       }
