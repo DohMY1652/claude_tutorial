@@ -1,9 +1,3 @@
-# valve_params.yaml — valve_params_install.py 병합본
-# 생성: 2026-08-27T17:53:20
-# 입력: /home/risebrl/claude_tutorial/src/can_powerpack/config/valve_params.yaml, /tmp/new23.yaml
-#
-# _fit 진단 블록은 제거했다 (빈 리스트가 ROS 파서를 죽인다).
-# 없는 밸브/채널은 powerpack_config.yaml 의 기본값으로 폴백한다.
 /pack2/pp_controller:
   ros__parameters:
     channel_config:
@@ -39,7 +33,6 @@
           zeta_down: 0.2
           I_MAX: 0.3
         macro:
-          I_MAX: 0.3
           A_max: 0.2845
           k_shape: 33.09
           C_k: 0.0288
@@ -53,6 +46,7 @@
           zeta_up: 1.2
           wn_down: 45.0
           zeta_down: 1.0
+          I_MAX: 0.3
         chamber_volume_ml: 132.0
       ch1:
         micro:
@@ -86,7 +80,6 @@
           zeta_down: 0.2
           I_MAX: 0.3
         macro:
-          I_MAX: 0.3
           A_max: 0.2845
           k_shape: 33.09
           C_k: 0.0288
@@ -100,6 +93,7 @@
           zeta_up: 1.2
           wn_down: 45.0
           zeta_down: 1.0
+          I_MAX: 0.3
         chamber_volume_ml: 132.0
       ch2:
         micro:
@@ -133,7 +127,6 @@
           zeta_down: 0.2
           I_MAX: 0.3
         macro:
-          I_MAX: 0.3
           A_max: 0.2845
           k_shape: 33.09
           C_k: 0.0288
@@ -147,6 +140,7 @@
           zeta_up: 1.2
           wn_down: 45.0
           zeta_down: 1.0
+          I_MAX: 0.3
         chamber_volume_ml: 132.0
       ch3:
         micro:
@@ -180,7 +174,6 @@
           zeta_down: 0.2
           I_MAX: 0.3
         macro:
-          I_MAX: 0.3
           A_max: 0.2845
           k_shape: 33.09
           C_k: 0.0288
@@ -194,6 +187,7 @@
           zeta_up: 1.2
           wn_down: 45.0
           zeta_down: 1.0
+          I_MAX: 0.3
         chamber_volume_ml: 132.0
       ch4:
         micro:
@@ -227,7 +221,6 @@
           zeta_down: 0.2
           I_MAX: 0.3
         macro:
-          I_MAX: 0.3
           A_max: 0.2845
           k_shape: 33.09
           C_k: 0.0288
@@ -241,6 +234,7 @@
           zeta_up: 1.2
           wn_down: 45.0
           zeta_down: 1.0
+          I_MAX: 0.3
         chamber_volume_ml: 132.0
       ch5:
         micro:
@@ -274,7 +268,6 @@
           zeta_down: 0.2
           I_MAX: 0.3
         macro:
-          I_MAX: 0.3
           A_max: 0.2845
           k_shape: 33.09
           C_k: 0.0288
@@ -288,6 +281,7 @@
           zeta_up: 1.2
           wn_down: 45.0
           zeta_down: 1.0
+          I_MAX: 0.3
         chamber_volume_ml: 132.0
       ch6:
         micro:
