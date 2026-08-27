@@ -439,7 +439,77 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   };
   (void)get_phi_ff;
 
-  const float Pref = cfg_.ref_value;
+  // ── 보강 ① 유량 이득 적응 ───────────────────────────────────────────
+  // 직전 틱에 실제로 인가한 명령의 모델 유량(q_model_last_)과, 그 사이 챔버가 실제로
+  // 보인 유량을 비교한다. 챔버 자체가 유량계다: q = dP/dt·V/(R·T).
+  // 부피 추정이나 오리피스 환산이 틀려도 이 비가 그만큼을 흡수한다.
+  // 측정 유량은 **필터 전 생값**으로 낸다. 컨트롤러 LPF 를 통과한 값으로 미분하면
+  // 과도 구간에서 dP/dt 가 지연·축소되고, 그 손실이 그대로 k 의 하향 편향이 된다
+  // (시뮬에서 모델=플랜트라 참값이 1.0 인데 0.52 까지 내려갔다).
+  const float p_for_rate = cfg_.mppi_raw_state ? current_P_now_raw_ : current_P_now_raw_;
+  if (cfg_.aug.adapt_gain && p_prev_meas_ > 0.0f && dt_sec > 1e-6f &&
+      std::abs(q_model_last_) > cfg_.aug.adapt_min_flow_lpm) {
+    const float dpdt = (p_for_rate - p_prev_meas_) / dt_sec;            // [kPa/s]
+    const float q_meas = dpdt * 1000.0f * current_vol / (Rgas * TempK) / lpm2kgps;
+    // **틱마다 q_meas/q_model 을 나누면 안 된다.** 생값 미분은 0.25 kPa 양자화에서
+    // ±125 kPa/s 잡음이라 비가 폭넓게 흩어지고, 클램프·게이트와 겹쳐 편향이 생긴다
+    // (계측: 필터값으로는 0.52, 생값 틱별 비로는 1.56 — 참값 1.0 을 양쪽으로 빗나갔다).
+    // 창을 모아 최소자승 이득 k = Σ(q_meas·q_model)/Σ(q_model²) 로 구한다.
+    // 분모에 잡음이 없으므로 이 추정은 편향되지 않는다.
+    if (std::isfinite(q_meas)) {
+      adapt_sxy_ += (double)q_meas * (double)q_model_last_;
+      adapt_sxx_ += (double)q_model_last_ * (double)q_model_last_;
+      ++adapt_n_;
+    }
+    if (adapt_n_ >= cfg_.aug.adapt_window && adapt_sxx_ > 1e-9) {
+      const float k_ls = (float)(adapt_sxy_ / adapt_sxx_);
+      if (std::isfinite(k_ls) && k_ls > 0.0f) {
+        k_flow_ += cfg_.aug.adapt_rate * (k_ls - k_flow_);
+        k_flow_ = std::clamp(k_flow_, cfg_.aug.gain_min, cfg_.aug.gain_max);
+      }
+      adapt_sxy_ = adapt_sxx_ = 0.0; adapt_n_ = 0;
+    }
+  }
+  if (!cfg_.aug.adapt_gain) k_flow_ = 1.0f;   // 끄면 즉시 모델 그대로로 되돌린다
+  p_prev_meas_ = p_for_rate;
+
+  // ── 보강 ② 오프셋 프리 (출력 외란 추정) ─────────────────────────────
+  // 정상상태 오차를 레퍼런스 쪽으로 흡수한다. 데드밴드는 센서 분해능(0.25 kPa)보다
+  // 크게 두어 잡음을 적분하지 않는다.
+  if (cfg_.aug.offset_free) {
+    const float e0 = cfg_.ref_value - P_now;
+    // ── 안티와인드업 ──────────────────────────────────────────────────
+    // 적분은 **컨트롤러가 실제로 더 밀 수 있을 때만** 의미가 있다. 두 경우를 막는다:
+    //  · 밸브가 이미 포화 — 더 요구해도 나갈 유량이 없다
+    //  · 과압 세이프티 래치 — 명령이 무시되고 밸브가 강제 전개된다. 그 구간의 오차는
+    //    컨트롤러 탓이 아닌데 적분하면, 래치가 풀린 뒤 감긴 만큼 과도하게 민다
+    //    (계측: 이 보호 없이 d 가 한계 +29 kPa 까지 감겨 레퍼런스를 214 kPa 로 밀고
+    //     세이프티가 225 샘플 재발동했다).
+    const bool sat_up = cfg_.is_positive ? (last_u3_[0] >= 99.5f || last_u3_[1] >= 99.5f)
+                                         : (last_u3_[2] >= 99.5f);
+    const bool sat_dn = cfg_.is_positive ? (last_u3_[2] >= 99.5f)
+                                         : (last_u3_[0] >= 99.5f || last_u3_[1] >= 99.5f);
+    const bool blocked = safety_latched_ext_
+                      || (e0 > 0.0f && sat_up) || (e0 < 0.0f && sat_dn);
+    // 적분은 **정상상태 보정**이다 — 과도 구간에서 적분하면 그 자체가 제어기가 돼
+    // 오버슈트를 만든다. 오차가 band 안(= 거의 다 왔다)일 때만 적분한다.
+    // 속도는 **초당** 값이라 제어 주기(500 Hz)와 무관하다. 예전에는 틱당 0.01 이라
+    // 실효 시상수가 0.2 s 였고, 오차 55 kPa 짜리 과도에서 0.1 초 만에 한계까지 감겼다.
+    const bool in_band = std::abs(e0) > cfg_.aug.dist_deadband_kpa
+                      && std::abs(e0) < cfg_.aug.dist_band_kpa;
+    if (!blocked && in_band) {
+      d_hat_ += cfg_.aug.dist_rate * e0 * dt_sec;
+      d_hat_ = std::clamp(d_hat_, -cfg_.aug.dist_limit_kpa, cfg_.aug.dist_limit_kpa);
+    }
+    // 래치 중에는 감긴 것을 **되돌린다** — 래치는 "너무 높다"는 뜻이므로 d 를 줄인다.
+    if (safety_latched_ext_ && d_hat_ > 0.0f)
+      d_hat_ = std::max(0.0f, d_hat_ - cfg_.aug.dist_rate * cfg_.aug.dist_limit_kpa);
+  } else {
+    d_hat_ = 0.0f;
+  }
+
+  const float Pref = cfg_.ref_value + d_hat_;
+  ref_eff_ = Pref;                       // solve() 의 MPPI 도 같은 목표를 본다
   float err = Pref - P_now;
 
   // 하드 데드밴드는 여기 있었지만 제거했다 — solve() 의 명령 테이퍼로 대체한다.
@@ -506,14 +576,20 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   // 채널이 550 kPa 까지 올라가 과압 세이프티가 반복 래치됐다 (HANDOFF 3-1).
   auto split_demand = [&](int j_rail, double q_req, double Pin, double Pout, double z,
                           double& q_rail, double& q_boost) {
-    const double cap = mppi::q_static(cfg_.pv[(size_t)j_rail], 100.0f,
-                                      (float)Pin, (float)Pout, (float)z);
+    // 용량도 같은 이득으로 본다 — 이득이 분자·분모에 함께 들어가야 분배 비율이
+    // 이득과 무관해진다 (macro 로 새는 것을 막는다).
+    const double cap = (double)mppi::q_static(cfg_.pv[(size_t)j_rail], 100.0f,
+                                              (float)Pin, (float)Pout, (float)z)
+                     / std::max(1e-3f, k_flow_);
     q_rail  = std::min(q_req, cap);
     q_boost = std::max(0.0, q_req - cap);
   };
  
   // Feedforward: 역모델로 필요한 u_pct 계산
-  const double Q_req = (double)std::abs(m_dot_pressure + m_dot_volume);
+  // 모델이 실제보다 k_flow_ 배 많이 흘린다고 추정되면 그만큼 **덜** 요구해야
+  // 실제 유량이 목표가 된다. k_flow_=1 이면 기존과 동일하다.
+  const double Q_req = (double)std::abs(m_dot_pressure + m_dot_volume)
+                     / std::max(1e-3f, k_flow_);
 
   if (cfg_.is_positive) {
     // 양압 채널: micro=레일→챔버, macro=탱크→챔버, atm=챔버→대기
@@ -767,6 +843,8 @@ void AcadosMpc::finish(const std::array<float,3>& du3,
   for (auto& v : u0) if (!std::isfinite(v)) v = 0.0f;   // clamp 이후 한 번 더
   last_u3_ = u0;
 
+
+
   // 밸브 내부 상태(q, qd) 추정을 실제 인가 명령 + 측정 압력으로 한 틱 전진시킨다.
   // 관측기를 쓰면 압력 예측도 이어 간다 (매 틱 측정으로 리셋하지 않는다).
   mppi::Exogenous ex;
@@ -782,6 +860,19 @@ void AcadosMpc::finish(const std::array<float,3>& du3,
   plant_est_.v[2].z = (float)z_atm_;    plant_est_.v[2].dir = dir_atm_;
   mppi::advance_valve_estimate(mppi_pv_, plant_est_, u0, ex, dt_sec_,
                                cfg_.mppi_estimator, cfg_.volume_m3);
+
+  // 적응 ①의 기준 — **정적 유량(q_static)이 아니라 동적 유량**을 써야 한다.
+  // 밸브는 2차 동특성(wn≈40 rad/s, τ≈25 ms)을 지나므로 과도 구간에서 실제 유량이
+  // 정적값보다 한참 작다. 정적값과 비교하면 비가 늘 1 보다 작게 나와, 시뮬처럼
+  // 모델과 플랜트가 같은 경우에도 k 가 0.33 까지 내려갔다.
+  // advance_valve_estimate 이후의 plant_est_.v[j].q 가 mppi::step 이 챔버에
+  // 적용하는 바로 그 값이고, 부호 규약도 거기와 같게 맞춘다.
+  {
+    const float qmi = plant_est_.v[mppi::V_MICRO].q;
+    const float qma = plant_est_.v[mppi::V_MACRO].q;
+    const float qat = plant_est_.v[mppi::V_ATM].q;
+    q_model_last_ = cfg_.is_positive ? (qmi + qma - qat) : (-qmi - qma + qat);
+  }
   if (cfg_.mppi_estimator) p_hat_ = plant_est_.P;
 
   // 4095 스케일 (100% -> 4095), 출력 순서는 micro, atm, macro
@@ -817,7 +908,7 @@ void AcadosMpc::solve(float dt_ms,
   const auto uref_arr = prepare(dt_ms, current_time_sec);
   Eigen::RowVector3f u_ref(uref_arr[0], uref_arr[1], uref_arr[2]);
 
-  std::fill(P_ref_.begin(), P_ref_.end(), cfg_.ref_value);
+  std::fill(P_ref_.begin(), P_ref_.end(), ref_eff_);
 
   mppi::Exogenous ex;
   ex.P_micro = current_P_micro_;
@@ -825,8 +916,36 @@ void AcadosMpc::solve(float dt_ms,
   ex.P_atm   = current_P_atm_;
   ex.V0      = cfg_.volume_m3;
   ex.Vdot    = vol_dot_est_;
-  ex.P_ref   = cfg_.ref_value;
-  ex.tau_ref = (cfg_.mppi_ref_tau_s > 0.f) ? cfg_.mppi_ref_tau_s : cfg_.target_time_constant;
+  ex.P_ref   = ref_eff_;
+
+  // ── 보강 ③ 접근 시상수 자동 조정 ───────────────────────────────────
+  // 오차 부호가 자주 바뀌면(진동) 느리게, 한 방향으로 크게 남으면(둔함) 빠르게 민다.
+  // 경계 안에서만 움직이고, 끄면 즉시 설정값으로 되돌아간다.
+  const float tau_cfg = (cfg_.mppi_ref_tau_s > 0.f) ? cfg_.mppi_ref_tau_s
+                                                    : cfg_.target_time_constant;
+  if (cfg_.aug.auto_tune) {
+    if (tau_ref_cur_ <= 0.0f) tau_ref_cur_ = tau_cfg;
+    const float e = ref_eff_ - P_used_;
+    const int sg = (e > 0.05f) ? 1 : (e < -0.05f ? -1 : 0);
+    if (sg != 0) {
+      if (last_err_sign_ != 0 && sg != last_err_sign_) ++sign_flips_;
+      last_err_sign_ = sg;
+    }
+    err_abs_acc_ += std::abs(e);
+    if (++tune_tick_ >= cfg_.aug.tune_window) {
+      const float osc = (float)sign_flips_ / (float)tune_tick_;
+      const float err_mean = err_abs_acc_ / (float)tune_tick_;
+      if (osc > cfg_.aug.osc_hi)
+        tau_ref_cur_ *= (1.0f + cfg_.aug.tune_rate);          // 진동 → 느리게
+      else if (err_mean > cfg_.aug.err_slow_kpa)
+        tau_ref_cur_ *= (1.0f - cfg_.aug.tune_rate);          // 둔함 → 빠르게
+      tau_ref_cur_ = std::clamp(tau_ref_cur_, cfg_.aug.tau_min, cfg_.aug.tau_max);
+      tune_tick_ = 0; sign_flips_ = 0; err_abs_acc_ = 0.0f;
+    }
+  } else {
+    tau_ref_cur_ = tau_cfg;
+  }
+  ex.tau_ref = tau_ref_cur_;
   ex.P0      = P_used_;
 
   std::array<float,3> du3{0.f, 0.f, 0.f};
@@ -1442,6 +1561,85 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   RCLCPP_INFO(this->get_logger(), "Controller node initialization complete.");
 }
 
+namespace {
+// 파라미터 이름 → ControlAug 필드. 선언과 콜백이 **같은 목록**을 쓰게 해서
+// 새 항목을 넣을 때 한 곳만 고치면 되게 한다.
+struct AugBind { const char* name; bool is_bool; };
+}  // namespace
+
+void Controller::declare_aug_params() {
+  auto& a = aug_;
+  // 기본값은 전부 off / 현재 동작 유지. 아무것도 켜지 않으면 기존과 동일하다.
+  a.adapt_gain   = get_param_or<bool>  (this, "aug.adapt_gain",   false);
+  a.adapt_rate   = (float)get_param_or<double>(this, "aug.adapt_rate",   0.20);
+  a.gain_min     = (float)get_param_or<double>(this, "aug.gain_min",     0.25);
+  a.gain_max     = (float)get_param_or<double>(this, "aug.gain_max",     4.00);
+  a.adapt_min_flow_lpm = (float)get_param_or<double>(this, "aug.adapt_min_flow_lpm", 0.10);
+  a.adapt_window = get_param_or<int>(this, "aug.adapt_window", 100);
+
+  a.offset_free  = get_param_or<bool>  (this, "aug.offset_free",  false);
+  a.dist_rate    = (float)get_param_or<double>(this, "aug.dist_rate",    0.5);
+  a.dist_band_kpa= (float)get_param_or<double>(this, "aug.dist_band_kpa",  5.0);
+  a.dist_limit_kpa    = (float)get_param_or<double>(this, "aug.dist_limit_kpa",    30.0);
+  a.dist_deadband_kpa = (float)get_param_or<double>(this, "aug.dist_deadband_kpa",  0.3);
+
+  a.auto_tune    = get_param_or<bool>  (this, "aug.auto_tune",    false);
+  a.tune_rate    = (float)get_param_or<double>(this, "aug.tune_rate",    0.02);
+  a.tau_min      = (float)get_param_or<double>(this, "aug.tau_min",      0.06);
+  a.tau_max      = (float)get_param_or<double>(this, "aug.tau_max",      0.40);
+  a.osc_hi       = (float)get_param_or<double>(this, "aug.osc_hi",       0.30);
+  a.err_slow_kpa = (float)get_param_or<double>(this, "aug.err_slow_kpa", 3.0);
+  a.tune_window  = get_param_or<int>   (this, "aug.tune_window",  250);
+
+  // **재시작 없이** 바꿀 수 있게 한다. 하나씩 켜 가며 효과를 분리해 보는 것이 요점이다.
+  aug_cb_ = this->add_on_set_parameters_callback(
+    [this](const std::vector<rclcpp::Parameter>& ps) {
+      rcl_interfaces::msg::SetParametersResult r; r.successful = true;
+      std::lock_guard<std::mutex> lk(aug_mtx_);
+      for (const auto& q : ps) {
+        const std::string& n = q.get_name();
+        if (n.rfind("aug.", 0) != 0) continue;
+        try {
+          if      (n == "aug.adapt_gain")   aug_.adapt_gain  = q.as_bool();
+          else if (n == "aug.offset_free")  aug_.offset_free = q.as_bool();
+          else if (n == "aug.auto_tune")    aug_.auto_tune   = q.as_bool();
+          else if (n == "aug.adapt_rate")   aug_.adapt_rate  = (float)q.as_double();
+          else if (n == "aug.gain_min")     aug_.gain_min    = (float)q.as_double();
+          else if (n == "aug.gain_max")     aug_.gain_max    = (float)q.as_double();
+          else if (n == "aug.adapt_min_flow_lpm") aug_.adapt_min_flow_lpm = (float)q.as_double();
+          else if (n == "aug.adapt_window") aug_.adapt_window = (int)q.as_int();
+          else if (n == "aug.dist_rate")    aug_.dist_rate   = (float)q.as_double();
+          else if (n == "aug.dist_band_kpa") aug_.dist_band_kpa = (float)q.as_double();
+          else if (n == "aug.dist_limit_kpa")    aug_.dist_limit_kpa    = (float)q.as_double();
+          else if (n == "aug.dist_deadband_kpa") aug_.dist_deadband_kpa = (float)q.as_double();
+          else if (n == "aug.tune_rate")    aug_.tune_rate   = (float)q.as_double();
+          else if (n == "aug.tau_min")      aug_.tau_min     = (float)q.as_double();
+          else if (n == "aug.tau_max")      aug_.tau_max     = (float)q.as_double();
+          else if (n == "aug.osc_hi")       aug_.osc_hi      = (float)q.as_double();
+          else if (n == "aug.err_slow_kpa") aug_.err_slow_kpa= (float)q.as_double();
+          else if (n == "aug.tune_window")  aug_.tune_window = (int)q.as_int();
+        } catch (const std::exception& e) {
+          r.successful = false; r.reason = e.what();
+        }
+      }
+      RCLCPP_INFO(get_logger(), "보강 갱신: 이득적응=%s 오프셋프리=%s 자동튜닝=%s",
+                  aug_.adapt_gain ? "on" : "off", aug_.offset_free ? "on" : "off",
+                  aug_.auto_tune ? "on" : "off");
+      return r;
+    });
+
+  RCLCPP_INFO(get_logger(),
+    "제어 보강 (ros2 param set 으로 실행 중 변경 가능): "
+    "aug.adapt_gain=%s aug.offset_free=%s aug.auto_tune=%s",
+    a.adapt_gain ? "on" : "off", a.offset_free ? "on" : "off", a.auto_tune ? "on" : "off");
+}
+
+void Controller::push_aug_to_mpcs() {
+  ControlAug snap;
+  { std::lock_guard<std::mutex> lk(aug_mtx_); snap = aug_; }
+  for (auto& m : mpcs_) m->cfg_mutable().aug = snap;
+}
+
 void Controller::on_zero_calibration(
   const std_srvs::srv::Trigger::Request::SharedPtr,
   std_srvs::srv::Trigger::Response::SharedPtr res)
@@ -1623,6 +1821,7 @@ void Controller::build_mpcs() {
   }
 
   RCLCPP_INFO(get_logger(), "Initialized %zu MPC controllers based on active_mpc_channels parameter.", mpcs_.size());
+  declare_aug_params();
   {
     // 실기에서 **피팅 결과가 실제로 로드됐는지** 확인하는 유일한 수단이다.
     // valve_params.yaml 을 config/ 에 넣고 재빌드했는데 0/N 이 나오면 병합이 안 된 것이다.
@@ -2115,6 +2314,26 @@ void Controller::on_timer() {
   }
   filter_initialized_ = true;
 
+  // 보강 설정을 각 MPC 에 반영 (ros2 param set 이 바꾼 값이 다음 틱부터 적용된다)
+  push_aug_to_mpcs();
+
+  // 보강 상태 진단 — 어느 항이 얼마나 일하고 있는지 보여야 켜고 끌 판단이 선다.
+  if (tick_ % 1000 == 0 && !mpcs_.empty()) {
+    ControlAug snap; { std::lock_guard<std::mutex> lk(aug_mtx_); snap = aug_; }
+    if (snap.adapt_gain || snap.offset_free || snap.auto_tune) {
+      std::string line;
+      for (auto& m : mpcs_) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), " ch%d[k=%.2f d=%+.1f tau=%.3f]",
+                 m->cfg().global_id, m->k_flow(), m->d_hat(), m->tau_used());
+        line += buf;
+      }
+      RCLCPP_INFO(get_logger(), "[보강 %s%s%s]%s",
+                  snap.adapt_gain ? "이득 " : "", snap.offset_free ? "오프셋 " : "",
+                  snap.auto_tune ? "튜닝 " : "", line.c_str());
+    }
+  }
+
   // ----------------------------------------------------------------
   // 2. 필터링된 값을 Topic으로 Publish
   // ----------------------------------------------------------------
@@ -2392,6 +2611,7 @@ void Controller::on_timer() {
       safety_latched_[gid] = false;
     }
 
+    if (auto* m = mpc_for_gid(gid)) m->set_safety_latched(safety_latched_[gid]);
     if (safety_latched_[gid]) {
       int base        = brd_idx * PWM_PER_BOARD;
       cmds_[base + 0] = 0;     // micro valve: closed

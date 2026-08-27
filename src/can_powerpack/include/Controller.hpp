@@ -151,6 +151,54 @@ private:
   std::vector<int> pin_cpus_;
 };
 
+// ============================================================================
+// ControlAug — 실행 중 켜고 끌 수 있는 제어 보강
+// ============================================================================
+// 실기는 모델과 다르다. 어디가 다른지 미리 알 수 없으므로, **모르는 부분을 온라인으로
+// 메우는 항**을 셋 두고 각각 독립적으로 켜고 끈다. 전부 기본 off 이므로 아무것도 켜지
+// 않으면 기존 동작과 **비트 단위로 같다.**
+//
+// `ros2 param set /pack2/pp_controller aug.<이름> <값>` 으로 **재시작 없이** 바뀐다.
+// 하나씩 켜 가며 효과를 분리해서 볼 수 있게 만든 것이 요점이다.
+struct ControlAug {
+  // ── ① 온라인 유량 이득 적응 ──────────────────────────────────────────
+  // 밸브 모델의 절대 스케일(A_max)은 챔버 부피 추정에 통째로 비례한다. 부피는
+  // 이중부피법으로 재도 ±30% 가 남고, 오리피스 면적비 환산도 스풀이 병목이면 틀린다.
+  // 그래서 "모델이 예측한 유량 대비 실제 유량의 비" k_flow 를 매 틱 추정해
+  // 역모델에 곱한다. k_flow=1 이면 모델 그대로다.
+  //   측정 유량 q_meas = dP/dt·V/(R·T)   (챔버가 곧 유량계다)
+  //   모델 유량 q_model = Σ_j q_static(적용된 명령)
+  //   k ← k + rate·(q_meas/q_model − k)
+  // 유량이 작을 때는 비가 잡음이라 갱신하지 않는다.
+  bool  adapt_gain{false};
+  float adapt_rate{0.20f};            // 창마다 적용하는 완화 계수
+  float gain_min{0.25f}, gain_max{4.0f};
+  float adapt_min_flow_lpm{0.10f};    // 이보다 작은 모델 유량에서는 갱신 안 함
+  int   adapt_window{100};            // 최소자승 누적 창 [tick] (500 Hz 기준 0.2 s)
+
+  // ── ② 오프셋 프리 (정상상태 외란 추정) ───────────────────────────────
+  // 모델 오차·누설·센서 영점 이탈은 정상상태 오차로 남는다. 출력 외란 d 를 적분
+  // 추정해 **레퍼런스를 그만큼 밀어** 실제 출력이 목표에 가게 한다 (offset-free MPC 의
+  // 실용형). MPPI 비용에 손대지 않으므로 솔버 튜닝과 독립이다.
+  //   d ← clamp(d + rate·(P_ref − P_meas))
+  //   MPPI 가 추종하는 목표 = P_ref + d
+  bool  offset_free{false};
+  float dist_rate{0.5f};              // [1/s] — 제어 주기와 무관하게 초당 속도로 준다
+  float dist_band_kpa{5.0f};          // 오차가 이 안일 때만 적분 (과도에서는 적분 금지)
+  float dist_limit_kpa{30.0f};
+  float dist_deadband_kpa{0.3f};      // 센서 분해능(0.25 kPa) 이하에서는 적분하지 않는다
+
+  // ── ③ 접근 시상수 자동 조정 ──────────────────────────────────────────
+  // mppi_ref_tau_s 가 성능을 가장 크게 좌우한다(MPPI.md 6.3). 오차 부호가 자주 바뀌면
+  // (진동) 느리게, 한 방향으로 크게 남으면(둔함) 빠르게 민다. 경계 안에서만 움직인다.
+  bool  auto_tune{false};
+  float tune_rate{0.02f};             // 한 번에 바꾸는 비율
+  float tau_min{0.06f}, tau_max{0.40f};
+  float osc_hi{0.30f};                // 최근 창에서 부호 변화 비율이 이보다 크면 진동
+  float err_slow_kpa{3.0f};           // 이보다 큰 오차가 한 방향으로 유지되면 둔하다
+  int   tune_window{250};             // 판정 창 [tick] (500 Hz 기준 0.5 s)
+};
+
 class AcadosMpc {
 public:
   struct Config {
@@ -188,6 +236,7 @@ public:
     // "닫힘"으로 볼 유효면적 비율 (A_eff / A_max). 이 면적에 해당하는 전류가 크래킹
     // 임계이고, 그 이하에서는 솔레노이드 자기력이 스풀을 못 들어 유량이 0 이다.
     float valve_crack_area_frac = 1e-6f;
+    ControlAug aug{};                 // Controller 가 매 틱 최신값을 밀어 넣는다
     // 밸브별 13-parameter (0=micro, 1=macro, 2=atm). build_mpcs 가 채운다.
     // **이것이 모델의 단일 출처다.** 아래 평면 필드는 하위 호환용으로 micro 값을 담는다.
     std::array<mppi::PlantParams, 3> pv{};
@@ -272,17 +321,24 @@ public:
   inline const std::array<float,3>& uref()    const { return uref_; }
   inline const mppi::ChannelState& plant_est() const { return plant_est_; }
   inline float vol_dot_est() const { return vol_dot_est_; }
+  inline float k_flow()   const { return k_flow_; }
+  inline float d_hat()    const { return d_hat_; }
+  inline float tau_used() const { return tau_ref_cur_; }
   // 롤아웃 초기 상태 — 채널 경로와 중앙집중 경로가 **같은 조립 규칙**을 쓰게 한다.
   // prepare() 직후에 부를 것 (z 가 이번 틱 값으로 갱신된 뒤여야 한다).
   mppi::ChannelState rollout_state() const;
   const mppi::ChannelPlant& plant_params() const { return mppi_pv_; }
   const Config& cfg() const { return cfg_; }
+  Config& cfg_mutable() { return cfg_; }   // 보강 설정을 매 틱 밀어 넣기 위해
 
   // macro 개방 게이트는 없다. 분담량이 곧 개방 여부다 —
   // compute_input_reference 의 split_demand 주석 참조.
   // 이 채널이 붙은 레일의 압력 변화율 [kPa/s]. 컨트롤러가 12채널 명목 명령으로 한 번
   // 계산해 공유한다 — 롤아웃이 레일을 상수로 두던 오차(≈5~34 kPa)를 없앤다.
   inline void set_rail_rate(float r) { rail_rate_ = r; }
+  // 과압 세이프티가 래치되면 컨트롤러 명령이 **무시되고** 밸브가 강제 전개된다.
+  // 그동안의 추종 오차는 컨트롤러 탓이 아니므로 적분(오프셋 프리)을 멈춰야 한다.
+  inline void set_safety_latched(bool v) { safety_latched_ext_ = v; }
 
   float current_P_now_       = 101.325f;
   // 롤아웃 초기 상태 전용 생값(필터 전). 오차·피드포워드·적분항은 그대로 필터값을 쓴다 —
@@ -316,6 +372,19 @@ private:
   Eigen::VectorXf qvec_, LL_, UL_;
   std::array<float,3> last_u3_{0,0,0};
   float pos_error_integral_{0.0f};
+  // ── 보강 상태 (채널별) ──────────────────────────────────────────────
+  float k_flow_{1.0f};        // ① 적응된 유량 이득 (1 = 모델 그대로)
+  float d_hat_{0.0f};         // ② 추정 출력 외란 [kPa]
+  float tau_ref_cur_{-1.0f};  // ③ 현재 접근 시상수 [s] (<0 = 아직 초기화 전)
+  int   sign_flips_{0}, tune_tick_{0};
+  int   last_err_sign_{0};
+  float err_abs_acc_{0.0f};
+  float q_model_last_{0.0f};  // 직전 틱에 적용한 명령의 모델 유량 [LPM]
+  double adapt_sxy_{0.0}, adapt_sxx_{0.0};   // Σ(q_meas·q_model), Σ(q_model²)
+  int    adapt_n_{0};
+  float ref_eff_{101.325f};   // 외란 보정이 들어간 유효 레퍼런스 [kPa]
+  bool  safety_latched_ext_{false};
+  float p_prev_meas_{-1.0f};  // 직전 틱 측정압 [kPa] (유량 역산용)
   float neg_error_integral_{0.0f};
 
   float last_error_{0.0f};
@@ -820,6 +889,14 @@ private:
   // 0점 재보정이 yaml 기준에서 얼마나 벗어났는지 알리기 위해 원본을 보관한다.
   std::array<double, NUM_CAN_BOARDS> yaml_offset_{};
   double zero_tolerance_kpa_{8.0};
+  // ── 실행 중 켜고 끌 수 있는 보강 ──────────────────────────────────────
+  // 파라미터 콜백이 갱신하고, on_timer 가 매 틱 각 MPC 의 cfg_.aug 로 밀어 넣는다.
+  // 값 자체는 콜백 스레드와 제어 스레드가 함께 만지므로 뮤텍스로 보호한다.
+  ControlAug aug_{};
+  std::mutex aug_mtx_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr aug_cb_;
+  void declare_aug_params();
+  void push_aug_to_mpcs();
   bool   sensor_zeroed_{true};   // true = use YAML offsets directly (no auto-calib at startup)
   int    sensor_zero_tick_{0};
   std::array<double, NUM_CAN_BOARDS> sensor_zero_sum_{};
