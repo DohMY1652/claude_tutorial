@@ -1,0 +1,46 @@
+Step 1 — CSV 로드
+  pos_micro_vol0.csv: 68949 행, ΔV=0 mL
+  pos_micro_vol0_line220.csv: 88968 행, ΔV=0 mL
+  pos_micro_vol0_line290.csv: 91562 행, ΔV=0 mL
+  pos_micro_vol0_line350.csv: 92702 행, ΔV=0 mL
+  pos_micro_vol400_line350.csv: 50841 행, ΔV=400 mL
+
+Step 1b — 기록 재구성
+  pos_micro gid0 v1: 11389 샘플 (유효 4709), ΔV=0, 라인 140 kPa
+  pos_micro gid0 v2: 5424 샘플 (유효 5118), ΔV=0, 라인 140 kPa
+  pos_micro gid0 v1: 10168 샘플 (유효 5622), ΔV=0, 라인 220 kPa
+  pos_micro gid0 v2: 11754 샘플 (유효 5608), ΔV=0, 라인 220 kPa
+  pos_micro gid0 v1: 10714 샘플 (유효 7034), ΔV=0, 라인 290 kPa
+  pos_micro gid0 v2: 11823 샘플 (유효 5547), ΔV=0, 라인 290 kPa
+  pos_micro gid0 v1: 11260 샘플 (유효 7229), ΔV=0, 라인 350 kPa
+  pos_micro gid0 v2: 11528 샘플 (유효 5202), ΔV=0, 라인 350 kPa
+  pos_micro gid0 v1: 5288 샘플 (유효 3654), ΔV=400, 라인 350 kPa
+  pos_micro gid0 v2: 7053 샘플 (유효 3881), ΔV=400, 라인 350 kPa
+
+Step 2 — 챔버 부피
+  지정값 사용: 132.00 mL (이중 부피법 생략)
+
+Step 3 — 13-parameter 피팅
+
+  pos_micro gid0 v1 (V=132.00 mL, 라인 ['140', '220', '290', '350'] kPa × 4 회차)
+  1단계 전역 난수 탐색 200 샘플...
+  2단계 정밀 탐색 1/3: SSE=4866 (nfev=6934)
+  2단계 정밀 탐색 2/3: SSE=1.173e+04 (nfev=7652)
+  2단계 정밀 탐색 3/3: SSE=1.247e+04 (nfev=6458)
+    SSE=4866  R²=0.6089
+    C_p/C_k 분리도 0.003 (P_ref=266 kPa abs)
+    중간 저장 완료 (1개 밸브) → results_fit/refit_pos_micro
+
+  pos_micro gid0 v2 (V=132.00 mL, 라인 ['140', '220', '290', '350'] kPa × 4 회차)
+  1단계 전역 난수 탐색 200 샘플...
+  2단계 정밀 탐색 1/3: SSE=4086 (nfev=11057)
+  2단계 정밀 탐색 2/3: SSE=1.594e+04 (nfev=1032)
+  2단계 정밀 탐색 3/3: SSE=1.26e+04 (nfev=5921)
+    SSE=4086  R²=0.7223  식별성 낮음: ['gamma_bw']
+    C_p/C_k 분리도 3.818 (P_ref=145 kPa abs)
+    중간 저장 완료 (2개 밸브) → results_fit/refit_pos_micro
+
+Step 5 — 결과 저장
+  results_fit/refit_pos_micro/valve_params.yaml
+  results_fit/refit_pos_micro/report.md
+  fit_*.png (2개)
