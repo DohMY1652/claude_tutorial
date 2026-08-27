@@ -889,6 +889,8 @@ private:
   // 0점 재보정이 yaml 기준에서 얼마나 벗어났는지 알리기 위해 원본을 보관한다.
   std::array<double, NUM_CAN_BOARDS> yaml_offset_{};
   double zero_tolerance_kpa_{8.0};
+  // 액추에이터 미연결이면 엔코더도 미연결이다 — 각도를 0° 로 고정한다.
+  bool encoder_zero_when_disconnected_{true};
   // ── 실행 중 켜고 끌 수 있는 보강 ──────────────────────────────────────
   // 파라미터 콜백이 갱신하고, on_timer 가 매 틱 각 MPC 의 cfg_.aug 로 밀어 넣는다.
   // 값 자체는 콜백 스레드와 제어 스레드가 함께 만지므로 뮤텍스로 보호한다.

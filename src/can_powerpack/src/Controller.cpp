@@ -1022,6 +1022,8 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
 
   sensor_.atm_offset = get_param_or<double>(this, "Sensor_calibration.atm_offset", 101.325);
   zero_tolerance_kpa_ = get_param_or<double>(this, "Sensor_calibration.zero_tolerance_kpa", 8.0);
+  encoder_zero_when_disconnected_ =
+      get_param_or<bool>(this, "encoder_zero_when_disconnected", true);
 
   sensor_filter_alpha_ = this->declare_parameter<double>("sensor_filter_alpha", 1.0);
 
@@ -1255,9 +1257,15 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
       "board/analog", 10,
       [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
           std::lock_guard<std::mutex> lk(sensors_mtx_);
+          // 액추에이터가 안 붙어 있으면 엔코더도 안 붙어 있다. 그때 board/analog 는
+          // 전압이 안 잡히는 채널에 대해 0 raw 를 주는데, 그 값을 반전증폭 역산에
+          // 넣으면 (4125−0)/0.825 = 5000 mV → offset·gain 에 따라 **엉뚱한 큰 각도**가
+          // 나온다. 그 값이 속도 추정과 디버그 토픽으로 흘러 들어가 오해를 만든다.
+          // 연결 전에는 0° 로 고정한다 (encoder_zero_when_disconnected 로 끌 수 있다).
+          const bool zero = encoder_zero_when_disconnected_ && !actuator_connected_;
           const size_t n = std::min(msg->data.size(), encoder_angles_.size());
           for (size_t i = 0; i < n; ++i)
-              encoder_angles_[i] = msg->data[i];
+              encoder_angles_[i] = zero ? 0.0 : msg->data[i];
       });
 
   size_t nth = std::max<size_t>(2, std::min<size_t>(
