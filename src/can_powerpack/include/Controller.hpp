@@ -236,6 +236,16 @@ public:
     // "닫힘"으로 볼 유효면적 비율 (A_eff / A_max). 이 면적에 해당하는 전류가 크래킹
     // 임계이고, 그 이하에서는 솔레노이드 자기력이 스풀을 못 들어 유량이 0 이다.
     float valve_crack_area_frac = 1e-6f;
+    // ── 명령 저역통과 [Hz] (0 = 끔) ────────────────────────────────────
+    // 밸브는 2차계이고 실측 피팅이 ωn≈39.5~45.3 rad/s(6.3~7.2 Hz), ζ≈0.2 를 준다.
+    // ζ=0.2 는 공진 첨두가 1/(2ζ)=2.5배인 **매우 약한 감쇠**다. 그런데 MPPI 는
+    // du_limit=100 이라 한 틱(2 ms)에 u 를 0↔100 로 던질 수 있어 250 Hz 성분까지
+    // 실린 명령이 나간다 — 그 스펙트럼이 7 Hz 공진을 정면으로 때린다.
+    // 실기 계측: 챔버가 6.86 Hz 로 peak-to-peak 210 kPa 진동했고, 그 주파수가
+    // 밸브 고유주파수와 정확히 일치했다. 첫스텝 포화도 97.6~100% 였다.
+    // → 명령을 공진보다 한참 아래에서 잘라 낸다. 액추에이터가 따라올 수 없는
+    //   빠르기로 명령하지 않는다는, 제어에서 가장 기본적인 규칙이다.
+    float cmd_lpf_hz = 0.0f;
     ControlAug aug{};                 // Controller 가 매 틱 최신값을 밀어 넣는다
     // 밸브별 13-parameter (0=micro, 1=macro, 2=atm). build_mpcs 가 채운다.
     // **이것이 모델의 단일 출처다.** 아래 평면 필드는 하위 호환용으로 micro 값을 담는다.
@@ -383,6 +393,8 @@ private:
   double adapt_sxy_{0.0}, adapt_sxx_{0.0};   // Σ(q_meas·q_model), Σ(q_model²)
   int    adapt_n_{0};
   float ref_eff_{101.325f};   // 외란 보정이 들어간 유효 레퍼런스 [kPa]
+  std::array<float,3> u_lpf_{0.f, 0.f, 0.f};   // 명령 저역통과 상태
+  bool  u_lpf_init_{false};
   bool  safety_latched_ext_{false};
   float p_prev_meas_{-1.0f};  // 직전 틱 측정압 [kPa] (유량 역산용)
   float neg_error_integral_{0.0f};
@@ -718,6 +730,7 @@ private:
     double leakage_u_neg{0.0};
     double target_tc{0.2};
     double valve_crack_area_frac{1e-6};
+    double cmd_lpf_hz{0.0};   // 명령 저역통과 [Hz], 0=끔
     // 솔버 선택 + MPPI 하이퍼파라미터
     std::string solver{"qp"};
     int    mppi_samples{128};
@@ -859,6 +872,9 @@ private:
     double kp{0.0786}, ki{0.0295}, kd{0.0049};
     double integ_limit_nm{2.0};
     double friction_nm{0.30};
+    // 중력 피드포워드 배율. 액추에이터 미연결 시험에서 목표 압력을 낮추는 데 쓴다.
+    // 목표 압력에 거의 선형으로 반영된다. 액추에이터를 붙이면 1.0 으로 되돌릴 것.
+    double tau_ff_gain{1.0};
   };
   std::vector<TorquePid>  tau_pid_;
   std::vector<double>     tau_integ_;

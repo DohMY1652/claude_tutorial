@@ -1068,6 +1068,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.leakage_u_neg = get_param_or<double>(this, "MPC_parameters.leakage_u_neg", 0.0);
   mpc_.target_tc = get_param_or<double>(this, "MPC_parameters.target_time_constant", 0.2);
   mpc_.valve_crack_area_frac = get_param_or<double>(this, "MPC_parameters.valve_crack_area_frac", 1e-6);
+  mpc_.cmd_lpf_hz            = get_param_or<double>(this, "MPC_parameters.cmd_lpf_hz", 0.0);
 
   // ── 솔버 선택 ────────────────────────────────────────────────────────────
   mpc_.solver = get_param_or<std::string>(this, "MPC_parameters.solver", std::string("qp"));
@@ -1385,6 +1386,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     tp.kd             = get_param_or<double>(this, pre + "kd",             0.0049);
     tp.integ_limit_nm = get_param_or<double>(this, pre + "integ_limit_nm", 2.0);
     tp.friction_nm    = get_param_or<double>(this, pre + "friction_nm",    0.30);
+    tp.tau_ff_gain    = get_param_or<double>(this, pre + "tau_ff_gain",    1.0);
   }
 
   {
@@ -1792,6 +1794,7 @@ void Controller::build_mpcs() {
 
       cfg.target_time_constant = (float)mpc_.target_tc;
       cfg.valve_crack_area_frac = (float)mpc_.valve_crack_area_frac;
+      cfg.cmd_lpf_hz            = (float)mpc_.cmd_lpf_hz;
 
       // mppi_system 에서는 채널 솔버를 만들지 않는다 — Δu 를 중앙집중이 낸다.
       // prepare/finish(피드포워드·적분·크래킹·상태추정)는 그대로 쓰인다.
@@ -2913,9 +2916,16 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     const double tau_pid = actuator_connected_
         ? (tp.kp * err + tp.ki * I - tp.kd * vel) : 0.0;
 
-    // 중력 피드포워드 — 이제 곱셈 없이 그대로 토크다
+    // 중력 피드포워드. tau_ff_gain 으로 크기를 줄일 수 있다.
+    //
+    // 액추에이터를 떼고 압력만 시험할 때는 실제로 들 하중이 없다. 그런데 기하값
+    // (5 kg × 0.15 m)이 그대로 들어가면 45° 에서 5.20 N·m → 208 N 을 요구하고,
+    // 그 힘은 양압 정격(185 kPa abs) 단독으로 못 내므로 생성기가 음압까지 30 kPa
+    // 까지 끌어내린다. 시험용으로는 과하다.
+    // 게인은 **목표 압력에 거의 선형**으로 반영된다 (F = P⁺·A − P⁻·A).
+    // 액추에이터를 붙이면 반드시 1.0 으로 되돌릴 것 — 그때는 중력을 실제로 들어야 한다.
     const double ff_angle = actuator_connected_ ? angle : angle_ref;
-    const double tau_grav = cfg.mass_kg * 9.81 * cfg.link_length_m
+    const double tau_grav = tp.tau_ff_gain * cfg.mass_kg * 9.81 * cfg.link_length_m
                           * std::sin(ff_angle * M_PI / 180.0);
 
     const double tau_fric = (actuator_connected_ && std::abs(err) > 0.3)
