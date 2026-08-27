@@ -1,9 +1,11 @@
-# valve_params.yaml — valve_params_install.py 병합본
-# 생성: 2026-08-27T13:40:39
-# 입력: /home/risebrl/claude_tutorial/src/can_powerpack/config/valve_params.orifice.yaml
+# valve_params.orifice.yaml — valve_params_from_orifice.py 생성
+# 생성: 2026-08-27T13:40:28
 #
-# _fit 진단 블록은 제거했다 (빈 리스트가 ROS 파서를 죽인다).
-# 없는 밸브/채널은 powerpack_config.yaml 의 기본값으로 폴백한다.
+# 하드코딩 기본값(1.6 mm 오리피스로 피팅)을 밸브별 실제 지름에 맞춰
+# A_max 만 면적비 (d/1.6)^2 로 스케일한 것이다. 나머지 12개 파라미터는
+# 솔레노이드/스풀 특성이라 오리피스와 무관하므로 그대로 둔다.
+#   양압 ch0~5: v1 2.3 / v2 2.3 / v3 1.6 mm
+#   음압 ch6~11: 전부 4.0 mm
 /pack2/pp_controller:
   ros__parameters:
     channel_config:

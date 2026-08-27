@@ -1,0 +1,201 @@
+# valve_params.yaml — valve_params_install.py 병합본
+# 생성: 2026-08-27T13:31:12
+# 입력: /home/risebrl/claude_tutorial/src/can_powerpack/config/valve_params.yaml.bak.20260827_132905, /home/risebrl/claude_tutorial/src/can_powerpack/results_fit/refit_pos_micro/valve_params.yaml
+#
+# _fit 진단 블록은 제거했다 (빈 리스트가 ROS 파서를 죽인다).
+# 없는 밸브/채널은 powerpack_config.yaml 의 기본값으로 폴백한다.
+/pack2/pp_controller:
+  ros__parameters:
+    channel_config:
+      ch0:
+        micro:
+          A_max: 0.03487933
+          k_shape: 5.08080297
+          C_k: 0.12646238
+          C_p: 0.00014726
+          C_z: 0.00103526
+          A_bw: 260695.71351477
+          beta_bw: 242.48593873
+          gamma_bw: 0.13994499
+          alpha_shape: 476.81902345
+          wn_up: 39.89252941
+          zeta_up: 1.53349315
+          wn_down: 22.54277522
+          zeta_down: 2.49101393
+          I_MAX: 0.3
+        atm:
+          A_max: 0.07944135
+          k_shape: 15.4922114
+          C_k: 0.20932804
+          C_p: 0.00048031
+          C_z: 0.00015942
+          A_bw: 248531.23687877
+          beta_bw: 164.56301283
+          gamma_bw: 0.14882667
+          alpha_shape: 94.86171561
+          wn_up: 150.0
+          zeta_up: 2.01435574
+          wn_down: 21.18802167
+          zeta_down: 1.35257714
+          I_MAX: 0.3
+        chamber_volume_ml: 132.0
+      ch1:
+        micro:
+          A_max: 0.03487933
+          k_shape: 5.08080297
+          C_k: 0.12646238
+          C_p: 0.00014726
+          C_z: 0.00103526
+          A_bw: 260695.71351477
+          beta_bw: 242.48593873
+          gamma_bw: 0.13994499
+          alpha_shape: 476.81902345
+          wn_up: 39.89252941
+          zeta_up: 1.53349315
+          wn_down: 22.54277522
+          zeta_down: 2.49101393
+          I_MAX: 0.3
+        atm:
+          A_max: 0.07944135
+          k_shape: 15.4922114
+          C_k: 0.20932804
+          C_p: 0.00048031
+          C_z: 0.00015942
+          A_bw: 248531.23687877
+          beta_bw: 164.56301283
+          gamma_bw: 0.14882667
+          alpha_shape: 94.86171561
+          wn_up: 150.0
+          zeta_up: 2.01435574
+          wn_down: 21.18802167
+          zeta_down: 1.35257714
+          I_MAX: 0.3
+        chamber_volume_ml: 132.0
+      ch2:
+        micro:
+          A_max: 0.03487933
+          k_shape: 5.08080297
+          C_k: 0.12646238
+          C_p: 0.00014726
+          C_z: 0.00103526
+          A_bw: 260695.71351477
+          beta_bw: 242.48593873
+          gamma_bw: 0.13994499
+          alpha_shape: 476.81902345
+          wn_up: 39.89252941
+          zeta_up: 1.53349315
+          wn_down: 22.54277522
+          zeta_down: 2.49101393
+          I_MAX: 0.3
+        atm:
+          A_max: 0.07944135
+          k_shape: 15.4922114
+          C_k: 0.20932804
+          C_p: 0.00048031
+          C_z: 0.00015942
+          A_bw: 248531.23687877
+          beta_bw: 164.56301283
+          gamma_bw: 0.14882667
+          alpha_shape: 94.86171561
+          wn_up: 150.0
+          zeta_up: 2.01435574
+          wn_down: 21.18802167
+          zeta_down: 1.35257714
+          I_MAX: 0.3
+        chamber_volume_ml: 132.0
+      ch3:
+        micro:
+          A_max: 0.03487933
+          k_shape: 5.08080297
+          C_k: 0.12646238
+          C_p: 0.00014726
+          C_z: 0.00103526
+          A_bw: 260695.71351477
+          beta_bw: 242.48593873
+          gamma_bw: 0.13994499
+          alpha_shape: 476.81902345
+          wn_up: 39.89252941
+          zeta_up: 1.53349315
+          wn_down: 22.54277522
+          zeta_down: 2.49101393
+          I_MAX: 0.3
+        atm:
+          A_max: 0.07944135
+          k_shape: 15.4922114
+          C_k: 0.20932804
+          C_p: 0.00048031
+          C_z: 0.00015942
+          A_bw: 248531.23687877
+          beta_bw: 164.56301283
+          gamma_bw: 0.14882667
+          alpha_shape: 94.86171561
+          wn_up: 150.0
+          zeta_up: 2.01435574
+          wn_down: 21.18802167
+          zeta_down: 1.35257714
+          I_MAX: 0.3
+        chamber_volume_ml: 132.0
+      ch4:
+        micro:
+          A_max: 0.03487933
+          k_shape: 5.08080297
+          C_k: 0.12646238
+          C_p: 0.00014726
+          C_z: 0.00103526
+          A_bw: 260695.71351477
+          beta_bw: 242.48593873
+          gamma_bw: 0.13994499
+          alpha_shape: 476.81902345
+          wn_up: 39.89252941
+          zeta_up: 1.53349315
+          wn_down: 22.54277522
+          zeta_down: 2.49101393
+          I_MAX: 0.3
+        atm:
+          A_max: 0.07944135
+          k_shape: 15.4922114
+          C_k: 0.20932804
+          C_p: 0.00048031
+          C_z: 0.00015942
+          A_bw: 248531.23687877
+          beta_bw: 164.56301283
+          gamma_bw: 0.14882667
+          alpha_shape: 94.86171561
+          wn_up: 150.0
+          zeta_up: 2.01435574
+          wn_down: 21.18802167
+          zeta_down: 1.35257714
+          I_MAX: 0.3
+        chamber_volume_ml: 132.0
+      ch5:
+        micro:
+          A_max: 0.03487933
+          k_shape: 5.08080297
+          C_k: 0.12646238
+          C_p: 0.00014726
+          C_z: 0.00103526
+          A_bw: 260695.71351477
+          beta_bw: 242.48593873
+          gamma_bw: 0.13994499
+          alpha_shape: 476.81902345
+          wn_up: 39.89252941
+          zeta_up: 1.53349315
+          wn_down: 22.54277522
+          zeta_down: 2.49101393
+          I_MAX: 0.3
+        atm:
+          A_max: 0.07944135
+          k_shape: 15.4922114
+          C_k: 0.20932804
+          C_p: 0.00048031
+          C_z: 0.00015942
+          A_bw: 248531.23687877
+          beta_bw: 164.56301283
+          gamma_bw: 0.14882667
+          alpha_shape: 94.86171561
+          wn_up: 150.0
+          zeta_up: 2.01435574
+          wn_down: 21.18802167
+          zeta_down: 1.35257714
+          I_MAX: 0.3
+        chamber_volume_ml: 132.0

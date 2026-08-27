@@ -107,12 +107,33 @@ def scan_containers(node, path=''):
     return out
 
 
+def expand_channels(spec):
+    """'ch1-ch5' 또는 'ch1,ch3' → ['ch1',...]. 범위는 양끝 포함."""
+    out = []
+    for part in spec.split(','):
+        part = part.strip()
+        if '-' in part:
+            a, b = part.split('-', 1)
+            ia, ib = int(a.strip()[2:]), int(b.strip()[2:])
+            out += [f'ch{i}' for i in range(min(ia, ib), max(ia, ib) + 1)]
+        elif part:
+            out.append(part)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('sources', nargs='+', help='피팅 산출 valve_params.yaml (여러 개 가능)')
     ap.add_argument('--out', default=None, help='기본: config/valve_params.yaml')
     ap.add_argument('--check', action='store_true', help='병합하지 않고 검사만 한다')
+    ap.add_argument('--copy-from', default=None, metavar='chN',
+                    help='이 채널의 값을 --copy-to 채널들에 복사한다. 같은 규격의 밸브를 쓰는 '
+                         '채널에 한 채널의 피팅을 펼칠 때 쓴다 (양압 ch0~5 는 같은 밸브다).')
+    ap.add_argument('--copy-to', default=None, metavar='ch1-ch5',
+                    help="복사 대상. 'ch1-ch5' 범위 또는 'ch1,ch3' 목록.")
+    ap.add_argument('--copy-roles', default='micro,atm,macro',
+                    help='복사할 밸브 역할. 기본 전부. 예: --copy-roles micro,atm')
     ap.add_argument('--rail-max-kpa', type=float, default=351.325,
                     help='양압 micro 가 겪는 최대 상류압 [kPa abs]. 기본 = 대기압 + '
                          'PressureRefGen.rail.pos_sp_max_kpa(250)')
@@ -149,6 +170,30 @@ def main():
             tgt[gid].update(clean)
             n += 1
         print(f'  읽음: {src} — 채널 {n}개')
+
+    if a.copy_from:
+        if not a.copy_to:
+            print('  --copy-from 에는 --copy-to 가 필요하다')
+            return 2
+        src = tgt.get(a.copy_from)
+        if not isinstance(src, dict):
+            print(f'  복사 원본이 없다: {a.copy_from}')
+            return 2
+        roles = [r.strip() for r in a.copy_roles.split(',') if r.strip()]
+        dsts = expand_channels(a.copy_to)
+        done = []
+        for gid in dsts:
+            if gid == a.copy_from:
+                continue
+            tgt.setdefault(gid, {})
+            for r in roles:
+                if r in src:
+                    tgt[gid][r] = copy.deepcopy(src[r])   # deepcopy = alias 원천 차단
+            for k, v in src.items():
+                if k not in ('micro', 'atm', 'macro') and k not in tgt[gid]:
+                    tgt[gid][k] = copy.deepcopy(v)        # chamber_volume_ml 등
+            done.append(gid)
+        print(f'  복사: {a.copy_from} → {done}  (역할 {roles})')
 
     bad, info = audit(merged, a.rail_max_kpa, a.chamber_max_kpa)
     empt = scan_containers(merged)
