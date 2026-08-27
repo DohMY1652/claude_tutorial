@@ -525,6 +525,12 @@ def sweep_valve(node, gid, args, mode, valve, prep):
             lim = dict(ceiling=args.ceiling, floor=args.floor, lead_s=args.stop_lead) \
                 if valve == mode['target'] else {}
             why = wait_hold(node, board, args.level_hold, args.settle_eps, **lim)
+            # **제동 전에 태그를 뗀다.** brake() 는 중립밸브를 활짝 열므로 그 뒤의
+            # dP/dt 는 두 밸브의 합이라 대상 밸브에 귀속시킬 수 없다. 태그를 'sweep'
+            # 으로 둔 채 제동하면 그 구간이 잔차에 섞인다 — 라인압이 높아 레벨이 짧게
+            # 끝나는 회차(예: 탱크 700 kPa, 레벨당 0.39 s)에서는 오염 비율이 25% 에
+            # 달한다.
+            node.tag.update(phase='brake' if why == 'limit' else 'settle')
             if why == 'limit':
                 # 대상밸브 폐쇄 + 중립밸브 개방을 한 번의 발행으로 — 꼬리 유량을 즉시 제동한다
                 node.brake(board, valve, mode['neutral'])
