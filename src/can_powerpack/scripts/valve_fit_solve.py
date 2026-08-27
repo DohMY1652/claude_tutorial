@@ -632,9 +632,14 @@ def write_yaml(outdir, fits, volumes, orif, args):
         entry['_fit'] = dict(mode=mode, r2=float(round(fit['r2'], 5)),
                              sse=float(f"{fit['sse']:.6g}"),
                              volume_ml=float(round(fit['volume_ml'], 3)),
-                             lines_kpa=[float(x) for x in fit.get('lines_kpa', [])],
+                             lines_kpa=', '.join(f'{x:g}' for x in fit.get('lines_kpa', []))
+                                       or 'none',
                              cp_ck_deg=float(fit.get('cp_ck_deg', float('nan'))),
-                             weak_params=fit['weak'])
+                             # **문자열로 쓴다.** 빈 리스트를 그대로 두면 ROS 2 의
+                             # rcl_yaml_param_parser 가 타입을 추론하지 못해 노드 생성
+                             # 중에 InvalidParameterValueException 으로 죽는다
+                             # (HANDOFF 2-2: can_bridge_node·pp_controller 동시 SIGABRT).
+                             weak_params=', '.join(fit['weak']) or 'none')
         ch[f'ch{gid}'][valve_role[valve]] = entry
     for gid, v in volumes.items():
         ch[f'ch{gid}']['chamber_volume_ml'] = float(round(v, 3))
