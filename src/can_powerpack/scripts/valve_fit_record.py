@@ -572,6 +572,50 @@ def apply_effective_limits(node, args, mode):
               f'끝까지 채운다 (트립 {args.trip_hi_kpa:.0f}/{args.trip_lo_kpa:.0f} 는 그대로 백스톱)')
 
 
+def sweep_descend(node, gid, args, mode, valve):
+    """전류를 **연속 감소**시키는 분기 — Bouc-Wen 하강 분기를 구속한다.
+
+    Phase A/B 는 레벨마다 to_neutral() 로 밸브를 0 으로 되돌리므로 전류 경로가 항상
+    `0 → 레벨 → 0` 펄스다. 그래서 "100 에서 80 으로 내리는" 구간이 데이터에 **한 번도
+    없고**, 히스테리시스의 하강 분기가 미구속으로 남는다. 피팅이 그 구간에 무슨 값을
+    넣어도 SSE 가 안 변하므로, 실측 데이터로 재피팅해도 거기만 엉뚱하게 나온다
+    (계측: 신규 피팅의 micro 가 u 를 100→80 으로 내리자 개도 0.587→0.000 으로 즉시 붕괴).
+    실기에서는 MPPI 가 u 를 연속으로 올렸다 내리므로 그 구간이 실제로 쓰인다.
+
+    레벨 사이에 대상 밸브를 건드리지 않고 **중립 밸브만 열어 챔버를 배기**한다 —
+    그래야 차압이 남아 dP/dt 로 유량을 볼 수 있으면서도 대상 밸브의 전류는 단조
+    감소한다. 배기 구간은 phase='bleed' 로 태그해 잔차에서 빠진다 (두 밸브가 동시에
+    열려 있어 dP/dt 를 한쪽에 귀속시킬 수 없다).
+    """
+    board = gid + args.board_offset
+    to_neutral(node, gid, args, mode)
+    if node.tripped:
+        return False
+    for lv in sorted(set(args.levels), reverse=True):
+        if node.tripped:
+            return False
+        # 배기 — 대상 밸브 명령은 그대로 두고 중립만 연다 (전류 단조성 유지)
+        if args.descend_bleed > 0:
+            node.tag.update(phase='bleed', valve=mode['neutral'], level=100.0, sweep='dn_cont')
+            node.set_valve(board, mode['neutral'], 100.0)
+            t_end = time.time() + args.descend_bleed
+            while time.time() < t_end and not node.tripped:
+                time.sleep(0.01)
+            node.set_valve(board, mode['neutral'], 0.0)
+            time.sleep(0.05)
+        node.tag.update(phase='sweep', valve=valve, level=float(lv), sweep='dn_cont')
+        node.set_valve(board, valve, float(lv))
+        why = wait_hold(node, board, args.descend_hold, args.settle_eps,
+                        ceiling=args.ceiling, floor=args.floor, lead_s=args.stop_lead)
+        if why == 'limit':
+            node.brake(board, valve, mode['neutral'])
+            print(f'     하강분기: 레벨 {lv:.0f} 에서 압력 한계 — 여기까지 기록')
+            return True
+    node.set_valve(board, valve, 0.0)
+    time.sleep(0.1)
+    return True
+
+
 def run_channel(node, gid, args, mode):
     print(f'\n  ── gid {gid} (board {gid + args.board_offset}) 시작 ──')
     apply_effective_limits(node, args, mode)
@@ -583,6 +627,11 @@ def run_channel(node, gid, args, mode):
     print(f'     Phase B: {mode["neutral"]} 스윕')
     if not sweep_valve(node, gid, args, mode, mode['neutral'], charge_full):
         return False
+    # Phase C: 대상 밸브 하강 분기 (전류 단조 감소)
+    if args.descend_hold > 0:
+        print(f'     Phase C: {mode["target"]} 하강 분기 (전류 연속 감소)')
+        if not sweep_descend(node, gid, args, mode, mode['target']):
+            return False
     to_neutral(node, gid, args, mode)
     node.close_channel(gid + args.board_offset)
     return True
@@ -673,6 +722,17 @@ def main():
                          '**크게 잡으면 안 된다** — 선행거리(lead×상승률)가 충전 구간보다 '
                          '커지면 밸브를 여는 즉시 정지 조건이 성립한다 (구 기본값 0.10 은 '
                          'Phase B 충전 구간 38.7 kPa 를 상승률 387 kPa/s 에서 이미 삼켰다).')
+    ap.add_argument('--tag', default='',
+                    help='출력 파일명 뒤에 붙일 꼬리표. 같은 라인압으로 성격이 다른 회차를 '
+                         '더 찍을 때 쓴다 (예: --tag descend).')
+    ap.add_argument('--descend-hold', type=float, default=1.2,
+                    help='하강 분기(Phase C) 레벨당 유지 시간 [s]. 0 이면 Phase C 를 건너뛴다. '
+                         '짧게 잡아야 챔버가 라인압에 닿기 전에 전 레벨을 훑는다 — 차압이 '
+                         '남아 있어야 dP/dt 로 유량이 보인다.')
+    ap.add_argument('--descend-bleed', type=float, default=1.5,
+                    help='하강 분기에서 레벨 사이 배기 시간 [s]. 대상 밸브 명령은 그대로 두고 '
+                         '중립 밸브만 열어 차압을 회복한다 (전류 단조 감소를 깨지 않는다). '
+                         '0 이면 배기 없이 이어 붙인다.')
     ap.add_argument('--min-charge-kpa', type=float, default=10.0,
                     help='Phase B 충전 후 최소 차압 [kPa]. 미달이면 경고한다 — 중립밸브가 '
                          '흘릴 압력이 없으면 그 레벨의 기록은 잡음뿐이다.')
@@ -846,6 +906,16 @@ def main():
         # 여러 회차를 같은 디렉터리에 모아야 하는데, 예전 이름은 mode+ΔV 뿐이라
         # 두 번째 회차가 첫 회차를 그대로 덮어썼다.
         stem = f'{args.mode}_vol{int(args.extra_volume_ml)}_line{int(round(args.line_kpa))}'
+        if args.tag:
+            stem += '_' + args.tag
+        # **덮어쓰기 방지.** 같은 (모드, ΔV, 라인압) 으로 한 번 더 찍는 경우가 실제로 있다
+        # (예: 하강 분기를 같은 라인압에서 추가 기록). 그대로 두면 몇 십 분 걸려 얻은
+        # 기존 회차가 조용히 사라진다.
+        base, k = stem, 2
+        while os.path.exists(os.path.join(outdir, stem + '.csv')):
+            stem = f'{base}_{k}'; k += 1
+        if stem != base:
+            print(f'  기존 파일이 있어 이름을 바꾼다: {base}.csv → {stem}.csv')
         path = os.path.join(outdir, stem + '.csv')
         with open(path, 'w', newline='') as f:
             w = csv.writer(f)
