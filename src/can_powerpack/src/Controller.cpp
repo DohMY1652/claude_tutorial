@@ -902,6 +902,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   final_active_vols_ml_.assign(num_total_channels_, 0.0);
 
   sensor_.atm_offset = get_param_or<double>(this, "Sensor_calibration.atm_offset", 101.325);
+  zero_tolerance_kpa_ = get_param_or<double>(this, "Sensor_calibration.zero_tolerance_kpa", 8.0);
 
   sensor_filter_alpha_ = this->declare_parameter<double>("sensor_filter_alpha", 1.0);
 
@@ -915,6 +916,8 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     const std::string base = "Sensor_calibration.boards." + std::to_string(bid);
     auto& ch = sensor_.boards[(size_t)(bid - 1)];
     ch.offset = get_param_or<double>(this, base + ".offset", ch.offset);
+    if (bid - 1 >= 0 && bid - 1 < NUM_CAN_BOARDS)
+      yaml_offset_[(size_t)(bid - 1)] = ch.offset;   // 0점 재보정 이탈 경고 기준
     ch.gain   = get_param_or<double>(this, base + ".gain",   ch.gain);
   }
 
@@ -2055,8 +2058,20 @@ void Controller::on_timer() {
 
     if (sensor_zero_tick_ >= ZERO_SAMPLES) {
       for (int i = 0; i < 16; ++i) {
-        if (sensor_zero_cnt_[i] > 0)
-          sensor_.boards[i].offset = sensor_zero_sum_[i] / sensor_zero_cnt_[i];
+        if (sensor_zero_cnt_[i] == 0) continue;
+        const double meas = sensor_zero_sum_[i] / sensor_zero_cnt_[i];
+        // 0점 보정은 "지금 이 압력이 대기압이다" 라고 선언하는 것이다. 계통에 잔압이
+        // 남은 채 부르면 그 채널의 영점이 잔압만큼 통째로 밀리고, **과압 세이프티도
+        // 같이 밀린다** (190 kPa 트립이 실제 210 kPa 에서 걸리는 식). 조용히 넘어가면
+        // 안 되므로 yaml 값과의 차이를 kPa 로 환산해 경고한다.
+        const double dev_kpa = (meas - yaml_offset_[(size_t)i]) * sensor_.boards[i].gain;
+        if (std::abs(dev_kpa) > zero_tolerance_kpa_)
+          RCLCPP_WARN(get_logger(),
+            "0점 보정: board %d 가 yaml 기준에서 %+.1f kPa 벗어났다 "
+            "(offset %.1f → %.1f). 계통에 잔압이 남아 있지 않은지 확인할 것 — "
+            "영점이 밀리면 과압 세이프티도 같이 밀린다.",
+            i + 1, dev_kpa, yaml_offset_[(size_t)i], meas);
+        sensor_.boards[i].offset = meas;
       }
       sensor_zeroed_ = true;
       RCLCPP_INFO(get_logger(), "=== Sensor zero-calibration complete ===");

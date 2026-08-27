@@ -817,6 +817,9 @@ private:
 
   // Sensor zero-calibration at startup
   static constexpr int ZERO_SAMPLES = 250;   // ~0.5 sec at 500 Hz
+  // 0점 재보정이 yaml 기준에서 얼마나 벗어났는지 알리기 위해 원본을 보관한다.
+  std::array<double, NUM_CAN_BOARDS> yaml_offset_{};
+  double zero_tolerance_kpa_{8.0};
   bool   sensor_zeroed_{true};   // true = use YAML offsets directly (no auto-calib at startup)
   int    sensor_zero_tick_{0};
   std::array<double, NUM_CAN_BOARDS> sensor_zero_sum_{};

@@ -110,6 +110,7 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
   targets_.resize(NUM_BOARDS + 1);
   // 워치독: 0 이면 끔. 실기에서는 반드시 켤 것.
   wd_timeout_ms_  = this->declare_parameter<int>("pwm_watchdog_ms", 200);
+  rx_timeout_ms_  = this->declare_parameter<int>("can_rx_watchdog_ms", 200);
   wd_vent_index_  = this->declare_parameter<int>("pwm_watchdog_vent_index",  0);   // board1 v1
   wd_admit_index_ = this->declare_parameter<int>("pwm_watchdog_admit_index", 3);   // board2 v1
 
@@ -122,6 +123,7 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
     "PWM 워치독: %d ms (0=끔). 시한 초과 시 채널 밸브 폐쇄 + 라인 밸브(idx %d, %d) 전개",
     wd_timeout_ms_, wd_vent_index_, wd_admit_index_);
   sensors_snapshot_.assign(PWM_BOARDS + 1, 0);
+  sensors_filt_.assign(PWM_BOARDS + 1, 0.0);
   current_snapshot_.resize(PWM_BOARDS + 1, {0.0, 0.0, 0.0});
   analog_snapshot_.assign(NUM_BOARDS - ANALOG_BOARD_START + 1, 0);  // 9 values (boards 17..25)
 
@@ -148,7 +150,14 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
     exit(1);
   }
 
-  tx_timer_     = this->create_wall_timer(4ms, std::bind(&CanBridge::tx_routine,     this));
+  // TX 는 두 경로로 나간다: on_cmd_pwm(컨트롤러 명령마다, 실측 500 Hz) + 이 타이머.
+  // 타이머는 컨트롤러가 조용할 때 보드를 살려 두는 keepalive 이자 워치독 구동원이다.
+  // 명령이 오는 동안에는 중복 발행이라 CAN 버스만 더 쓴다 — 실기에서 버스 점유가
+  // ID 높은 보드(board14+)의 응답을 밀어낸 전례가 있어(RUNBOOK/HANDOFF) 조정할 수
+  // 있게 파라미터로 뺀다. 기본값은 기존 동작 그대로 4 ms 다.
+  const int tx_ms = this->declare_parameter<int>("can_tx_period_ms", 4);
+  tx_timer_     = this->create_wall_timer(std::chrono::milliseconds(std::max(1, tx_ms)),
+                                          std::bind(&CanBridge::tx_routine,     this));
   sensor_timer_ = this->create_wall_timer(2ms, std::bind(&CanBridge::sensor_routine, this));
 
   running_ = true;
@@ -230,6 +239,10 @@ void CanBridge::on_cmd_pwm(const std_msgs::msg::UInt16MultiArray::SharedPtr msg)
       wd_tripped_ = false;
       RCLCPP_INFO(get_logger(), "PWM 워치독 복구 — 명령 수신 재개");
     }
+    // CAN 수신이 끊긴 동안에는 컨트롤러 명령을 받지 않는다 — 받으면 위에서 넣은
+    // 안전 상태를 매 틱 덮어써 무효가 된다. 컨트롤러는 얼어붙은 센서값을 보고 있으므로
+    // 그 명령을 신뢰할 수 없다.
+    if (rx_stale_.load(std::memory_order_relaxed)) return;
     const int n = std::min((int)msg->data.size() / 3, PWM_BOARDS);
     for (int i = 0; i < n; ++i) {
       int bid = i + 1;
@@ -255,6 +268,11 @@ void CanBridge::rx_loop() {
 
     if (stat == canOK && id >= 0x121 && id <= (0x120 + NUM_BOARDS)) {
       int bid = id - 0x120;
+      last_rx_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count(),
+          std::memory_order_relaxed);
+      if (rx_stale_.exchange(false, std::memory_order_relaxed))
+        RCLCPP_INFO(get_logger(), "CAN 수신 워치독 복구 — 보드 프레임 재개");
 
       if (bid >= ANALOG_BOARD_START) {
         // Encoder boards (17..25): 8-byte payload, raw[3] (bytes 6-7) = PA7 angle sensor
@@ -278,10 +296,16 @@ void CanBridge::rx_loop() {
         if (p_mv_raw < 0) p_mv_raw = 0;
         if (p_mv_raw > 5000) p_mv_raw = 5000;
 
-        double p_prev = (double)sensors_snapshot_[bid];
-        double p_filtered = (p_prev == 0.0) ? p_mv_raw
-                          : (p_prev * (1.0 - LPF_ALPHA) + p_mv_raw * LPF_ALPHA);
-        sensors_snapshot_[bid] = (uint16_t)p_filtered;
+        // **LPF 상태를 double 로 들고 있어야 한다.** 예전에는 sensors_snapshot_
+        // (uint16) 에 곧바로 되먹여, 매 스텝 소수부가 절단됐다. alpha=0.2 이면
+        // 증분이 0.2·Δ 라 **Δ가 5 mV 미만이면 증분이 1 미만이라 통째로 사라진다** —
+        // 필터가 그 자리에 멈춘다. 계측: 상승 신호에서 정상상태 −4 mV 로 수렴하고
+        // (gain 0.250 → **−1.0 kPa 영구 편향**), 하강에서는 0 이라 비대칭이다.
+        // 과압 세이프티도 이 값을 보므로 실제보다 1 kPa 늦게 트립한다.
+        double& p_state = sensors_filt_[bid];
+        p_state = (p_state == 0.0) ? p_mv_raw
+                                   : (p_state * (1.0 - LPF_ALPHA) + p_mv_raw * LPF_ALPHA);
+        sensors_snapshot_[bid] = (uint16_t)std::lround(p_state);
 
         double c1_raw = (double)raw_i1 * TO_MV;
         double c2_raw = (double)raw_i2 * TO_MV;
@@ -360,6 +384,27 @@ void CanBridge::tx_routine() {
   //   · 라인 밸브 2개 → **전개** (레일을 대기로 되돌린다)
   //   · MacroSwitch → 0 (이젝터 정지)
   // 로 간다.
+  // ── CAN 수신 워치독 ─────────────────────────────────────────────────────
+  // 수신이 끊기면 압력이 마지막 값에 얼어붙는데, 컨트롤러는 그걸 모르고 계속
+  // 밸브를 연다 (과압 세이프티도 같은 얼어붙은 값을 본다). 여기서 끊어 준다.
+  if (rx_timeout_ms_ > 0) {
+    const long long now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const long long last = last_rx_ns_.load(std::memory_order_relaxed);
+    if (last != 0) {
+      const double age_ms = (double)(now_ns - last) / 1e6;
+      if (age_ms > (double)rx_timeout_ms_) {
+        if (!rx_stale_.exchange(true, std::memory_order_relaxed))
+          RCLCPP_ERROR(get_logger(),
+            "CAN 수신 워치독: %d ms 동안 보드 프레임이 없다 — 센서값이 얼어붙었다. "
+            "채널 밸브 폐쇄 + 라인 밸브 전개. 배선·전원·버스를 확인할 것.",
+            rx_timeout_ms_);
+        std::lock_guard<std::mutex> lk(cmd_mtx_);
+        apply_safe_state();
+      }
+    }
+  }
+
   if (wd_timeout_ms_ > 0) {
     bool trip = false;
     {

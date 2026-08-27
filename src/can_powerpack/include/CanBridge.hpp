@@ -57,16 +57,29 @@ private:
   std::mutex cmd_mtx_;
   // PWM 워치독 — targets_ 가 영구 래치라 컨트롤러가 죽으면 마지막 명령이 계속 나간다.
   std::chrono::steady_clock::time_point last_cmd_{};
-  bool cmd_seen_{false}, wd_tripped_{false};
+  bool cmd_seen_{false};
+  // wd_tripped_ 는 tx_routine(타이머 스레드)이 쓰고 on_cmd_pwm(콜백)이 지운다 — atomic.
+  std::atomic<bool> wd_tripped_{false};
   int  wd_timeout_ms_{200}, wd_vent_index_{0}, wd_admit_index_{3};
   void apply_safe_state();     // 채널 폐쇄 + 라인 밸브 전개 (초기화·워치독 공용)
+
+  // === CAN 수신 워치독 ===
+  // PWM 워치독은 "컨트롤러가 죽었다"를 막지만 그 반대는 못 막는다: CAN 수신이
+  // 끊기면 sensors_snapshot_ 이 마지막 값에 얼어붙고 sensor_routine 은 그 값을
+  // 2 ms 마다 계속 발행한다. 컨트롤러는 살아 있으므로 PWM 워치독도 안 걸리고,
+  // **얼어붙은 압력을 보며 밸브를 계속 연다.** 과압 세이프티도 같은 값을 보므로
+  // 트립하지 않는다. 그래서 수신 쪽에도 워치독이 필요하다.
+  std::atomic<long long> last_rx_ns_{0};      // steady_clock, 마지막 유효 프레임
+  std::atomic<bool> rx_stale_{false};
+  int rx_timeout_ms_{200};
 
   uint8_t current_mode_{0};
   uint8_t control_type_{0};
   uint8_t heartbeat_cnt_{0};
 
   // === Sensor (RX) ===
-  std::vector<uint16_t> sensors_snapshot_;                  // [bid], bid = 0..18
+  std::vector<uint16_t> sensors_snapshot_;                  // [bid], bid = 0..PWM_BOARDS (발행용)
+  std::vector<double>   sensors_filt_;                      // [bid] LPF 상태 (절단 방지)
   std::vector<std::array<double, 3>> current_snapshot_;     // [bid][0..2], bid 0..18
   std::vector<uint16_t> analog_snapshot_;                   // [0..8] → board 17..25
   std::set<int> active_encoder_boards_;                     // board IDs to read (empty = all)
