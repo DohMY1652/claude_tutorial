@@ -66,6 +66,10 @@ public:
     int    Hpreview{100};            // 프리뷰 창 [스텝]. 1 이면 현재 수요만
     double Pneg_cap_deep{-74.325e3}; // 음압 최대 깊이 [Pa gauge]
     double Pneg_shallow{-30.0e3};    // 저수요 시 음압 셋포인트 [Pa gauge]
+    // 평활항(J4)의 기준점을 직전 **레퍼런스**로 둘지(true, MATLAB 원본) 측정
+    // 챔버압으로 둘지(false, 예전 포팅 동작). true 면 레퍼런스가 실측 잡음을
+    // 쫓지 않는다 — PressureRefGen.cpp 의 xp 주석 참조.
+    bool smooth_anchor_ref{true};
     double Ppos_sp_min{ 30.0e3};     // 양압레일 최소 셋포인트 [Pa gauge]
     double Ppos_sp_max{400.0e3};     // 양압레일 최대 셋포인트 [Pa gauge]
     double Fmax_ref{150.0};          // 수요 정규화 기준 힘 [N]

@@ -1024,6 +1024,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   zero_tolerance_kpa_ = get_param_or<double>(this, "Sensor_calibration.zero_tolerance_kpa", 8.0);
   encoder_zero_when_disconnected_ =
       get_param_or<bool>(this, "encoder_zero_when_disconnected", true);
+  use_measured_dt_ = get_param_or<bool>(this, "use_measured_dt", true);
 
   sensor_filter_alpha_ = this->declare_parameter<double>("sensor_filter_alpha", 1.0);
 
@@ -1390,6 +1391,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     PressureRefGen::Params gp;
     gp.N  = num_actuators_;
     gp.dt = std::max(1e-3, gen_period_ms_ / 1000.0);
+    gp.smooth_anchor_ref = get_param_or<bool>(this, "PressureRefGen.smooth_anchor_ref", true);
     const double A_m2 = piston_area_mm2_ * 1e-6;
     gp.Apos.assign(num_actuators_, A_m2);
     gp.Aneg.assign(num_actuators_, A_m2);
@@ -2066,7 +2068,7 @@ void Controller::run_system_mppi(double P_atm_kPa, double P_line_pos_kPa,
       float ref_kpa = 0.f;
       if (gid >= 0 && gid < (int)ref_snapshot_.size()) ref_kpa = (float)ref_snapshot_[(size_t)gid];
       m->set_ref_value(ref_kpa);
-      m->prepare((float)period_ms_, (float)elapsed_time_sec_);
+      m->prepare((float)(dt_ctrl_sec_ * 1000.0), (float)elapsed_time_sec_);
     }
   }
 
@@ -2184,7 +2186,7 @@ void Controller::run_system_mppi(double P_atm_kPa, double P_line_pos_kPa,
 
   // 라인 밸브 내부 상태를 실제 인가 명령으로 전진 (채널은 finish 가 한다)
   {
-    const float dt = (float)period_ms_ / 1000.0f;
+    const float dt = (float)dt_ctrl_sec_;
     auto adv = [&](int idx, float u, float pin, float pout) {
       auto& vs = sys_state_.v[(size_t)idx];
       const float z = mppi::step_bw(sys_params_.line, vs, u);
@@ -2242,8 +2244,24 @@ void Controller::on_timer() {
   // 틱 기준이면 같은 입력에 항상 같은 궤적이 나오고, 오프라인 하네스로 옮길 때도
   // 시간 주입점이 여기 한 곳으로 끝난다.
   elapsed_time_sec_ = (double)tick_ * (double)std::max(1, period_ms_) / 1000.0;
-  wall_elapsed_sec_ = std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - start_time_).count();
+  const auto tick_now = std::chrono::steady_clock::now();
+  wall_elapsed_sec_ = std::chrono::duration<double>(tick_now - start_time_).count();
+
+  // ── 이번 틱의 dt ────────────────────────────────────────────────────
+  // elapsed_time_sec_ 는 게이트 재현성을 위해 **틱 기반**으로 남기고(README 0절),
+  // 물리 계산에 쓰는 dt 만 실측으로 바꾼다. 둘의 역할이 다르다:
+  // 전자는 "몇 번째 틱인가", 후자는 "얼마나 시간이 흘렀는가" 다.
+  {
+    const double nom = (double)std::max(1, period_ms_) / 1000.0;
+    if (tick_ > 0) {
+      const double raw = std::chrono::duration<double>(tick_now - last_tick_time_).count();
+      // 스케줄러 스파이크가 dt 를 오염시키지 않게 공칭의 [0.25, 4] 배로 자른다.
+      const double d = std::clamp(raw, 0.25 * nom, 4.0 * nom);
+      dt_meas_sec_ = (dt_meas_sec_ <= 0.0) ? d : (0.02 * d + 0.98 * dt_meas_sec_);
+    }
+    last_tick_time_ = tick_now;
+    dt_ctrl_sec_ = (use_measured_dt_ && dt_meas_sec_ > 0.0) ? dt_meas_sec_ : nom;
+  }
 
   std::array<uint16_t, NUM_CAN_BOARDS> snap_sensors;
   {
@@ -2362,11 +2380,9 @@ void Controller::on_timer() {
   // 각도 → 압력 레퍼런스 변환 후 mpc_ref_kpa_ 에 기록
   // ----------------------------------------------------------------
   if (control_mode_ == 1) {
-    const double dt_sec = std::max(1e-6, (double)period_ms_ / 1000.0);
-    run_position_control(dt_sec);
+    run_position_control(std::max(1e-6, dt_ctrl_sec_));
   } else if (control_mode_ == 2) {
-    const double dt_sec = std::max(1e-6, (double)period_ms_ / 1000.0);
-    run_optimized_pressure_ref(dt_sec);
+    run_optimized_pressure_ref(std::max(1e-6, dt_ctrl_sec_));
   }
 
   {
@@ -2479,7 +2495,7 @@ void Controller::on_timer() {
 
       m->set_rail_rate(pos_side ? rail_rate_pos_ : rail_rate_neg_);
       std::array<uint16_t, MPC_OUT_DIM> u3{};
-      m->solve(static_cast<float>(period_ms_), u3, static_cast<float>(elapsed_time_sec_));
+      m->solve(static_cast<float>(dt_ctrl_sec_ * 1000.0), u3, static_cast<float>(elapsed_time_sec_));
 
       const int pwm_base = brd_idx * PWM_PER_BOARD;
       zoh_[pwm_base + 0] = u3[0];
@@ -2503,7 +2519,7 @@ void Controller::on_timer() {
     zoh_[(size_t)macro_switch_pwm_index_] = any_neg_macro_active ? 4095 : 0;
   }
 
-  const double dt = std::max(1e-6, (double)period_ms_ / 1000.0);
+  const double dt = std::max(1e-6, dt_ctrl_sec_);   // LinePID
 
   // 중앙집중 MPPI 는 라인 밸브 2개를 **직접** 지령한다 (라인 PID 를 흡수).
   // 그 경로에서 PID 를 함께 돌리면 같은 PWM 인덱스에 두 주인이 생긴다.
@@ -2587,9 +2603,11 @@ void Controller::on_timer() {
     const double ratio = wall_elapsed_sec_ / std::max(1e-9, elapsed_time_sec_);
     if (ratio < 0.97 || ratio > 1.03)
       RCLCPP_WARN(get_logger(),
-        "틱 간격이 가정과 다르다: 가정 %.1f ms, 실측 평균 %.2f ms (비 %.3f). "
-        "컨트롤러는 dt 를 항상 period_ms 로 쓰므로 이 괴리는 모델 오차다.",
-        (double)period_ms_, (double)period_ms_ * ratio, ratio);
+        "틱 간격: 가정 %.1f ms, 실측 평균 %.2f ms (비 %.3f). dt 는 %s. "
+        "period_ms 를 실측에 맞추면 게이트 시간(elapsed)도 함께 맞는다.",
+        (double)period_ms_, (double)period_ms_ * ratio, ratio,
+        use_measured_dt_ ? "실측값을 쓴다 (모델 오차 없음)"
+                         : "period_ms 를 쓴다 — 이 괴리가 그대로 모델 오차다");
   }
 
   if (sys_valve_operate_ && elapsed_time_sec_ >= 5.0) {

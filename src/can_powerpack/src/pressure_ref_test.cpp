@@ -12,6 +12,7 @@
 #include "PressureRefGen.hpp"
 #include "PneumaticFlow.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
@@ -158,6 +159,41 @@ int main()
     std::printf("  음수 목표 클램프: ");
     auto r2 = gen.step({-50.0}, axes, sup);
     std::printf("목표 −50 N → 달성 %.2f N (목표 0 과 같으면 클램프 정상)\n", r2.F_achieved[0]);
+  }
+
+  std::printf("\n=== 5. 레퍼런스가 측정 잡음을 쫓지 않는가 (평활 기준점) ===\n");
+  {
+    // 목표 힘은 **고정**인데 실측 챔버압만 ±15 kPa, 6 Hz 로 흔들리는 상황.
+    // 이때 레퍼런스가 같이 흔들리면 그 진동이 다시 챔버를 흔들어 되먹임 고리가 된다
+    // (실기 계측: 목표각 45° 고정인데 레퍼런스가 5.71 Hz 로 진동했다).
+    // MATLAB 원본은 평활항 기준점을 **직전 레퍼런스**로 둔다 (`ch_cur = ch;`).
+    for (int mode = 0; mode < 2; ++mode) {
+      auto p = make_params(1);
+      p.smooth_anchor_ref = (mode == 1);
+      PressureRefGen gen(p);
+      gen.build_pump_table();
+      PressureRefGen::SupplyState sup;
+      sup.P_rail_pos = 250e3; sup.P_rail_neg = -74e3; sup.P_tank = 480e3;
+      sup.P_ej = -70e3; sup.use_ej_meas = true;
+
+      double mn = 1e30, mx = -1e30, sum = 0, prev = 0; int n = 0;
+      for (int k = 0; k < 200; ++k) {
+        const double osc = 15e3 * std::sin(2.0 * M_PI * 6.0 * (double)k * p.dt);
+        std::vector<PressureRefGen::AxisState> axes{ axis_at(60e3 + osc, -5e3) };
+        auto r = gen.step({150.0}, axes, sup);
+        const double ref = r.P_pos_ref[0] / 1e3;
+        if (k >= 100) {                       // 과도 지난 뒤만 본다
+          mn = std::min(mn, ref); mx = std::max(mx, ref);
+          if (n) sum += std::fabs(ref - prev);
+          prev = ref; ++n;
+        }
+      }
+      std::printf("  smooth_anchor_ref=%-5s → 레퍼런스 %7.2f~%7.2f kPa (폭 %6.2f), "
+                  "틱간 변화 평균 %6.3f kPa\n",
+                  p.smooth_anchor_ref ? "true" : "false", mn, mx, mx - mn,
+                  n > 1 ? sum / (n - 1) : 0.0);
+    }
+    std::printf("    실측은 ±15 kPa 로 흔들리는데 목표 힘은 고정이다 — 폭이 작을수록 좋다.\n");
   }
 
   std::printf("\n");

@@ -232,8 +232,26 @@ PressureRefGen::Result PressureRefGen::step(const std::vector<double>& F_ref_in,
   Eigen::VectorXd lb(nx), ub(nx), dP_rail(N), dN_rail(N);
   build_slew_box(axes, sup, lb, ub, dP_rail, dN_rail);
 
+  // ── 평활항(J4)·탱크/이젝터 벌점의 기준점 ─────────────────────────────
+  // **직전 레퍼런스**를 쓴다. MATLAB 원본이 그렇다 (`ch_cur = ch;` — optimize_channels
+  // 가 낸 직전 해를 다음 스텝의 ch_prev 로 넘긴다).
+  //
+  // 포팅은 여기에 **측정 챔버압**을 넣었다. 그러면 J4 가 "측정값에서 멀어지지 마라"가
+  // 되어 레퍼런스가 실측을 쫓아간다 — 챔버가 흔들리면 레퍼런스도 같이 흔들린다.
+  // 실기 계측: 목표각이 45° 로 고정이라 레퍼런스가 상수여야 하는데 틱간 평균
+  // 2.78 kPa(최대 43.2)씩 바뀌며 5.71 Hz 로 진동했다. 그 진동이 다시 챔버를 흔들어
+  // 되먹임 고리가 된다.
+  //
+  // 슬루 박스(lb/ub)는 **측정값 기준 그대로 둔다** — "지금 이 압력에서 한 스텝에
+  // 어디까지 갈 수 있나"는 실제 상태에서 재야 하는 물리량이다. 기준점만 바꾼다.
+  // 직전 레퍼런스가 박스 밖이면 박스 안으로 클램프한다.
   Eigen::VectorXd xp(nx);
-  for (int i = 0; i < N; ++i) { xp(i) = axes[(size_t)i].P_pos; xp(N + i) = axes[(size_t)i].P_neg; }
+  if (p_.smooth_anchor_ref && has_prev_) {
+    xp = x_prev_;
+  } else {
+    for (int i = 0; i < N; ++i) { xp(i) = axes[(size_t)i].P_pos; xp(N + i) = axes[(size_t)i].P_neg; }
+  }
+  xp = xp.cwiseMax(lb).cwiseMin(ub);
 
   // ── 3. 박스 제약 SQP ───────────────────────────────────────────────
   // 목적함수가 비선형(J2)·비평활(J4 의 L1, hinge)이라 순수 QP 로 표현되지 않는다.

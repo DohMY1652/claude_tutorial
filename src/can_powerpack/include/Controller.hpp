@@ -891,6 +891,18 @@ private:
   double zero_tolerance_kpa_{8.0};
   // 액추에이터 미연결이면 엔코더도 미연결이다 — 각도를 0° 로 고정한다.
   bool encoder_zero_when_disconnected_{true};
+
+  // ── 실측 제어 주기 ──────────────────────────────────────────────────
+  // 제어 루프는 board/sensors 도착에 물려 돈다. 컨트롤러가 그 속도를 못 따라가면
+  // 실제 틱 간격이 period_ms 보다 길어지는데, 예전에는 dt 를 **항상 period_ms 로**
+  // 썼다 (실기 계측: 가정 2.0 ms, 실측 3.09 ms — 1.55배). 그 괴리는 특히
+  // advance_valve_estimate 가 밸브 상태를 실시간 대비 1.55배 느리게 전진시켜,
+  // 모델이 밸브를 굼뜨다고 보고 과도하게 명령하게 만든다 (첫스텝 포화 99%).
+  // 실측 간격을 EMA 로 잡아 dt 로 쓴다. 스파이크는 클램프로 막는다.
+  bool   use_measured_dt_{true};
+  double dt_meas_sec_{-1.0};
+  std::chrono::steady_clock::time_point last_tick_time_{};
+  double dt_ctrl_sec_{0.002};        // 이번 틱에 실제로 쓰는 dt
   // ── 실행 중 켜고 끌 수 있는 보강 ──────────────────────────────────────
   // 파라미터 콜백이 갱신하고, on_timer 가 매 틱 각 MPC 의 cfg_.aug 로 밀어 넣는다.
   // 값 자체는 콜백 스레드와 제어 스레드가 함께 만지므로 뮤텍스로 보호한다.
