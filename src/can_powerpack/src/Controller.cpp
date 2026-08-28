@@ -1567,6 +1567,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     gp.rail_pos_headroom = get_param_or<double>(this, "PressureRefGen.rail.pos_headroom_kpa", 60.0) * 1000.0;
     gp.chamber_neg_headroom = get_param_or<double>(this, "PressureRefGen.rail.chamber_neg_headroom_kpa", 15.0) * 1000.0;
     gp.chamber_pos_headroom = get_param_or<double>(this, "PressureRefGen.rail.chamber_pos_headroom_kpa", 15.0) * 1000.0;
+    gp.supply_filter_tau_s  = get_param_or<double>(this, "PressureRefGen.rail.supply_filter_tau_s", 0.5);
     gp.P_tank_stop  = get_param_or<double>(this, "PressureRefGen.tank_stop_kpa",        450.0) * 1000.0;
 
     gp.wtrack   = get_param_or<double>(this, "PressureRefGen.weights.track",  100.0);
@@ -3190,6 +3191,43 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
       m.data.push_back(r.m_boost * 1e3);                        // 부스트 [g/s]
       m.data.push_back(r.m_eject * 1e3);                        // 이젝터 [g/s]
       pub_refgen_dbg_->publish(m);
+    }
+
+    // ── 공급 부족 경고 ────────────────────────────────────────────────
+    //
+    // 공급이 모자라면 밸브를 아무리 열어도 챔버가 안 찬다. 그 상태의 로그로
+    // 밸브를 피팅하면 실제의 수십분의 1 로 잡혀 컨트롤러가 전 채널을 100% 로
+    // 내게 된다 — 실기 20260828_181748 에서 탱크가 98 kPa(정상 ~600)까지
+    // 비어 있었는데 " LOW" 가 INFO 줄 끝에 붙어 있을 뿐이라 알아채지 못했다.
+    // 터미널에서 바로 보이게 ERROR 로 올린다 (2 초마다 한 번).
+    {
+      const double tank_abs = filt_out_[P_macro_board_id_ - 1];
+      const double rail_abs = filt_out_[P_pos_board_id_ - 1];
+      const double rail_neg_abs = filt_out_[P_neg_board_id_ - 1];
+      double ref_pos_max = 0.0, ref_neg_min = 1e9;
+      for (int a = 0; a < N; ++a) {
+        ref_pos_max = std::max(ref_pos_max, gen_pos_ref_kpa_[(size_t)a]);
+        ref_neg_min = std::min(ref_neg_min, gen_neg_ref_kpa_[(size_t)a]);
+      }
+      if (r.tank_low) {
+        RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+          "[공급 부족] 탱크 %.0f kPa — 운전 하한 %.0f kPa 미만이다. macro 부스트를 쓸 수 없다. "
+          "컴프레서/펌프를 확인할 것. 이 상태의 로그는 밸브 피팅에 쓰면 안 된다.",
+          tank_abs, get_param_or<double>(this, "PressureRefGen.tank_stop_kpa", 450.0) + 101.325);
+      }
+      // 레일이 챔버 목표보다 낮으면 micro 로는 채울 방법이 없다.
+      if (ref_pos_max > 0.0 && rail_abs < ref_pos_max + 10.0) {
+        RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+          "[공급 부족] 양압레일 %.0f kPa 이 챔버 목표 최대 %.0f kPa 보다 낮다(여유 %.0f kPa). "
+          "micro 로는 채울 수 없어 수요가 macro 로 몰린다. 레일 셋포인트는 %.0f kPa 다.",
+          rail_abs, ref_pos_max, rail_abs - ref_pos_max, gen_rail_pos_sp_kpa_);
+      }
+      if (ref_neg_min < 1e8 && rail_neg_abs > ref_neg_min - 10.0) {
+        RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+          "[공급 부족] 음압레일 %.1f kPa 이 챔버 목표 최저 %.1f kPa 보다 깊지 않다(여유 %.1f kPa). "
+          "더 내려갈 수 없다. 레일 셋포인트는 %.1f kPa 다.",
+          rail_neg_abs, ref_neg_min, ref_neg_min - rail_neg_abs, gen_rail_neg_sp_kpa_);
+      }
     }
 
     if (tick_ % 250 == 0) {

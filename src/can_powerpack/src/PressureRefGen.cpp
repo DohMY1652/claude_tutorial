@@ -248,11 +248,39 @@ double PressureRefGen::objective(const Eigen::VectorXd& x, const Eigen::VectorXd
 // ============================================================================
 PressureRefGen::Result PressureRefGen::step(const std::vector<double>& F_ref_in,
                                             const std::vector<AxisState>& axes,
-                                            const SupplyState& sup,
+                                            const SupplyState& sup_in,
                                             const std::vector<std::vector<double>>& F_preview_in)
 {
   const int N = p_.N;
   const int nx = 2 * N;
+
+  // 공급압을 **걸러서** 쓴다.
+  //
+  // 챔버 레퍼런스의 상·하한이 레일 압력에서 나온다(chamber_pos/neg_headroom).
+  // 수요가 커서 레퍼런스가 그 경계에 붙으면 레일의 리플이 그대로 레퍼런스
+  // 리플이 된다 — 목표 각도가 고정인데도 레퍼런스가 흔들린다.
+  //   실기 20260828_181748 (6축, 목표 80° 고정): ref⁺ 와 ub⁺ 가 소수점까지
+  //   같았고(상관 0.998), ub⁺ 는 라인압과 상관 0.971 이었다. 라인압이
+  //   118~138 kPa 로 뛰자 레퍼런스가 103.7~124.3 kPa 로 같이 뛰었다.
+  //   1축에서는 경계에 닿지 않아 안 보였다 — 6축이 같은 레일을 나눠 쓰면서
+  //   항상 닿게 됐다.
+  // 레일이 실제로 내려앉는 것은 따라가야 하므로 완전히 고정하지는 않고,
+  // 리플만 없앨 정도(τ = supply_filter_tau_s, 기본 0.5 s)로 거른다.
+  SupplyState sup = sup_in;
+  {
+    const double a = (p_.supply_filter_tau_s > 1e-6)
+                   ? (p_.dt / (p_.supply_filter_tau_s + p_.dt)) : 1.0;
+    if (!sup_f_init_) { sup_f_ = sup_in; sup_f_init_ = true; }
+    sup_f_.P_rail_pos += a * (sup_in.P_rail_pos - sup_f_.P_rail_pos);
+    sup_f_.P_rail_neg += a * (sup_in.P_rail_neg - sup_f_.P_rail_neg);
+    sup_f_.P_tank     += a * (sup_in.P_tank     - sup_f_.P_tank);
+    sup_f_.P_ej       += a * (sup_in.P_ej       - sup_f_.P_ej);
+    sup.P_rail_pos = sup_f_.P_rail_pos;
+    sup.P_rail_neg = sup_f_.P_rail_neg;
+    sup.P_tank     = sup_f_.P_tank;
+    sup.P_ej       = sup_f_.P_ej;
+  }
+
   Result res;
   res.P_pos_ref.assign((size_t)N, 0.0);
   res.P_neg_ref.assign((size_t)N, 0.0);

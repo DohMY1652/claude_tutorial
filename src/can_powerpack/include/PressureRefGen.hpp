@@ -79,6 +79,10 @@ public:
     // 챔버는 음압레일보다 깊어질 수도, 양압레일보다 높아질 수도 없다.
     double chamber_neg_headroom{15.0e3};
     double chamber_pos_headroom{15.0e3};
+    // 공급압(레일·탱크·이젝터) 저역통과 시정수 [s]. 0 이하면 끔.
+    // 레퍼런스가 레일에서 나온 경계에 붙으면 레일 리플이 그대로 레퍼런스
+    // 리플이 된다. 레일이 실제로 내려앉는 것은 따라가되 리플만 없앤다.
+    double supply_filter_tau_s{0.5};
     double Fmax_ref{150.0};          // 수요 정규화 기준 힘 [N]
 
     // 압축탱크 (부스터)
@@ -214,6 +218,8 @@ private:
   pneu::PumpTable pump_;
 
   std::shared_ptr<QP> qp_;
+  SupplyState sup_f_{};       // 걸러진 공급압
+  bool        sup_f_init_{false};
   Eigen::VectorXd x_prev_;      // 직전 해 (평활항·warm start)
   bool has_prev_{false};
 };
