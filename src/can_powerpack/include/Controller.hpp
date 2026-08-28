@@ -246,6 +246,7 @@ public:
     // → 명령을 공진보다 한참 아래에서 잘라 낸다. 액추에이터가 따라올 수 없는
     //   빠르기로 명령하지 않는다는, 제어에서 가장 기본적인 규칙이다.
     float cmd_lpf_hz = 0.0f;
+    float ki_u_limit_pct = 10.0f;  // 적분 기여분 상한 [지령 %p]
     ControlAug aug{};                 // Controller 가 매 틱 최신값을 밀어 넣는다
     // 밸브별 13-parameter (0=micro, 1=macro, 2=atm). build_mpcs 가 채운다.
     // **이것이 모델의 단일 출처다.** 아래 평면 필드는 하위 호환용으로 micro 값을 담는다.
@@ -731,6 +732,7 @@ private:
     double target_tc{0.2};
     double valve_crack_area_frac{1e-6};
     double cmd_lpf_hz{0.0};   // 명령 저역통과 [Hz], 0=끔
+    double ki_u_limit_pct{10.0};  // 적분 기여분 상한 [지령 %p]
     // 솔버 선택 + MPPI 하이퍼파라미터
     std::string solver{"qp"};
     int    mppi_samples{128};

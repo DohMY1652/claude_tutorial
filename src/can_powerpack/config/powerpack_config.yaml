@@ -127,86 +127,86 @@
 
     channel_config:
       ch0:
-        pos_ki_micro: 0.0
-        pos_ki_macro: 0.0
-        pos_ki_atm: 0.0
+        pos_ki_micro: 0.15
+        pos_ki_macro: 0.05
+        pos_ki_atm: 0.15
         k0: 0.00022
         k1: 0.010
         k2: 0.75
       ch1:
-        pos_ki_micro: 0.0
-        pos_ki_macro: 0.0
-        pos_ki_atm: 0.0
+        pos_ki_micro: 0.15
+        pos_ki_macro: 0.05
+        pos_ki_atm: 0.15
         k0: 0.00022
         k1: 0.010
         k2: 0.75
       ch2:
-        pos_ki_micro: 0.0
-        pos_ki_macro: 0.0
-        pos_ki_atm: 0.0
+        pos_ki_micro: 0.15
+        pos_ki_macro: 0.05
+        pos_ki_atm: 0.15
         k0: 0.00022
         k1: 0.010
         k2: 0.75
       ch3:
-        pos_ki_micro: 0.0
-        pos_ki_macro: 0.0
-        pos_ki_atm: 0.0
+        pos_ki_micro: 0.15
+        pos_ki_macro: 0.05
+        pos_ki_atm: 0.15
         k0: 0.00022
         k1: 0.010
         k2: 0.75
       ch4:
-        pos_ki_micro: 0.0
-        pos_ki_macro: 0.0
-        pos_ki_atm: 0.0
+        pos_ki_micro: 0.15
+        pos_ki_macro: 0.05
+        pos_ki_atm: 0.15
         k0: 0.00022
         k1: 0.010
         k2: 0.75
       ch5:
-        pos_ki_micro: 0.0
-        pos_ki_macro: 0.0
-        pos_ki_atm: 0.0
+        pos_ki_micro: 0.15
+        pos_ki_macro: 0.05
+        pos_ki_atm: 0.15
         k0: 0.00022
         k1: 0.010
         k2: 0.75
       ch6:                         # 음압 ch6 (Board 11, gid 6)
-        neg_ki_micro: 0.0
-        neg_ki_macro: 0.0
-        neg_ki_atm: 0.0
+        neg_ki_micro: 0.15
+        neg_ki_macro: 0.05
+        neg_ki_atm: 0.15
         k0: 0.00022
         k1: 0.008
         k2: 0.70
       ch7:                         # 음압 ch7 (Board 12, gid 7)
-        neg_ki_micro: 0.0
-        neg_ki_macro: 0.0
-        neg_ki_atm: 0.0
+        neg_ki_micro: 0.15
+        neg_ki_macro: 0.05
+        neg_ki_atm: 0.15
         k0: 0.00022
         k1: 0.008
         k2: 0.70
       ch8:                         # 음압 ch8 (Board 13, gid 8)
-        neg_ki_micro: 0.0
-        neg_ki_macro: 0.0
-        neg_ki_atm: 0.0
+        neg_ki_micro: 0.15
+        neg_ki_macro: 0.05
+        neg_ki_atm: 0.15
         k0: 0.00022
         k1: 0.008
         k2: 0.70
       ch9:                         # 음압 ch9 (Board 14, gid 9)
-        neg_ki_micro: 0.0
-        neg_ki_macro: 0.0
-        neg_ki_atm: 0.0
+        neg_ki_micro: 0.15
+        neg_ki_macro: 0.05
+        neg_ki_atm: 0.15
         k0: 0.00022
         k1: 0.008
         k2: 0.70
       ch10:                        # 음압 ch10 (Board 15, gid 10)
-        neg_ki_micro: 0.0
-        neg_ki_macro: 0.0
-        neg_ki_atm: 0.0
+        neg_ki_micro: 0.15
+        neg_ki_macro: 0.05
+        neg_ki_atm: 0.15
         k0: 0.00022
         k1: 0.008
         k2: 0.70
       ch11:                        # 음압 ch11 (Board 16, gid 11)
-        neg_ki_micro: 0.0
-        neg_ki_macro: 0.0
-        neg_ki_atm: 0.0
+        neg_ki_micro: 0.15
+        neg_ki_macro: 0.05
+        neg_ki_atm: 0.15
         k0: 0.00022
         k1: 0.008
         k2: 0.70
@@ -833,14 +833,14 @@
       # → 혼합 분포를 쓴다: 대부분은 작은 sigma 로 정밀하게, explore_frac 만큼은 큰
       #   sigma 로 임계를 건너뛴다. 데드밴드 플랜트에서 단일 분산으로는 정밀도와
       #   도달성을 동시에 얻을 수 없다.
-      mppi_sigma_pct: 3.0            # 정밀 탐색
-      mppi_sigma_explore_pct: 10.0   # 임계 돌파용
+      mppi_sigma_pct: 1.5            # 정밀 탐색
+      mppi_sigma_explore_pct: 5.0   # 임계 돌파용
       mppi_explore_frac: 0.30        # 큰 sigma 를 쓰는 샘플 비율
 
       # MPPI 의 Δu 한계 [%]. QP 경로의 ±30 을 쓰지 않는 이유가 위와 같다 — uref≈0 에서
       # ±30 이면 크래킹 임계(≈52%)에 도달조차 못 한다. 100 이면 절대 클램프 [0,100] 과
       # 겹쳐 사실상 전권이다.
-      mppi_du_limit_pct: 12.0
+      mppi_du_limit_pct: 8.0
 
       # ── 지평 안 스테이지 레퍼런스의 접근 시상수 [s] ──────────────────────
       # **이 값이 성능을 가장 크게 좌우한다.** ≤0 이면 target_time_constant 를 쓴다.
@@ -931,6 +931,12 @@
       # (mppi_ref_tau_s 0.12 s → 1.33 Hz)에서의 위상 지연은 34° 로 감당 가능하다.
       # 과압 세이프티는 cmds_ 를 직접 덮어쓰므로 이 필터를 지나지 않는다 (배기 안 느려짐).
       cmd_lpf_hz : 2.0
+
+      # 적분 기여분 상한 [지령 %p]. 이 밸브는 비례대역이 5.2%p 뿐이고 크래킹
+      # 아래에서 유량이 정확히 0 이라, 적분기가 반응 없이 쌓이다 밸브가 열리는
+      # 순간 718 kPa/s 로 덤핑한다. 적분기의 역할은 모델이 빗나간 만큼(≈8%p) 을
+      # 메우는 것뿐이므로 그만큼만 허용한다.
+      ki_u_limit_pct : 10.0
 
       # 명령 테이퍼(구 cmd_taper_kpa)는 제거했다. 사람이 정하는 kPa 임계값이었고,
       # 플랜트에서는 꺼져 있는데 MPPI 롤아웃에는 남아 있어 예측이 실제보다 감쇠돼

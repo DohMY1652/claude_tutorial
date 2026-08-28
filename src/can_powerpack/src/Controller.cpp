@@ -557,6 +557,19 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
     neg_error_integral_ = std::clamp(neg_error_integral_, -integral_limit, integral_limit);
   }
   
+  // 적분 **기여분** 을 지령 몇 %p 로 묶는다.
+  //
+  // 이 밸브는 비례대역이 5.2%p 뿐이고 크래킹 아래에서는 유량이 정확히 0 이다.
+  // 그 구간에서 적분기는 아무 반응도 못 받은 채 계속 쌓이다가, 밸브가 열리는
+  // 순간 718 kPa/s 로 한꺼번에 쏟아진다. 실제로 플랜트를 모델보다 8% 뻑뻑하게
+  // 두고 시험하니 오버슛이 +42~+100 kPa 였고 끝내 정착하지 못했다.
+  // 적분기가 해야 할 일은 "모델이 빗나간 만큼(≈8%p) 을 메우는 것" 이지
+  // 밸브를 100% 까지 미는 것이 아니다. 기여분을 묶으면 그 역할만 남는다.
+  // (u≥100 에서만 멈추던 기존 anti-windup 은 크래킹 아래에서는 절대 걸리지 않는다.)
+  const float ki_u_lim = cfg_.ki_u_limit_pct;
+  auto ki_term = [ki_u_lim](float ki, float integ) {
+    return std::clamp(ki * integ, -ki_u_lim, ki_u_lim);
+  };
   const float ki_mi = cfg_.is_positive ? cfg_.pos_ki_micro : cfg_.neg_ki_micro;
   const float ki_ma = cfg_.is_positive ? cfg_.pos_ki_macro : cfg_.neg_ki_macro;
   const float ki_at = cfg_.is_positive ? cfg_.pos_ki_atm   : cfg_.neg_ki_atm;
@@ -601,17 +614,17 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
       split_demand(mppi::V_MICRO, Q_req, (double)P_micro, (double)P_now, z_micro_,
                    q_rail, q_boost);
       u_mi_req = valve_invert(mppi::V_MICRO, q_rail, (double)P_micro, (double)P_now, z_micro_)
-                 + ki_mi * pos_error_integral_;
+                 + ki_term(ki_mi, pos_error_integral_);
       u_at_req = 0.f;
       u_ma_req = (q_boost > 0.0)
                  ? valve_invert(mppi::V_MACRO, q_boost, (double)P_macro, (double)P_now, z_macro_)
-                   + ki_ma * pos_error_integral_
+                   + ki_term(ki_ma, pos_error_integral_)
                  : 0.f;
     } else {
       u_mi_req = 0.f;
       u_ma_req = 0.f;
       u_at_req = valve_invert(mppi::V_ATM, Q_req, (double)P_now, (double)P_abs_atm, z_atm_)
-                 + ki_at * std::abs(pos_error_integral_);
+                 + ki_term(ki_at, std::abs(pos_error_integral_));
     }
   } else {
     // 음압 채널: micro=챔버→음압레일, macro=챔버→이젝터, atm=대기→챔버
@@ -623,17 +636,17 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
       split_demand(mppi::V_MICRO, Q_req, (double)P_now, (double)P_micro, z_micro_,
                    q_rail, q_boost);
       u_mi_req = valve_invert(mppi::V_MICRO, q_rail, (double)P_now, (double)P_micro, z_micro_)
-                 + ki_mi * neg_error_integral_;
+                 + ki_term(ki_mi, neg_error_integral_);
       u_at_req = 0.f;
       u_ma_req = (q_boost > 0.0)
                  ? valve_invert(mppi::V_MACRO, q_boost, (double)P_now, (double)cfg_.ejector_p_limit, z_macro_)
-                   + ki_ma * neg_error_integral_
+                   + ki_term(ki_ma, neg_error_integral_)
                  : 0.f;
     } else {
       u_mi_req = 0.f;
       u_ma_req = 0.f;
       u_at_req = valve_invert(mppi::V_ATM, Q_req, (double)P_abs_atm, (double)P_now, z_atm_)
-                 + ki_at * std::abs(neg_error_integral_);
+                 + ki_term(ki_at, std::abs(neg_error_integral_));
     }
   }
 
@@ -850,13 +863,19 @@ void AcadosMpc::finish(const std::array<float,3>& du3,
   // 1차 저역통과는 DC 이득이 1 이라 정상상태 오차를 만들지 않는다 — 느려질 뿐이다.
   //
   // 과압 세이프티는 cmds_ 를 직접 덮어쓰므로 이 필터를 지나지 않는다.
+  // **비대칭**이다: 여는 쪽만 느리고 닫는 쪽은 그대로 통과시킨다.
+  //
+  // 대칭 필터는 닫는 것도 똑같이 늦춘다. 실기에서 밸브가 열리면 챔버가
+  // 718 kPa/s 로 차오르는데(20260828 적합), 2 Hz 대칭 필터는 닫는 데 τ=80 ms 를
+  // 걸어 그동안 ≈57 kPa 를 더 밀어 넣는다 — 진동을 막으려던 필터가 오버슛을
+  // 만든다. 여는 쪽만 늦추면 공진을 때리는 급격한 상승은 그대로 막으면서
+  // 배기·폐쇄는 즉시 듣는다. 과압 세이프티는 어차피 cmds_ 를 직접 덮어쓴다.
   if (cfg_.cmd_lpf_hz > 0.0f && dt_sec_ > 1e-6f) {
     if (!u_lpf_init_) { u_lpf_ = u0; u_lpf_init_ = true; }
     const float a = 1.0f - std::exp(-2.0f * (float)M_PI * cfg_.cmd_lpf_hz * (float)dt_sec_);
     for (int j = 0; j < 3; ++j) {
-      u_lpf_[(size_t)j] += a * (u0[(size_t)j] - u_lpf_[(size_t)j]);
-      // 완전히 닫으라는 지령에서 지수 꼬리가 남아 밸브가 계속 새는 것을 막는다.
-      if (u0[(size_t)j] <= 0.0f && u_lpf_[(size_t)j] < 0.05f) u_lpf_[(size_t)j] = 0.0f;
+      if (u0[(size_t)j] <= u_lpf_[(size_t)j]) u_lpf_[(size_t)j] = u0[(size_t)j];  // 닫기: 즉시
+      else u_lpf_[(size_t)j] += a * (u0[(size_t)j] - u_lpf_[(size_t)j]);          // 열기: 완만히
       u0[(size_t)j] = std::clamp(u_lpf_[(size_t)j], 0.0f, 100.0f);
     }
   }
@@ -1089,6 +1108,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.target_tc = get_param_or<double>(this, "MPC_parameters.target_time_constant", 0.2);
   mpc_.valve_crack_area_frac = get_param_or<double>(this, "MPC_parameters.valve_crack_area_frac", 1e-6);
   mpc_.cmd_lpf_hz            = get_param_or<double>(this, "MPC_parameters.cmd_lpf_hz", 0.0);
+  mpc_.ki_u_limit_pct        = get_param_or<double>(this, "MPC_parameters.ki_u_limit_pct", 10.0);
 
   // ── 솔버 선택 ────────────────────────────────────────────────────────────
   mpc_.solver = get_param_or<std::string>(this, "MPC_parameters.solver", std::string("qp"));
@@ -1828,6 +1848,7 @@ void Controller::build_mpcs() {
       cfg.target_time_constant = (float)mpc_.target_tc;
       cfg.valve_crack_area_frac = (float)mpc_.valve_crack_area_frac;
       cfg.cmd_lpf_hz            = (float)mpc_.cmd_lpf_hz;
+      cfg.ki_u_limit_pct        = (float)mpc_.ki_u_limit_pct;
 
       // mppi_system 에서는 채널 솔버를 만들지 않는다 — Δu 를 중앙집중이 낸다.
       // prepare/finish(피드포워드·적분·크래킹·상태추정)는 그대로 쓰인다.

@@ -60,25 +60,60 @@ PIN_ROLE = {
     ('neg', 'macro'): 101.3,   # 챔버 → 이젝터
 }
 
-# 비례대역을 정하는 두 점
-U_CLOSED, S_CLOSED = 6.7, 0.002
-U_OPEN,   S_OPEN   = 55.0, 0.95
+# 2026-08-28 실기 20260828_113700 로 20~120 mA 공백을 메운 뒤의 최소자승 적합.
+#
+# 그 전에는 이 구간에 표본이 없어 "20 mA 닫힘 / 55% 전개" 두 점으로 완만하게
+# 보간했다(k_shape 63.2, 비례대역 23.2%p). 실기에서 그 곡선은 25%/75 mA 에서
+# 면적 0.0037 을 예측했지만 실제 유량은 0 이었고, 컨트롤러가 21~28% 에서 멈춰
+# 서서 레퍼런스를 20~33 kPa 아래로 놓쳤다.
+#
+# 새 실측 (배기·macro 닫힘, 라인압>챔버+30 kPa):
+#     ≤ 90 mA (30%) : 면적 ≈ 0        (50~60 mA 구간만 n=1407)
+#     42.5%         : 0.024834
+#     47.5%         : 0.031861
+#     52.5%         : 0.032521
+# 12점 최소자승 결과가 아래 값이고 전 점을 ±0.8% 안에서 재현한다.
+#
+# 비례대역은 5.2%p 다. 넓히고 싶어도 실기가 그렇지 않다 — 이 밸브는 사실상
+# 온/오프고, 그래서 (a) 명령 LPF 를 비대칭(열 때만 느리게)으로 두고
+# (b) 적분항으로 대역 안에서 미세 조정한다. 자세한 것은 HANDOFF S-8.
+K_SHAPE = 283.6416
+C_K_REF = 0.14604655      # PIN_REF(190 kPa) 기준. 다른 상류압은 C_p·ΔPin 만큼 옮긴다.
 
-# 실측 포화 유효면적 (양압 ch0 계측). 나머지는 기존 비율을 그대로 유지한다.
-A_POS_MICRO = 0.033
-A_POS_ATM   = 0.044
+# 고압 상류(레일·탱크)를 가진 충전 밸브에만 거는 **뻑뻑함 여유폭** [지령 %p].
+#
+# 시뮬 강건성 시험 결과가 심하게 비대칭이다 (플랜트를 모델 대비 옮겨 가며 측정):
+#     플랜트가 −2.9%p 헐거움 → 오차 +0.12, p-p  2.5  (정상)
+#     정합                   → 오차 −0.02, p-p  0.2
+#     플랜트가 +1.9%p 뻑뻑   → 오차 −0.02, p-p  0.5
+#     플랜트가 +2.9%p 뻑뻑   → 오차 +1.66, p-p 63.1  (붕괴)
+# 위험한 방향은 하나뿐이다: **모델은 유량이 있다고 믿는데 실제로는 0 일 때.**
+# 그러면 피드백이 아예 없어 지령이 대역을 한참 지나칠 때까지 램프업하고,
+# 크래킹을 넘는 순간 700 kPa/s 가 한꺼번에 터진다. 2026-08-28 실기에서
+# 25%/75 mA 로 20 초를 버틴 것이 정확히 이 상태였다.
+# 모델을 조금 뻑뻑하게 잡아 두면 항상 안전한 쪽에 있다.
+#
+# 배기 밸브에는 걸지 않는다. 거기서 뻑뻑하게 잡으면 과배기해서 정상상태가
+# 목표보다 내려앉는다 (여유폭 +6.8%p 시험에서 −14 kPa).
+STIFF_MARGIN_PCT = 1.5
+STIFF_ROLES = {('pos', 'micro'), ('pos', 'macro')}   # 상류가 레일·탱크인 것만
+
+A_POS_MICRO = 0.032259
+A_POS_ATM   = 0.043300
 
 
 def solve_shape(Pin=PIN_REF):
-    kl = math.log(S_CLOSED / (1 - S_CLOSED))
-    kh = math.log(S_OPEN / (1 - S_OPEN))
-    k = (kh - kl) / (IMAX / 100.0 * (U_OPEN - U_CLOSED))
-    C_k = U_OPEN / 100.0 * IMAX + C_P * Pin - kh / k
-    return k, C_k
+    """적합 곡선을 상류압 Pin 으로 옮긴다. C_p·Pin 항이 상류압에 비례하므로
+    C_k 를 같은 만큼 옮겨야 밸브가 자기 동작점에서 같은 지령에 열린다."""
+    return K_SHAPE, C_K_REF + C_P * (Pin - PIN_REF)
 
 
 def role_ck(ch, valve):
-    return solve_shape(PIN_ROLE[('pos' if ch <= 5 else 'neg', valve)])[1]
+    role = ('pos' if ch <= 5 else 'neg', valve)
+    C_k = solve_shape(PIN_ROLE[role])[1]
+    if role in STIFF_ROLES:
+        C_k += STIFF_MARGIN_PCT / 100.0 * IMAX      # 모델을 그만큼 뻑뻑하게
+    return C_k
 
 
 def band(k, C_k):
@@ -115,9 +150,13 @@ def main():
     print(f"반개 {(C_k - C_P*PIN_REF)/IMAX*100:.1f}%   "
           f"비례대역 {lo:.1f}~{hi:.1f}% ({hi-lo:.1f}%p)   "
           f"[기존 모델은 64.5~68.0%, 3.5%p]")
-    print("밸브별 C_k (자기 상류압 기준, 반개 39.5% 로 통일):")
+    print(f"밸브별 C_k (자기 상류압 기준, 충전 밸브에 +{STIFF_MARGIN_PCT}%p 여유폭):")
     for (sgn, v), Pin in PIN_ROLE.items():
-        print(f"   {sgn}/{v:5s} Pin={Pin:6.1f} kPa → C_k = {solve_shape(Pin)[1]:.8f}")
+        ck = solve_shape(Pin)[1]
+        mark = ""
+        if (sgn, v) in STIFF_ROLES:
+            ck += STIFF_MARGIN_PCT / 100.0 * IMAX; mark = f"  (+{STIFF_MARGIN_PCT}%p)"
+        print(f"   {sgn}/{v:5s} Pin={Pin:6.1f} kPa → C_k = {ck:.8f}{mark}")
 
     src = open(YAML, encoding='utf-8').read()
     out = []
