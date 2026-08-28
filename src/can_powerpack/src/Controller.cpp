@@ -669,6 +669,7 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   //   양압 채널: micro·macro = 레일/탱크 → 챔버 (올림),  atm = 챔버 → 대기 (내림)
   //   음압 채널: micro·macro = 챔버 → 진공/이젝터 (내림), atm = 대기 → 챔버 (올림)
   u_want_ = { u_mi_req > 0.0f, u_ma_req > 0.0f, u_at_req > 0.0f };
+  err_abs_ = std::abs(err);
   const bool via_atm = (u_at_req > 0.0f);
   want_sign_ = cfg_.is_positive ? (via_atm ? -1.0f : +1.0f)
                                 : (via_atm ? +1.0f : -1.0f);
@@ -942,7 +943,19 @@ void AcadosMpc::finish(const std::array<float,3>& du3,
   //   +8 kPa/s 로 **올라가기 시작하자** |dP/dt|>5 라는 이유로 하한이 풀렸고,
   //   배기 지령이 11.6% 로 떨어져 아무것도 못 하는 사이 121.8 kPa 까지 올랐다.
   //   그때부터 2 Hz · p-p 40 kPa 진동이 시작됐다.
-  if (want_sign_ * dpdt_f_ < cfg_.crack_floor_rate_kpas) {
+  // 오차가 아주 작을 때는 걸지 않는다.
+  //
+  // 하한은 "요구했는데 아무 일도 안 일어난다" 를 구제하려는 것이지, 0.1 kPa
+  // 를 다듬으려는 것이 아니다. 크래킹 지점의 한 펄스가 수 kPa 를 움직이므로,
+  // 그보다 작은 오차에 하한을 걸면 매번 목표를 넘어가 방향이 뒤집히고 릴레이
+  // 진동이 된다.
+  //   실기 20260828_174653: t=39.8~41.5 에 n1 을 43.0% 에 두고 오차 +0.1 로
+  //   1.7 초간 완벽히 안정했다. 그런데 오차가 −0.1 로 넘어가는 순간 반대 밸브
+  //   (n2)가 하한으로 발사돼 +8.5 kPa 를 밀어 올렸고 2.8 Hz 진동이 재개됐다.
+  // 이 문턱 아래에서는 적분 트림(하한 뒤에 더해진다)이 계속 다듬으므로
+  // 정상상태 오차가 남지는 않는다.
+  if (err_abs_ >= cfg_.crack_floor_min_err_kpa &&
+      want_sign_ * dpdt_f_ < cfg_.crack_floor_rate_kpas) {
     for (int j = 0; j < 3; ++j) {
       if (u_want_[(size_t)j] && u0[(size_t)j] < u_crack_[(size_t)j])
         u0[(size_t)j] = std::clamp(u_crack_[(size_t)j], 0.0f, 100.0f);
@@ -1202,6 +1215,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.cmd_lpf_hz            = get_param_or<double>(this, "MPC_parameters.cmd_lpf_hz", 0.0);
   mpc_.ki_u_limit_pct        = get_param_or<double>(this, "MPC_parameters.ki_u_limit_pct", 10.0);
   mpc_.crack_floor_rate_kpas = get_param_or<double>(this, "MPC_parameters.crack_floor_rate_kpas", 5.0);
+  mpc_.crack_floor_min_err_kpa = get_param_or<double>(this, "MPC_parameters.crack_floor_min_err_kpa", 1.5);
 
   // ── 솔버 선택 ────────────────────────────────────────────────────────────
   mpc_.solver = get_param_or<std::string>(this, "MPC_parameters.solver", std::string("qp"));
@@ -1946,6 +1960,7 @@ void Controller::build_mpcs() {
       cfg.cmd_lpf_hz            = (float)mpc_.cmd_lpf_hz;
       cfg.ki_u_limit_pct        = (float)mpc_.ki_u_limit_pct;
       cfg.crack_floor_rate_kpas = (float)mpc_.crack_floor_rate_kpas;
+      cfg.crack_floor_min_err_kpa = (float)mpc_.crack_floor_min_err_kpa;
 
       // mppi_system 에서는 채널 솔버를 만들지 않는다 — Δu 를 중앙집중이 낸다.
       // prepare/finish(피드포워드·적분·크래킹·상태추정)는 그대로 쓰인다.

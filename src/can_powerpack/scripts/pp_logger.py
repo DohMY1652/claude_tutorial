@@ -426,6 +426,12 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        # 런치가 SIGINT 를 보내면 rclpy 가 ExternalShutdownException 을 던진다.
+        # 잡지 않으면 종료코드 1 이 되어 런치가 "process has died" 로 보고한다
+        # (CSV·PNG 는 정상 저장되는데도 실패처럼 보인다).
+        if type(e).__name__ != 'ExternalShutdownException':
+            raise
     finally:
         _cleanup()
 

@@ -248,6 +248,7 @@ public:
     float cmd_lpf_hz = 0.0f;
     float ki_u_limit_pct = 10.0f;  // 적분 기여분 상한 [지령 %p]
     float crack_floor_rate_kpas = 5.0f;  // |dP/dt| 가 이보다 작을 때만 크래킹 하한을 건다
+    float crack_floor_min_err_kpa = 1.5f; // 오차가 이보다 클 때만 크래킹 하한을 건다
     ControlAug aug{};                 // Controller 가 매 틱 최신값을 밀어 넣는다
     // 밸브별 13-parameter (0=micro, 1=macro, 2=atm). build_mpcs 가 채운다.
     // **이것이 모델의 단일 출처다.** 아래 평면 필드는 하위 호환용으로 micro 값을 담는다.
@@ -397,6 +398,7 @@ private:
   float ref_eff_{101.325f};   // 외란 보정이 들어간 유효 레퍼런스 [kPa]
   // 적분 보정 [지령 %p]. uref 가 아니라 **MPPI 뒤**에 더한다 — 자세한 이유는
   // AcadosMpc::finish() 의 주석 참조.
+  float err_abs_{0.0f};       // 이번 틱의 |Pref − P| [kPa]
   float want_sign_{0.0f};     // +1 = 압력을 올리려는 요구, −1 = 내리려는 요구
   std::array<bool,3>  u_want_{false, false, false};  // 이 틱에 유량을 요구한 밸브
   std::array<float,3> u_trim_{0.f, 0.f, 0.f};
@@ -741,6 +743,7 @@ private:
     double cmd_lpf_hz{0.0};   // 명령 저역통과 [Hz], 0=끔
     double ki_u_limit_pct{10.0};  // 적분 기여분 상한 [지령 %p]
     double crack_floor_rate_kpas{5.0};
+    double crack_floor_min_err_kpa{1.5};
     // 솔버 선택 + MPPI 하이퍼파라미터
     std::string solver{"qp"};
     int    mppi_samples{128};
