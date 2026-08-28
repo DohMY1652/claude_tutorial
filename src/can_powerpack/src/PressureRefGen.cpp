@@ -161,8 +161,28 @@ void PressureRefGen::build_slew_box(const std::vector<AxisState>& axes, const Su
 
     double loP = std::max(0.0,             Pp0 - dP_dn);
     double hiP = std::min(p_.Pch_pos_max,  Pp0 + dP_up);
+    // 대칭: 챔버는 양압레일(또는 탱크)보다 높아질 수 없다. 탱크 부스트가 살아
+    // 있으면 탱크까지 허용한다.
+    if (p_.chamber_pos_headroom > 0.0) {
+      const double src = std::max(Ppp, (p_.A_boost > 0.0) ? Ptk : Ppp);
+      hiP = std::min(hiP, std::max(loP, src - p_.chamber_pos_headroom));
+    }
     if (hiP < loP) hiP = loP;
     double loN = std::max(p_.Pch_neg_min,  Pn0 - dN_dn);
+
+    // 챔버는 음압레일보다 깊어질 수 없다. 실제로는 유량이 나오려면 여유가 더 필요하다.
+    //
+    // 슬루 박스는 한 스텝 유량만 보므로 dt 가 크면 사실상 전 구간이 열린다
+    // (실기 로그: P⁻ 경계가 [27.0~101.3] 로 항상 최대폭이었다). 그래서 최적화가
+    // 레일이 40 kPa 일 때도 27 kPa 를 목표로 냈고, 챔버는 도달 못 하는 목표를
+    // 쫓으며 ±25 kPa 로 진동했다 (20260828_164637, 오차 +15~+40 kPa).
+    //
+    // 이 하한이 걸리면 최적화는 같은 힘을 내기 위해 **양압을 더 쓸 수밖에 없다** —
+    // 음압만 혹사하고 양압이 노는 문제도 함께 풀린다.
+    // 여유폭을 0 이하로 두면 이 하한이 꺼진다.
+    if (p_.chamber_neg_headroom > 0.0)
+      loN = std::max(loN, Pnp + p_.chamber_neg_headroom);
+
     double hiN = std::min(0.0,             Pn0 + dN_up);
     if (hiN < loN) hiN = loN;
 

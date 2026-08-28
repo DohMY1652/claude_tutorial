@@ -1543,6 +1543,8 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     gp.Ppos_sp_max  = get_param_or<double>(this, "PressureRefGen.rail.pos_sp_max_kpa",  400.0) * 1000.0;
     gp.Fmax_ref     = get_param_or<double>(this, "PressureRefGen.rail.demand_ref_N",    150.0);
     gp.rail_pos_headroom = get_param_or<double>(this, "PressureRefGen.rail.pos_headroom_kpa", 60.0) * 1000.0;
+    gp.chamber_neg_headroom = get_param_or<double>(this, "PressureRefGen.rail.chamber_neg_headroom_kpa", 15.0) * 1000.0;
+    gp.chamber_pos_headroom = get_param_or<double>(this, "PressureRefGen.rail.chamber_pos_headroom_kpa", 15.0) * 1000.0;
     gp.P_tank_stop  = get_param_or<double>(this, "PressureRefGen.tank_stop_kpa",        450.0) * 1000.0;
 
     gp.wtrack   = get_param_or<double>(this, "PressureRefGen.weights.track",  100.0);

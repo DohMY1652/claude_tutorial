@@ -75,6 +75,10 @@ public:
     // 양압레일을 "가장 높은 챔버 레퍼런스 + 이 값" 으로 묶는다 [Pa]. 0 이하면 끔.
     // 셋포인트가 힘 수요로만 정해져 챔버가 쓸 압력보다 한참 위로 가는 것을 막는다.
     double rail_pos_headroom{60.0e3};
+    // 챔버 레퍼런스를 레일에서 이만큼 떨어뜨린다 [Pa]. 0 이하면 끔.
+    // 챔버는 음압레일보다 깊어질 수도, 양압레일보다 높아질 수도 없다.
+    double chamber_neg_headroom{15.0e3};
+    double chamber_pos_headroom{15.0e3};
     double Fmax_ref{150.0};          // 수요 정규화 기준 힘 [N]
 
     // 압축탱크 (부스터)
