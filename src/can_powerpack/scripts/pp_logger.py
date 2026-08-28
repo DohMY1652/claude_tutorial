@@ -16,12 +16,15 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray, UInt16MultiArray
 
-SCHEMA_VERSION = 3           # 형식을 바꾸면 올린다. 과거 CSV 구분용(meta.json 에 기록)
+SCHEMA_VERSION = 4           # 형식을 바꾸면 올린다. 과거 CSV 구분용(meta.json 에 기록)
 NAMESPACE  = '/pack2'
 LOG_HZ     = 100.0
-NUM_AXES   = 3               # PositionController.axis0~2 (board17~19)
-POS_GIDS   = [0, 1, 2]       # axis별 양압 채널 global_id
-NEG_GIDS   = [6, 7, 8]       # axis별 음압 채널 global_id
+# powerpack_config.yaml 의 num_actuators 최대치(6)에 맞춘다. 실제로 6축보다 적게
+# 돌려도 남는 축은 대기압으로 기록될 뿐이라 해가 없다. 3 으로 두면 6축 운전 시
+# axis3~5 가 통째로 빠진다.
+NUM_AXES   = 6               # PositionController.axis0~5 (board17~22)
+POS_GIDS   = [0, 1, 2, 3, 4, 5]      # axis별 양압 채널 global_id
+NEG_GIDS   = [6, 7, 8, 9, 10, 11]    # axis별 음압 채널 global_id
 CHANNEL_BOARD_OFFSET = 5     # board_id = gid + CHANNEL_BOARD_OFFSET
 PWM_BOARDS = 18              # board/pwm_cmd·board/currents 배열 크기 = PWM_BOARDS*3
 VALVE_NAMES = ['v1micro', 'v2atm', 'v3macro']   # 보드 위 v1/v2/v3 순서
@@ -457,11 +460,19 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    except Exception as e:
-        # 런치가 SIGINT 를 보내면 rclpy 가 ExternalShutdownException 을 던진다.
-        # 잡지 않으면 종료코드 1 이 되어 런치가 "process has died" 로 보고한다
-        # (CSV·PNG 는 정상 저장되는데도 실패처럼 보인다).
-        if type(e).__name__ != 'ExternalShutdownException':
+    except Exception:
+        # 종료 과정에서 나온 예외라면 무시한다.
+        #
+        # 런치가 SIGINT 를 보내면 rclpy 의 신호 처리기가 먼저 컨텍스트를 닫는다.
+        # 그 순간 spin() 은 아직 wait set 을 만드는 중이라 무효해진 컨텍스트로
+        # RCLError("the given context is not valid") 를 던진다 (경로에 따라
+        # ExternalShutdownException 이 오기도 한다). 둘 다 정상 종료 과정이고,
+        # 우리 쪽 _cleanup 은 아직 안 돌았을 수 있으므로 rclpy.ok() 로 판정한다.
+        # 잡지 않으면
+        # 종료코드 1 이 되어 런치가 "process has died" 로 보고한다 — CSV·PNG 는
+        # 멀쩡히 저장되는데도 실패처럼 보인다.
+        # rclpy 가 이미 컨텍스트를 닫았으면(=정상 종료 과정이면) 무시한다.
+        if rclpy.ok() and not _done[0]:
             raise
     finally:
         _cleanup()
