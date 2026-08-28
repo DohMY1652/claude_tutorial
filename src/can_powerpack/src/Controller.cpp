@@ -664,8 +664,14 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
     }
   }
 
-  // 어느 밸브에 유량을 요구했는지 기록해 둔다. 크래킹 하한은 finish() 맨 끝에서 건다.
+  // 어느 밸브에 유량을 요구했는지, 그리고 그 요구가 압력을 **올리려는 것인지
+  // 내리려는 것인지** 기록해 둔다. 크래킹 하한은 finish() 맨 끝에서 건다.
+  //   양압 채널: micro·macro = 레일/탱크 → 챔버 (올림),  atm = 챔버 → 대기 (내림)
+  //   음압 채널: micro·macro = 챔버 → 진공/이젝터 (내림), atm = 대기 → 챔버 (올림)
   u_want_ = { u_mi_req > 0.0f, u_ma_req > 0.0f, u_at_req > 0.0f };
+  const bool via_atm = (u_at_req > 0.0f);
+  want_sign_ = cfg_.is_positive ? (via_atm ? -1.0f : +1.0f)
+                                : (via_atm ? +1.0f : -1.0f);
 
   // Anti-windup Logic
   float u_mi_req_clamped =  std::clamp(u_mi_req + u_trim_[0], 0.0f, 100.0f);
@@ -942,7 +948,15 @@ void AcadosMpc::finish(const std::array<float,3>& du3,
   // 밸브를 확 열어 40 ms 만에 +6 kPa 를 밀어 넣고, 배기가 다시 끌어내리는
   // 3 Hz 리밋사이클이 된다 (p-p 14~30 kPa).
   // 압력이 이미 움직이고 있으면 피드백이 살아 있다는 뜻이므로 하한이 필요 없다.
-  if (std::abs(dpdt_f_) < cfg_.crack_floor_rate_kpas) {
+  // 조건은 "압력이 **원하는 방향으로** 충분히 움직이는가" 다. 절댓값으로 보면
+  // 안 된다 — 압력이 반대로 흐르는 중일 때(정확히 하한이 가장 필요한 때) 게이트가
+  // 오히려 하한을 풀어 버린다.
+  //   실기 20260828_163335: t=62.0~63.5 에 배기를 크래킹(54.9%/137 mA)에 둔 채
+  //   114.3 kPa 를 ±0.4 로 1.5 초간 완벽히 유지하고 있었다. 그런데 압력이
+  //   +8 kPa/s 로 **올라가기 시작하자** |dP/dt|>5 라는 이유로 하한이 풀렸고,
+  //   배기 지령이 11.6% 로 떨어져 아무것도 못 하는 사이 121.8 kPa 까지 올랐다.
+  //   그때부터 2 Hz · p-p 40 kPa 진동이 시작됐다.
+  if (want_sign_ * dpdt_f_ < cfg_.crack_floor_rate_kpas) {
     for (int j = 0; j < 3; ++j) {
       if (u_want_[(size_t)j] && u0[(size_t)j] < u_crack_[(size_t)j])
         u0[(size_t)j] = std::clamp(u_crack_[(size_t)j], 0.0f, 100.0f);
@@ -1528,6 +1542,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     gp.Ppos_sp_min  = get_param_or<double>(this, "PressureRefGen.rail.pos_sp_min_kpa",   30.0) * 1000.0;
     gp.Ppos_sp_max  = get_param_or<double>(this, "PressureRefGen.rail.pos_sp_max_kpa",  400.0) * 1000.0;
     gp.Fmax_ref     = get_param_or<double>(this, "PressureRefGen.rail.demand_ref_N",    150.0);
+    gp.rail_pos_headroom = get_param_or<double>(this, "PressureRefGen.rail.pos_headroom_kpa", 60.0) * 1000.0;
     gp.P_tank_stop  = get_param_or<double>(this, "PressureRefGen.tank_stop_kpa",        450.0) * 1000.0;
 
     gp.wtrack   = get_param_or<double>(this, "PressureRefGen.weights.track",  100.0);

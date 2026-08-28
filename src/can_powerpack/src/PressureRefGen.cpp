@@ -75,7 +75,26 @@ void PressureRefGen::decide_rail_setpoint(const std::vector<std::vector<double>>
   pneg_sp = std::max(p_.Pneg_cap_deep, std::min(p_.Pneg_shallow, pneg_sp));
 
   // 양압레일: 수요 클수록 높게, 단 능력경계까지만
-  const double ppos_target = p_.Ppos_sp_min + demand_norm * (p_.Ppos_sp_max - p_.Ppos_sp_min);
+  double ppos_target = p_.Ppos_sp_min + demand_norm * (p_.Ppos_sp_max - p_.Ppos_sp_min);
+
+  // 챔버가 실제로 쓸 압력보다 한참 위로 올릴 이유가 없다.
+  //
+  // 이 셋포인트는 **힘 수요**로만 정해져 있어서 챔버 레퍼런스와 무관하다.
+  // 실기 20260828_163335 에서 챔버 목표가 114.3 kPa abs(게이지 13) 인데 레일
+  // 셋포인트는 283.9 abs(게이지 182.6) 였다 — 필요량의 14 배다. 그 차압이
+  // 밸브를 초킹 영역에 두어 한 번 열 때마다 300 kPa/s 가 쏟아졌고, 챔버가
+  // ±20 kPa 로 진동했다. 레일 자체도 138~286 kPa 를 오갔다.
+  //
+  // 직전 해(x_prev_)의 최대 양압 레퍼런스에 여유폭을 더한 값으로 묶는다.
+  // 한 틱 지연이 있지만 레일은 챔버보다 훨씬 느리게 움직이므로 문제되지 않는다.
+  // 여유폭을 0 이하로 두면 이 상한이 꺼진다.
+  if (p_.rail_pos_headroom > 0.0 && has_prev_ && x_prev_.size() >= p_.N) {
+    double max_ref = 0.0;
+    for (int i = 0; i < p_.N; ++i) max_ref = std::max(max_ref, x_prev_(i));
+    const double cap = (max_ref - P_ATM) + p_.rail_pos_headroom;   // gauge 로 환산
+    ppos_target = std::min(ppos_target, std::max(p_.Ppos_sp_min, cap));
+  }
+
   ppos_sp = std::min(cap_ppos(pneg_sp), ppos_target);
 }
 

@@ -72,6 +72,9 @@ public:
     bool smooth_anchor_ref{true};
     double Ppos_sp_min{ 30.0e3};     // 양압레일 최소 셋포인트 [Pa gauge]
     double Ppos_sp_max{400.0e3};     // 양압레일 최대 셋포인트 [Pa gauge]
+    // 양압레일을 "가장 높은 챔버 레퍼런스 + 이 값" 으로 묶는다 [Pa]. 0 이하면 끔.
+    // 셋포인트가 힘 수요로만 정해져 챔버가 쓸 압력보다 한참 위로 가는 것을 막는다.
+    double rail_pos_headroom{60.0e3};
     double Fmax_ref{150.0};          // 수요 정규화 기준 힘 [N]
 
     // 압축탱크 (부스터)

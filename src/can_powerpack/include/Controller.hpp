@@ -397,6 +397,7 @@ private:
   float ref_eff_{101.325f};   // 외란 보정이 들어간 유효 레퍼런스 [kPa]
   // 적분 보정 [지령 %p]. uref 가 아니라 **MPPI 뒤**에 더한다 — 자세한 이유는
   // AcadosMpc::finish() 의 주석 참조.
+  float want_sign_{0.0f};     // +1 = 압력을 올리려는 요구, −1 = 내리려는 요구
   std::array<bool,3>  u_want_{false, false, false};  // 이 틱에 유량을 요구한 밸브
   std::array<float,3> u_trim_{0.f, 0.f, 0.f};
   std::array<float,3> u_lpf_{0.f, 0.f, 0.f};   // 명령 저역통과 상태
