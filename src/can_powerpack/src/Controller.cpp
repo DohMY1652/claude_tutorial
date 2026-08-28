@@ -575,6 +575,7 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   const float ki_at = cfg_.is_positive ? cfg_.pos_ki_atm   : cfg_.neg_ki_atm;
   
   float u_mi_req = 0.f, u_ma_req = 0.f, u_at_req = 0.f;
+  u_trim_ = {0.f, 0.f, 0.f};
 
   // macro 분담은 **판정이 아니라 나눗셈**이다 — MATLAB update_sources 와 같은 규칙:
   //     m_fill  = min(요구, 레일이 낼 수 있는 최대)
@@ -613,18 +614,18 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
       double q_rail = 0.0, q_boost = 0.0;
       split_demand(mppi::V_MICRO, Q_req, (double)P_micro, (double)P_now, z_micro_,
                    q_rail, q_boost);
-      u_mi_req = valve_invert(mppi::V_MICRO, q_rail, (double)P_micro, (double)P_now, z_micro_)
-                 + ki_term(ki_mi, pos_error_integral_);
+      u_mi_req = valve_invert(mppi::V_MICRO, q_rail, (double)P_micro, (double)P_now, z_micro_);
+      u_trim_[0] = ki_term(ki_mi, pos_error_integral_);
       u_at_req = 0.f;
       u_ma_req = (q_boost > 0.0)
                  ? valve_invert(mppi::V_MACRO, q_boost, (double)P_macro, (double)P_now, z_macro_)
-                   + ki_term(ki_ma, pos_error_integral_)
                  : 0.f;
+      u_trim_[1] = (q_boost > 0.0) ? ki_term(ki_ma, pos_error_integral_) : 0.f;
     } else {
       u_mi_req = 0.f;
       u_ma_req = 0.f;
-      u_at_req = valve_invert(mppi::V_ATM, Q_req, (double)P_now, (double)P_abs_atm, z_atm_)
-                 + ki_term(ki_at, std::abs(pos_error_integral_));
+      u_at_req = valve_invert(mppi::V_ATM, Q_req, (double)P_now, (double)P_abs_atm, z_atm_);
+      u_trim_[2] = ki_term(ki_at, std::abs(pos_error_integral_));
     }
   } else {
     // 음압 채널: micro=챔버→음압레일, macro=챔버→이젝터, atm=대기→챔버
@@ -635,25 +636,25 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
       double q_rail = 0.0, q_boost = 0.0;
       split_demand(mppi::V_MICRO, Q_req, (double)P_now, (double)P_micro, z_micro_,
                    q_rail, q_boost);
-      u_mi_req = valve_invert(mppi::V_MICRO, q_rail, (double)P_now, (double)P_micro, z_micro_)
-                 + ki_term(ki_mi, neg_error_integral_);
+      u_mi_req = valve_invert(mppi::V_MICRO, q_rail, (double)P_now, (double)P_micro, z_micro_);
+      u_trim_[0] = ki_term(ki_mi, neg_error_integral_);
       u_at_req = 0.f;
       u_ma_req = (q_boost > 0.0)
                  ? valve_invert(mppi::V_MACRO, q_boost, (double)P_now, (double)cfg_.ejector_p_limit, z_macro_)
-                   + ki_term(ki_ma, neg_error_integral_)
                  : 0.f;
+      u_trim_[1] = (q_boost > 0.0) ? ki_term(ki_ma, neg_error_integral_) : 0.f;
     } else {
       u_mi_req = 0.f;
       u_ma_req = 0.f;
-      u_at_req = valve_invert(mppi::V_ATM, Q_req, (double)P_abs_atm, (double)P_now, z_atm_)
-                 + ki_term(ki_at, std::abs(neg_error_integral_));
+      u_at_req = valve_invert(mppi::V_ATM, Q_req, (double)P_abs_atm, (double)P_now, z_atm_);
+      u_trim_[2] = ki_term(ki_at, std::abs(neg_error_integral_));
     }
   }
 
   // Anti-windup Logic
-  float u_mi_req_clamped =  std::clamp(u_mi_req, 0.0f, 100.0f);
-  float u_ma_req_clamped =  std::clamp(u_ma_req, 0.0f, 100.0f);
-  float u_at_req_clamped =  std::clamp(u_at_req, 0.0f, 100.0f);
+  float u_mi_req_clamped =  std::clamp(u_mi_req + u_trim_[0], 0.0f, 100.0f);
+  float u_ma_req_clamped =  std::clamp(u_ma_req + u_trim_[1], 0.0f, 100.0f);
+  float u_at_req_clamped =  std::clamp(u_at_req + u_trim_[2], 0.0f, 100.0f);
   
   bool pos_stop_integration = false;
   bool neg_stop_integration = false;
@@ -854,6 +855,20 @@ void AcadosMpc::finish(const std::array<float,3>& du3,
     std::clamp(safe(uref_[2] + du3[2], "u_atm"),   0.0f, 100.0f),
   };
   for (auto& v : u0) if (!std::isfinite(v)) v = 0.0f;   // clamp 이후 한 번 더
+
+  // 적분 보정은 **MPPI 뒤에** 더한다.
+  //
+  // uref 안에 넣으면 MPPI 가 그대로 되돌린다. MPPI 는 같은 밸브 모델로 재최적화
+  // 하는데, 적분항이 모델이 요구하는 것보다 밸브를 더 여는 순간 MPPI 의 예측은
+  // "그러면 넘친다" 가 되어 du 로 그만큼 빼 버린다. 적분항이 메우려는 것이 바로
+  // 그 모델의 오차이므로, 같은 모델에게 심판을 맡기면 영원히 못 메운다.
+  //   실기 20260828_151518: 배기 피드포워드 36.1% + 적분 +10 = 46.1% 여야 하는데
+  //   실제 지령은 38.1% 에 고정됐고(MPPI 가 −8), 챔버가 11 초간 목표보다
+  //   16.4 kPa 높은 채로 멈춰 있었다. 실측 배기 크래킹은 38.1~45% 사이다.
+  for (int j = 0; j < 3; ++j) {
+    if (u0[(size_t)j] > 0.0f || u_trim_[(size_t)j] > 0.0f)   // 닫으라는 밸브는 건드리지 않는다
+      u0[(size_t)j] = std::clamp(u0[(size_t)j] + u_trim_[(size_t)j], 0.0f, 100.0f);
+  }
 
   // 명령 저역통과 — 밸브 공진과 MPPI 의 틱 단위 스위칭을 끊는다.
   //
