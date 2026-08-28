@@ -543,16 +543,18 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   
   // 적분기(Integral) 업데이트
   constexpr float integral_limit = 1000.0f;
+  // 부호가 바뀔 때 적분기를 0 으로 **리셋하지 않는다.**
+  //
+  // 예전에는 오차 부호가 바뀌는 순간 통째로 0 으로 지웠다. 이 밸브는 크래킹
+  // 아래에서 유량이 0 이라 적분기가 크래킹까지 기어오르는 데 6 초쯤 걸리는데,
+  // 목표를 지나치는 순간 그 6 초치를 전부 버리고 다시 0 에서 시작한다. 그래서
+  // 평균이 목표 위에 앉는다 (시뮬: trim 8.9 → 0.0, 지령 54.3% → 44.9%, 오차가
+  // +1.0 kPa 에 고착). 지금은 보통의 적분기처럼 오차 부호를 따라 자연히 줄어든다.
+  // 폭주는 ki_u_limit_pct(기여분 상한)와 아래 anti-windup 이 막는다.
   if (cfg_.is_positive) {
-    if ((err > 0.0f && pos_error_integral_ < 0.0f) || (err < 0.0f && pos_error_integral_ > 0.0f)) {
-      pos_error_integral_ = 0.0f;
-    }
     pos_error_integral_ += err * dt_sec;
     pos_error_integral_ = std::clamp(pos_error_integral_, -integral_limit, integral_limit);
   } else {
-    if ((err > 0.0f && neg_error_integral_ > 0.0f) || (err < 0.0f && neg_error_integral_ < 0.0f)) {
-      neg_error_integral_ = 0.0f;
-    }
     neg_error_integral_ -= err * dt_sec;
     neg_error_integral_ = std::clamp(neg_error_integral_, -integral_limit, integral_limit);
   }
@@ -567,8 +569,10 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   // 밸브를 100% 까지 미는 것이 아니다. 기여분을 묶으면 그 역할만 남는다.
   // (u≥100 에서만 멈추던 기존 anti-windup 은 크래킹 아래에서는 절대 걸리지 않는다.)
   const float ki_u_lim = cfg_.ki_u_limit_pct;
+  // 밸브는 한 방향으로만 흐른다. 자기 방향의 오차가 쌓였을 때만 열고, 반대
+  // 부호일 때는 0 이다 (예전의 std::abs() 는 부호 리셋이 있을 때만 성립했다).
   auto ki_term = [ki_u_lim](float ki, float integ) {
-    return std::clamp(ki * integ, -ki_u_lim, ki_u_lim);
+    return std::clamp(std::max(0.0f, ki * integ), 0.0f, ki_u_lim);
   };
   const float ki_mi = cfg_.is_positive ? cfg_.pos_ki_micro : cfg_.neg_ki_micro;
   const float ki_ma = cfg_.is_positive ? cfg_.pos_ki_macro : cfg_.neg_ki_macro;
@@ -625,7 +629,7 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
       u_mi_req = 0.f;
       u_ma_req = 0.f;
       u_at_req = valve_invert(mppi::V_ATM, Q_req, (double)P_now, (double)P_abs_atm, z_atm_);
-      u_trim_[2] = ki_term(ki_at, std::abs(pos_error_integral_));
+      u_trim_[2] = ki_term(ki_at, -pos_error_integral_);
     }
   } else {
     // 음압 채널: micro=챔버→음압레일, macro=챔버→이젝터, atm=대기→챔버
@@ -647,9 +651,12 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
       u_mi_req = 0.f;
       u_ma_req = 0.f;
       u_at_req = valve_invert(mppi::V_ATM, Q_req, (double)P_abs_atm, (double)P_now, z_atm_);
-      u_trim_[2] = ki_term(ki_at, std::abs(neg_error_integral_));
+      u_trim_[2] = ki_term(ki_at, -neg_error_integral_);
     }
   }
+
+  // 어느 밸브에 유량을 요구했는지 기록해 둔다. 크래킹 하한은 finish() 맨 끝에서 건다.
+  u_want_ = { u_mi_req > 0.0f, u_ma_req > 0.0f, u_at_req > 0.0f };
 
   // Anti-windup Logic
   float u_mi_req_clamped =  std::clamp(u_mi_req + u_trim_[0], 0.0f, 100.0f);
@@ -894,6 +901,34 @@ void AcadosMpc::finish(const std::array<float,3>& du3,
       u0[(size_t)j] = std::clamp(u_lpf_[(size_t)j], 0.0f, 100.0f);
     }
   }
+
+  // 크래킹 하한은 **모든 것의 맨 마지막**이다 — LPF 뒤여야 한다.
+  //
+  // 위의 LPF 는 비대칭이라 "닫을 땐 즉시" 경로가 있다. 지령이 한 틱이라도
+  // 내려가면 필터가 그 값으로 곧장 떨어지므로, 출력은 평균이 아니라 최근
+  // **최솟값**에 눌러앉는다. 하한을 LPF 앞에 걸면 그 최솟값이 하한을 밑돌아
+  // 무효가 된다 (시뮬: 하한 55.8% 인데 최종 지령 48.5%, 오차 +0.95 kPa 고착).
+  // 유량을 요구한 밸브는 **최소한 크래킹까지는 연다.**
+  //
+  // 역모델은 요구 유량이 작으면 작은 지령을 낸다. 그런데 이 밸브는 크래킹
+  // 아래에서 유량이 정확히 0 이라, 그 지령은 "조금 흐른다" 가 아니라 "아무것도
+  // 안 흐른다" 가 된다. 피드백이 없으니 오차가 그대로 얼어붙는다.
+  //   실기 20260828_153540: 하강 목표에서 배기가 122~133 mA 에 앉아 오차
+  //   +3.4 kPa 가 6 초 동안 그대로였다. 실측 배기 크래킹은 138 mA 다.
+  //
+  // 이것도 적분 보정과 같은 이유로 MPPI **뒤**여야 한다. 앞에 걸면 MPPI 가
+  // 같은 모델로 "그만큼 열면 넘친다" 고 판단해 du 로 도로 끌어내린다.
+  //   시뮬에서 피드포워드에만 걸었을 때: 크래킹 하한 54.3% 인데 최종 지령이
+  //   45.9% 였고 오차가 +1.05 kPa 에 정확히 얼어붙었다.
+  //
+  // 최소 유량은 A_max 의 valve_crack_area_frac(0.05) 만큼이다 — 충전 ≈72 kPa/s,
+  // 배기 ≈9 kPa/s 로 과하지 않다. u_crack_ 은 예전부터 계산만 되고 아무도
+  // 쓰지 않았다 (접근자 u_crack() 도 호출처가 없었다).
+  for (int j = 0; j < 3; ++j) {
+    if (u_want_[(size_t)j] && u0[(size_t)j] < u_crack_[(size_t)j])
+      u0[(size_t)j] = std::clamp(u_crack_[(size_t)j], 0.0f, 100.0f);
+  }
+
 
   last_u3_ = u0;
 

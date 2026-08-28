@@ -127,86 +127,86 @@
 
     channel_config:
       ch0:
-        pos_ki_micro: 0.15
+        pos_ki_micro: 0.35
         pos_ki_macro: 0.05
-        pos_ki_atm: 0.15
+        pos_ki_atm: 0.60
         k0: 0.00022
         k1: 0.010
         k2: 0.75
       ch1:
-        pos_ki_micro: 0.15
+        pos_ki_micro: 0.35
         pos_ki_macro: 0.05
-        pos_ki_atm: 0.15
+        pos_ki_atm: 0.60
         k0: 0.00022
         k1: 0.010
         k2: 0.75
       ch2:
-        pos_ki_micro: 0.15
+        pos_ki_micro: 0.35
         pos_ki_macro: 0.05
-        pos_ki_atm: 0.15
+        pos_ki_atm: 0.60
         k0: 0.00022
         k1: 0.010
         k2: 0.75
       ch3:
-        pos_ki_micro: 0.15
+        pos_ki_micro: 0.35
         pos_ki_macro: 0.05
-        pos_ki_atm: 0.15
+        pos_ki_atm: 0.60
         k0: 0.00022
         k1: 0.010
         k2: 0.75
       ch4:
-        pos_ki_micro: 0.15
+        pos_ki_micro: 0.35
         pos_ki_macro: 0.05
-        pos_ki_atm: 0.15
+        pos_ki_atm: 0.60
         k0: 0.00022
         k1: 0.010
         k2: 0.75
       ch5:
-        pos_ki_micro: 0.15
+        pos_ki_micro: 0.35
         pos_ki_macro: 0.05
-        pos_ki_atm: 0.15
+        pos_ki_atm: 0.60
         k0: 0.00022
         k1: 0.010
         k2: 0.75
       ch6:                         # 음압 ch6 (Board 11, gid 6)
-        neg_ki_micro: 0.15
+        neg_ki_micro: 0.35
         neg_ki_macro: 0.05
-        neg_ki_atm: 0.15
+        neg_ki_atm: 0.60
         k0: 0.00022
         k1: 0.008
         k2: 0.70
       ch7:                         # 음압 ch7 (Board 12, gid 7)
-        neg_ki_micro: 0.15
+        neg_ki_micro: 0.35
         neg_ki_macro: 0.05
-        neg_ki_atm: 0.15
+        neg_ki_atm: 0.60
         k0: 0.00022
         k1: 0.008
         k2: 0.70
       ch8:                         # 음압 ch8 (Board 13, gid 8)
-        neg_ki_micro: 0.15
+        neg_ki_micro: 0.35
         neg_ki_macro: 0.05
-        neg_ki_atm: 0.15
+        neg_ki_atm: 0.60
         k0: 0.00022
         k1: 0.008
         k2: 0.70
       ch9:                         # 음압 ch9 (Board 14, gid 9)
-        neg_ki_micro: 0.15
+        neg_ki_micro: 0.35
         neg_ki_macro: 0.05
-        neg_ki_atm: 0.15
+        neg_ki_atm: 0.60
         k0: 0.00022
         k1: 0.008
         k2: 0.70
       ch10:                        # 음압 ch10 (Board 15, gid 10)
-        neg_ki_micro: 0.15
+        neg_ki_micro: 0.35
         neg_ki_macro: 0.05
-        neg_ki_atm: 0.15
+        neg_ki_atm: 0.60
         k0: 0.00022
         k1: 0.008
         k2: 0.70
       ch11:                        # 음압 ch11 (Board 16, gid 11)
-        neg_ki_micro: 0.15
+        neg_ki_micro: 0.35
         neg_ki_macro: 0.05
-        neg_ki_atm: 0.15
+        neg_ki_atm: 0.60
         k0: 0.00022
         k1: 0.008
         k2: 0.70
@@ -918,7 +918,14 @@
       #
       # 이 값은 "닫힘으로 볼 유효면적 비율"(A_eff/A_max)이고, 위 표는 1e-6 기준이다.
       # 실측 크래킹 전류를 알면 그 압력에서 값이 맞도록 여기를 교정하면 된다.
-      valve_crack_area_frac : 1.0e-6
+      valve_crack_area_frac : 0.01
+      # 1e-6 이면 시그모이드 바닥이라 실제 유량이 시작되는 지점보다 한참 아래를
+      # 가리킨다 (배기 기준 112 mA, 실측 크래킹은 138 mA). 0.05 로 두면 A_max 의
+      # 1% 지점이 되고 그것이 실측 크래킹과 맞는다 (배기 134 mA 에서 −1.9 kPa/s). 이 값이 "유량을 요구하면
+      # 최소한 여기까지는 연다" 의 기준이다 (Controller.cpp open_at_least).
+      # 이때 최소 유량은 충전 ≈14.5 kPa/s, 배기 ≈1.9 kPa/s 다.
+      # 0.05 로 두면 충전 최소가 72 kPa/s 가 되어 한 번 열 때마다 6 kPa 씩
+      # 밀어 올려 ±3 kPa 리밋사이클이 된다 — 최소 스텝이 곧 정착 정밀도다.
 
       # ── 명령 저역통과 [Hz] (0 = 끔) ────────────────────────────────────
       # 밸브는 2차계이고 실측 피팅이 ωn 39.5~45.3 rad/s(6.3~7.2 Hz), ζ≈0.2 를 준다.

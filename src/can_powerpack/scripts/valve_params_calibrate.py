@@ -64,14 +64,26 @@ PIN_REF = 190.0
 # 배기의 원 적합은 k_shape ≈ 1059 (비례대역 1.7%p) 로 사실상 계단이 나왔다.
 # 같은 하드웨어이므로 충전과 같은 k_shape 를 쓰고 C_k 로 크래킹만 맞췄다
 # (면적 −8.7% 오차를 감수한다). 계단보다 완만한 쪽이 제어 가능하다.
-K_SHAPE = 284.5405
-FIT = {                      # 역할 → (A_max, C_k, C_k 를 적합한 상류압)
-    ('pos', 'micro'): (0.032258, 0.14605948, 190.0),
-    ('pos', 'atm'):   (0.042874, 0.15046800, 141.0),
-    ('pos', 'macro'): (0.032258 * (0.2845 / 0.58789258), 0.14605948, 190.0),
-    ('neg', 'micro'): (0.032258 * (1.778125 / 0.58789258), 0.14605948, 190.0),
-    ('neg', 'atm'):   (0.042874 * (1.778125 / 0.58789258), 0.15046800, 141.0),
-    ('neg', 'macro'): (0.032258 * (1.778125 / 0.58789258), 0.14605948, 190.0),
+K_SHAPE = 284.5405          # 충전 계열 기본
+K_SHAPE_ATM = 413.1948      # 배기는 더 가파르다 (아래 참조)
+# 배기 재적합 (실기 20260828_153540, 정상상태 전류 구간 9점):
+#     126 mA (50.3%) 에서 dP/dt −0.1 kPa/s, n=1512  → 닫힘
+#     134 mA (53.5%) 에서 −1.9                       → 겨우 열림
+#     142 mA (56.7%) 에서 −33.7                      → 열림
+#     150 mA (59.9%) 에서 −43.9 ~ −145               → 전개
+# 반개 56.6%(142 mA), 대역 54.4~58.7%. 충전(반개 49.2%)보다 7%p 위다.
+#
+# S-10 의 배기 적합(A_max 0.0429)은 오염돼 있었다. 2026-08-27 실행은 과압
+# 세이프티가 배기를 100%(250 mA) 로 래치했고, 전류의 50 ms LPF 가 그 순간을
+# 142~165 mA 구간에 번지게 해 면적이 20 배로 잡혔다. 이번 정상상태 값이 옳다.
+# 최대 배기율은 ≈145 kPa/s 로 충전(1000+ kPa/s)보다 한참 약하다.
+FIT = {                      # 역할 → (A_max, C_k, C_k 를 적합한 상류압, k_shape)
+    ('pos', 'micro'): (0.032258, 0.14605948, 190.0, K_SHAPE),
+    ('pos', 'atm'):   (0.006000, 0.15860395, 141.0, K_SHAPE_ATM),
+    ('pos', 'macro'): (0.032258 * (0.2845 / 0.58789258), 0.14605948, 190.0, K_SHAPE),
+    ('neg', 'micro'): (0.032258 * (1.778125 / 0.58789258), 0.14605948, 190.0, K_SHAPE),
+    ('neg', 'atm'):   (0.006000 * (1.778125 / 0.58789258), 0.15860395, 141.0, K_SHAPE_ATM),
+    ('neg', 'macro'): (0.032258 * (1.778125 / 0.58789258), 0.14605948, 190.0, K_SHAPE),
 }
 
 # 각 밸브가 실제로 겪는 상류압. C_p·Pin 항이 상류압에 비례하므로 C_k 를 그만큼
@@ -96,9 +108,13 @@ def _role(ch, valve):
     return ('pos' if ch <= 5 else 'neg', valve)
 
 
+def role_k(ch, valve):
+    return FIT[_role(ch, valve)][3]
+
+
 def role_ck(ch, valve):
     role = _role(ch, valve)
-    _amax, C_k_fit, Pin_fit = FIT[role]
+    _amax, C_k_fit, Pin_fit, _k = FIT[role]
     C_k = C_k_fit + C_P * (PIN_ROLE[role] - Pin_fit)
     if role in STIFF_ROLES:
         C_k += STIFF_MARGIN_PCT / 100.0 * IMAX      # 모델을 그만큼 뻑뻑하게
@@ -137,14 +153,15 @@ def main():
     if not (a.apply or a.check):
         print(__doc__); return 0
 
-    print(f"I_MAX = {IMAX} A (실측)   k_shape = {K_SHAPE}   alpha_shape = 1.0")
+    print(f"I_MAX = {IMAX} A (실측)   alpha_shape = 1.0")
     print(f"밸브별 (자기 상류압 기준, 충전·배기에 +{STIFF_MARGIN_PCT}%p 여유폭):")
     for role in FIT:
         Pin = PIN_ROLE[role]
         ck = role_ck(0 if role[0] == 'pos' else 6, role[1])
         half = (ck - C_P * Pin) / IMAX * 100
-        lo = (ck - C_P * Pin + math.log(0.1 / 0.9) / K_SHAPE) / IMAX * 100
-        hi = (ck - C_P * Pin + math.log(0.9 / 0.1) / K_SHAPE) / IMAX * 100
+        kk = role_k(0 if role[0] == 'pos' else 6, role[1])
+        lo = (ck - C_P * Pin + math.log(0.1 / 0.9) / kk) / IMAX * 100
+        hi = (ck - C_P * Pin + math.log(0.9 / 0.1) / kk) / IMAX * 100
         print(f"   {role[0]}/{role[1]:5s} Pin={Pin:6.1f}  A_max={role_amax(0 if role[0]=='pos' else 6, role[1]):.6f}  "
               f"C_k={ck:.8f}  반개 {half:5.1f}%  대역 {lo:.1f}~{hi:.1f}%")
     print()
@@ -164,7 +181,7 @@ def main():
             m = re.match(r'^(          )(A_max|k_shape|C_k|alpha_shape|I_MAX):\s*(\S+)\s*$', line)
             if m:
                 ind, key, cur = m.group(1), m.group(2), float(m.group(3))
-                if key == 'k_shape':      val = K_SHAPE
+                if key == 'k_shape':      val = role_k(ch, valve)
                 elif key == 'C_k':        val = role_ck(ch, valve)
                 elif key == 'alpha_shape': val = 1.0
                 elif key == 'I_MAX':      val = IMAX
