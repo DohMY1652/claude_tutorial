@@ -247,6 +247,7 @@ public:
     //   빠르기로 명령하지 않는다는, 제어에서 가장 기본적인 규칙이다.
     float cmd_lpf_hz = 0.0f;
     float ki_u_limit_pct = 10.0f;  // 적분 기여분 상한 [지령 %p]
+    float crack_floor_rate_kpas = 5.0f;  // |dP/dt| 가 이보다 작을 때만 크래킹 하한을 건다
     ControlAug aug{};                 // Controller 가 매 틱 최신값을 밀어 넣는다
     // 밸브별 13-parameter (0=micro, 1=macro, 2=atm). build_mpcs 가 채운다.
     // **이것이 모델의 단일 출처다.** 아래 평면 필드는 하위 호환용으로 micro 값을 담는다.
@@ -401,6 +402,7 @@ private:
   std::array<float,3> u_lpf_{0.f, 0.f, 0.f};   // 명령 저역통과 상태
   bool  u_lpf_init_{false};
   bool  safety_latched_ext_{false};
+  float dpdt_f_{0.0f};        // 측정 압력 변화율 [kPa/s], τ=100 ms
   float p_prev_meas_{-1.0f};  // 직전 틱 측정압 [kPa] (유량 역산용)
   float neg_error_integral_{0.0f};
 
@@ -737,6 +739,7 @@ private:
     double valve_crack_area_frac{1e-6};
     double cmd_lpf_hz{0.0};   // 명령 저역통과 [Hz], 0=끔
     double ki_u_limit_pct{10.0};  // 적분 기여분 상한 [지령 %p]
+    double crack_floor_rate_kpas{5.0};
     // 솔버 선택 + MPPI 하이퍼파라미터
     std::string solver{"qp"};
     int    mppi_samples{128};

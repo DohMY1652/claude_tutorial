@@ -471,6 +471,15 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
     }
   }
   if (!cfg_.aug.adapt_gain) k_flow_ = 1.0f;   // 끄면 즉시 모델 그대로로 되돌린다
+  // 측정 압력 변화율 — 크래킹 하한을 걸지 말지 판단하는 데 쓴다.
+  // 생값 미분은 0.25 kPa 양자화에서 ±125 kPa/s 잡음이라 반드시 걸러야 한다.
+  if (p_prev_meas_ > 0.0f && dt_sec > 1e-6f) {
+    const float raw = (p_for_rate - p_prev_meas_) / dt_sec;
+    if (std::isfinite(raw)) {
+      const float a = dt_sec / (0.10f + dt_sec);          // τ = 100 ms
+      dpdt_f_ += a * (raw - dpdt_f_);
+    }
+  }
   p_prev_meas_ = p_for_rate;
 
   // ── 보강 ② 오프셋 프리 (출력 외란 추정) ─────────────────────────────
@@ -924,9 +933,20 @@ void AcadosMpc::finish(const std::array<float,3>& du3,
   // 최소 유량은 A_max 의 valve_crack_area_frac(0.05) 만큼이다 — 충전 ≈72 kPa/s,
   // 배기 ≈9 kPa/s 로 과하지 않다. u_crack_ 은 예전부터 계산만 되고 아무도
   // 쓰지 않았다 (접근자 u_crack() 도 호출처가 없었다).
-  for (int j = 0; j < 3; ++j) {
-    if (u_want_[(size_t)j] && u0[(size_t)j] < u_crack_[(size_t)j])
-      u0[(size_t)j] = std::clamp(u_crack_[(size_t)j], 0.0f, 100.0f);
+  // **압력이 실제로 안 움직일 때만** 건다. 그것이 이 하한의 원래 목적이다 —
+  // "유량을 요구했는데 아무 일도 안 일어난다" 를 구제하는 것.
+  //
+  // 조건 없이 걸면 반대 문제가 생긴다. 모델은 크래킹 지점의 최소 유량을
+  // 14.5 kPa/s 로 보지만 실기 충전 밸브는 그 지점에서 285~495 kPa/s 를 낸다
+  // (20260828_160825, 지령 41%/104 mA). 압력이 목표보다 조금만 내려가도 하한이
+  // 밸브를 확 열어 40 ms 만에 +6 kPa 를 밀어 넣고, 배기가 다시 끌어내리는
+  // 3 Hz 리밋사이클이 된다 (p-p 14~30 kPa).
+  // 압력이 이미 움직이고 있으면 피드백이 살아 있다는 뜻이므로 하한이 필요 없다.
+  if (std::abs(dpdt_f_) < cfg_.crack_floor_rate_kpas) {
+    for (int j = 0; j < 3; ++j) {
+      if (u_want_[(size_t)j] && u0[(size_t)j] < u_crack_[(size_t)j])
+        u0[(size_t)j] = std::clamp(u_crack_[(size_t)j], 0.0f, 100.0f);
+    }
   }
 
 
@@ -1159,6 +1179,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.valve_crack_area_frac = get_param_or<double>(this, "MPC_parameters.valve_crack_area_frac", 1e-6);
   mpc_.cmd_lpf_hz            = get_param_or<double>(this, "MPC_parameters.cmd_lpf_hz", 0.0);
   mpc_.ki_u_limit_pct        = get_param_or<double>(this, "MPC_parameters.ki_u_limit_pct", 10.0);
+  mpc_.crack_floor_rate_kpas = get_param_or<double>(this, "MPC_parameters.crack_floor_rate_kpas", 5.0);
 
   // ── 솔버 선택 ────────────────────────────────────────────────────────────
   mpc_.solver = get_param_or<std::string>(this, "MPC_parameters.solver", std::string("qp"));
@@ -1899,6 +1920,7 @@ void Controller::build_mpcs() {
       cfg.valve_crack_area_frac = (float)mpc_.valve_crack_area_frac;
       cfg.cmd_lpf_hz            = (float)mpc_.cmd_lpf_hz;
       cfg.ki_u_limit_pct        = (float)mpc_.ki_u_limit_pct;
+      cfg.crack_floor_rate_kpas = (float)mpc_.crack_floor_rate_kpas;
 
       // mppi_system 에서는 채널 솔버를 만들지 않는다 — Δu 를 중앙집중이 낸다.
       // prepare/finish(피드포워드·적분·크래킹·상태추정)는 그대로 쓰인다.
