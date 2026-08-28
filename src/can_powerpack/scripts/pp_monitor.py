@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 pp_monitor.py  —  Powerpack terminal dashboard
-  보드 1~16 압력 + 전류, 목표 압력, 엔코더 위치 실시간 표시
+  보드 1~16 압력 + 전류 + **목표압·오차**, 엔코더 위치 실시간 표시
+  (목표압은 예전에 표 아래 한 줄로 있었는데 어느 보드 것인지 눈으로 맞춰야 했다.
+   각 보드 행 옆으로 옮기고 오차를 같이 띄운다.)
   't' 키: 표시 on/off 토글   'q' / Ctrl-C: 종료
 """
 import sys, os, threading, termios, tty, time
@@ -20,8 +22,11 @@ BOARD_NAMES = {
    13:'neg ch8', 14:'neg ch9', 15:'neg ch10',16:'neg ch11',
 }
 
-SEP  = '------------------------------------------------------------------------'
-SEP2 = '========================================================================'
+# board 5~16 은 채널 gid 0~11 이다 (powerpack_config 의 channel_board_offset).
+CHANNEL_BOARD_OFFSET = 5
+
+SEP  = '-' * 96
+SEP2 = '=' * 96
 
 
 # ─────────────── ROS2 Node ───────────────
@@ -32,6 +37,10 @@ class MonitorNode(Node):
         self._kpa      = [101.325] * 25
         self._currents = {}
         self._refs     = [101.325] * NUM_CHANNELS
+        # controller/pressure_ref_dbg 말미 6개:
+        #   [rail_pos_sp, rail_neg_sp, tank, tank_low, boost g/s, eject g/s]
+        self._rail_sp  = [float('nan'), float('nan')]
+        self._tank_low = False
         self._encoders = []
         # position_dbg: 축마다 8개씩 이어붙임
         # [angle, angle_ref, p_pos, p_neg, p_pid, p_ff, p_friction, vel_dps] × num_actuators
@@ -44,6 +53,8 @@ class MonitorNode(Node):
                                  self._cb_currents,  10)
         self.create_subscription(Float64MultiArray, f'{ns}/controller/mpc_refs_kpa',
                                  self._cb_refs,      10)
+        self.create_subscription(Float64MultiArray, f'{ns}/controller/pressure_ref_dbg',
+                                 self._cb_refgen,    10)
         self.create_subscription(Float64MultiArray, f'{ns}/board/analog',
                                  self._cb_analog,    10)
         self.create_subscription(Float64MultiArray, f'{ns}/controller/position_dbg',
@@ -58,6 +69,15 @@ class MonitorNode(Node):
         with self._lock:
             for i in range(len(msg.data) // 3):
                 self._currents[i+1] = [msg.data[i*3+j] / 10.0 for j in range(3)]
+
+    def _cb_refgen(self, msg):
+        # 축마다 12 개 + 말미 공용 6 개. 축 수를 몰라도 말미는 뒤에서 셀 수 있다.
+        d = list(msg.data)
+        if len(d) < 6:
+            return
+        with self._lock:
+            self._rail_sp = [d[-6], d[-5]]
+            self._tank_low = d[-3] > 0.5
 
     def _cb_refs(self, msg):
         with self._lock:
@@ -74,11 +94,13 @@ class MonitorNode(Node):
 
     def snapshot(self):
         with self._lock:
-            return list(self._kpa), dict(self._currents), list(self._refs), list(self._encoders), self._pos_dbg
+            return (list(self._kpa), dict(self._currents), list(self._refs),
+                    list(self._encoders), self._pos_dbg,
+                    list(self._rail_sp), self._tank_low)
 
 
 # ─────────────── 화면 구성 ───────────────
-def build_display(kpa, currents, refs, encoders, pos_dbg, display_on):
+def build_display(kpa, currents, refs, encoders, pos_dbg, rail_sp, tank_low, display_on):
     if not display_on:
         return '\033[2J\033[H  [ Display OFF ]  press \'t\' to enable\n'
 
@@ -86,21 +108,39 @@ def build_display(kpa, currents, refs, encoders, pos_dbg, display_on):
     o += f'========== Powerpack Monitor ({NAMESPACE}) ==========\n'
     o += f' [t] toggle display   [q] quit\n'
     o += SEP + '\n'
-    o += '|  ID  | Name          |  I1(mA) |  I2(mA) |  I3(mA) | Press(kPa) |\n'
-    o += '|------|---------------|---------|---------|---------|------------|\n'
+    o += ('|  ID  | Name          |  I1(mA) |  I2(mA) |  I3(mA) |'
+          ' Press(kPa) |   Ref(kPa) |  Err(kPa) |\n')
+    o += ('|------|---------------|---------|---------|---------|'
+          '------------|------------|-----------|\n')
 
     for bid in range(1, 17):
         p    = kpa[bid-1] if bid-1 < len(kpa) else 0.0
         cur  = currents.get(bid, [0.0, 0.0, 0.0])
         name = BOARD_NAMES.get(bid, f'board{bid}')
+
+        # 목표압: 채널 보드는 그 채널의 레퍼런스, 라인 보드는 레일 셋포인트.
+        # 탱크(3)·이젝터(4)는 추종 목표가 없다.
+        gid = bid - CHANNEL_BOARD_OFFSET
+        if 0 <= gid < NUM_CHANNELS and gid < len(refs):
+            ref = refs[gid]
+        elif bid == 1:
+            ref = rail_sp[0] if rail_sp else float('nan')
+        elif bid == 2:
+            ref = rail_sp[1] if len(rail_sp) > 1 else float('nan')
+        else:
+            ref = float('nan')
+
+        if ref == ref:                       # NaN 이 아니면
+            ref_s, err_s = f'{ref:10.3f}', f'{p - ref:+9.2f}'
+        else:
+            ref_s, err_s = ' ' * 10, ' ' * 9
+
         o += (f'|  {bid:02d}  | {name:<13} |'
               f' {cur[0]:7.1f} | {cur[1]:7.1f} | {cur[2]:7.1f} |'
-              f' {p:10.3f} |\n')
+              f' {p:10.3f} | {ref_s} | {err_s} |\n')
 
-    o += SEP2 + '\n'
-    o += ' Target Pressures\n'
-    o += '  gid: ' + ' '.join(f'{i:4d}' for i in range(NUM_CHANNELS)) + '\n'
-    o += '  ref: ' + ' '.join(f'{v:4.0f}' for v in refs)              + '\n'
+    if tank_low:
+        o += '  [경고] 탱크 압력이 운전 하한 미만이다 — macro 부스트를 쓸 수 없다\n'
 
     o += SEP + '\n'
     o += ' Encoders\n'
@@ -171,8 +211,9 @@ def main():
                 if display_on:
                     os.system('clear')
 
-            kpa, currents, refs, encoders, pos_dbg = node.snapshot()
-            sys.stdout.write(build_display(kpa, currents, refs, encoders, pos_dbg, display_on))
+            kpa, currents, refs, encoders, pos_dbg, rail_sp, tank_low = node.snapshot()
+            sys.stdout.write(build_display(kpa, currents, refs, encoders, pos_dbg,
+                                           rail_sp, tank_low, display_on))
             sys.stdout.flush()
             time.sleep(0.1)
     except KeyboardInterrupt:
