@@ -88,10 +88,17 @@ void PressureRefGen::decide_rail_setpoint(const std::vector<std::vector<double>>
   // 직전 해(x_prev_)의 최대 양압 레퍼런스에 여유폭을 더한 값으로 묶는다.
   // 한 틱 지연이 있지만 레일은 챔버보다 훨씬 느리게 움직이므로 문제되지 않는다.
   // 여유폭을 0 이하로 두면 이 상한이 꺼진다.
+  //
+  // x_prev_ 는 **이미 gauge** 다 (build_slew_box 의 Pp0 와 같은 단위). 여기서
+  // P_ATM 을 또 빼면 언제나 큰 음수가 되어 상한이 Ppos_sp_min 으로 클램프된다 —
+  // 실기 20260828_172124 에서 레일 셋포인트가 전 구간 131.3 kPa(= 30 gauge +
+  // 대기압) 로 고정됐고, 챔버 목표 145.1 보다 낮아 micro 로는 채울 수가 없었다.
+  // 그래서 수요가 전부 macro(탱크 590 kPa)로 가 폭주했다.
+  // "목표 압력이 높으면 안 된다" 의 정체가 이것이다.
   if (p_.rail_pos_headroom > 0.0 && has_prev_ && x_prev_.size() >= p_.N) {
     double max_ref = 0.0;
     for (int i = 0; i < p_.N; ++i) max_ref = std::max(max_ref, x_prev_(i));
-    const double cap = (max_ref - P_ATM) + p_.rail_pos_headroom;   // gauge 로 환산
+    const double cap = max_ref + p_.rail_pos_headroom;
     ppos_target = std::min(ppos_target, std::max(p_.Ppos_sp_min, cap));
   }
 
