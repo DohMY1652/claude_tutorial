@@ -577,6 +577,10 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   // 적분기가 해야 할 일은 "모델이 빗나간 만큼(≈8%p) 을 메우는 것" 이지
   // 밸브를 100% 까지 미는 것이 아니다. 기여분을 묶으면 그 역할만 남는다.
   // (u≥100 에서만 멈추던 기존 anti-windup 은 크래킹 아래에서는 절대 걸리지 않는다.)
+  // 지령 트림은 이제 **크래킹 위치 오차**만 담당한다 (유량 오차는 위의 q_gain).
+  // 비례대역(≈6%p)의 절반을 넘으면 그것만으로 밸브를 열고 닫을 수 있어
+  // 릴레이가 된다.
+  ki_flow_ = cfg_.ki_flow;
   const float ki_u_lim = cfg_.ki_u_limit_pct;
   // 밸브는 한 방향으로만 흐른다. 자기 방향의 오차가 쌓였을 때만 열고, 반대
   // 부호일 때는 0 이다 (예전의 std::abs() 는 부호 리셋이 있을 때만 성립했다).
@@ -615,8 +619,36 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   // Feedforward: 역모델로 필요한 u_pct 계산
   // 모델이 실제보다 k_flow_ 배 많이 흘린다고 추정되면 그만큼 **덜** 요구해야
   // 실제 유량이 목표가 된다. k_flow_=1 이면 기존과 동일하다.
+  // 적분 보정을 **유량**에 건다 (지령이 아니라).
+  //
+  // 예전에는 적분기가 지령에 상수 %p 를 더했다. 이 밸브는 비례대역이 6.2%p 라
+  // 그 방식은 오차 크기와 무관하게 밸브를 활짝 열어 버린다 — 오차 1 kPa 이든
+  // 15 kPa 이든 같은 +15%p 가 붙는다.
+  //   실기 20260828_184156 (6축): 모델이 요구한 지령은 38.5%(면적 2% 개방)인데
+  //   실제 지령이 53% 였다. 차이 15%p 는 트림이 상한에 포화한 것이고, 53% 는
+  //   그 밸브에서 사실상 완전 개방이다 — 의도의 48 배 유량이다. 그 결과
+  //   v1↔v2 가 3 Hz 로 왕복하며 챔버가 p-p 15~40 kPa 로 진동했다.
+  //
+  // 유량에 걸면 보정이 수요에 비례한다. 오차가 작으면 요구 유량도 작고 지령도
+  // 크래킹 근처에 머문다. 모델이 실제보다 많이 흘린다고 보면 그만큼 더 요구해
+  // 역모델이 알아서 더 큰 지령을 낸다 — 비선형은 역모델이 처리한다.
+  //
+  // 크래킹 위치 자체가 틀린 경우(유량이 아예 0)는 이 배율로 못 고친다.
+  // 그것은 finish() 의 크래킹 하한이 담당한다.
+  // 부호: 이번 틱에 여는 밸브의 **작용 방향**에 맞춰야 한다.
+  //   양압 micro/macro(채움) 은 pos 적분이 양수일 때 더 흘려야 하고,
+  //   양압 atm(배기) 은 pos 적분이 음수일 때 더 흘려야 한다. 음압도 대칭이다.
+  const double m_dot_sum = (double)(m_dot_pressure + m_dot_volume);
+  const bool q_via_atm = cfg_.is_positive ? !(m_dot_sum > 0.0) : !(m_dot_sum < 0.0);
+  const float integ_dir = (q_via_atm ? -1.0f : +1.0f)
+                        * (cfg_.is_positive ? (float)pos_error_integral_
+                                            : (float)neg_error_integral_);
+  const float q_gain = 1.0f + std::clamp(ki_flow_ * integ_dir,
+                                         -cfg_.q_trim_limit, cfg_.q_trim_limit);
+  q_trim_ = q_gain;
   const double Q_req = (double)std::abs(m_dot_pressure + m_dot_volume)
-                     / std::max(1e-3f, k_flow_);
+                     / std::max(1e-3f, k_flow_)
+                     * (double)std::max(0.2f, q_gain);
 
   if (cfg_.is_positive) {
     // 양압 채널: micro=레일→챔버, macro=탱크→챔버, atm=챔버→대기
@@ -1214,6 +1246,8 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.valve_crack_area_frac = get_param_or<double>(this, "MPC_parameters.valve_crack_area_frac", 1e-6);
   mpc_.cmd_lpf_hz            = get_param_or<double>(this, "MPC_parameters.cmd_lpf_hz", 0.0);
   mpc_.ki_u_limit_pct        = get_param_or<double>(this, "MPC_parameters.ki_u_limit_pct", 10.0);
+  mpc_.ki_flow               = get_param_or<double>(this, "MPC_parameters.ki_flow", 0.02);
+  mpc_.q_trim_limit          = get_param_or<double>(this, "MPC_parameters.q_trim_limit", 2.0);
   mpc_.crack_floor_rate_kpas = get_param_or<double>(this, "MPC_parameters.crack_floor_rate_kpas", 5.0);
   mpc_.crack_floor_min_err_kpa = get_param_or<double>(this, "MPC_parameters.crack_floor_min_err_kpa", 1.5);
 
@@ -1960,6 +1994,8 @@ void Controller::build_mpcs() {
       cfg.valve_crack_area_frac = (float)mpc_.valve_crack_area_frac;
       cfg.cmd_lpf_hz            = (float)mpc_.cmd_lpf_hz;
       cfg.ki_u_limit_pct        = (float)mpc_.ki_u_limit_pct;
+      cfg.ki_flow               = (float)mpc_.ki_flow;
+      cfg.q_trim_limit          = (float)mpc_.q_trim_limit;
       cfg.crack_floor_rate_kpas = (float)mpc_.crack_floor_rate_kpas;
       cfg.crack_floor_min_err_kpa = (float)mpc_.crack_floor_min_err_kpa;
 

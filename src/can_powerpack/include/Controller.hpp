@@ -246,7 +246,9 @@ public:
     // → 명령을 공진보다 한참 아래에서 잘라 낸다. 액추에이터가 따라올 수 없는
     //   빠르기로 명령하지 않는다는, 제어에서 가장 기본적인 규칙이다.
     float cmd_lpf_hz = 0.0f;
-    float ki_u_limit_pct = 10.0f;  // 적분 기여분 상한 [지령 %p]
+    float ki_u_limit_pct = 10.0f;  // 지령 트림 상한 [%p] — 크래킹 위치 오차용
+    float ki_flow = 0.02f;         // 유량 트림 이득 [1/(kPa·s)]
+    float q_trim_limit = 2.0f;     // 유량 배율 보정 상한 (2.0 = 최대 3배/1/3배)
     float crack_floor_rate_kpas = 5.0f;  // |dP/dt| 가 이보다 작을 때만 크래킹 하한을 건다
     float crack_floor_min_err_kpa = 1.5f; // 오차가 이보다 클 때만 크래킹 하한을 건다
     ControlAug aug{};                 // Controller 가 매 틱 최신값을 밀어 넣는다
@@ -398,6 +400,8 @@ private:
   float ref_eff_{101.325f};   // 외란 보정이 들어간 유효 레퍼런스 [kPa]
   // 적분 보정 [지령 %p]. uref 가 아니라 **MPPI 뒤**에 더한다 — 자세한 이유는
   // AcadosMpc::finish() 의 주석 참조.
+  float ki_flow_{0.02f};      // 유량 트림 이득
+  float q_trim_{1.0f};        // 이번 틱의 유량 배율 (진단용)
   float err_abs_{0.0f};       // 이번 틱의 |Pref − P| [kPa]
   float want_sign_{0.0f};     // +1 = 압력을 올리려는 요구, −1 = 내리려는 요구
   std::array<bool,3>  u_want_{false, false, false};  // 이 틱에 유량을 요구한 밸브
@@ -741,7 +745,9 @@ private:
     double target_tc{0.2};
     double valve_crack_area_frac{1e-6};
     double cmd_lpf_hz{0.0};   // 명령 저역통과 [Hz], 0=끔
-    double ki_u_limit_pct{10.0};  // 적분 기여분 상한 [지령 %p]
+    double ki_u_limit_pct{10.0};  // 지령 트림 상한 [%p]
+    double ki_flow{0.02};
+    double q_trim_limit{2.0};
     double crack_floor_rate_kpas{5.0};
     double crack_floor_min_err_kpa{1.5};
     // 솔버 선택 + MPPI 하이퍼파라미터
