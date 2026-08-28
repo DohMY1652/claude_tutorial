@@ -3252,16 +3252,20 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
           tank_abs, get_param_or<double>(this, "PressureRefGen.tank_stop_kpa", 450.0) + 101.325);
       }
       // 레일이 챔버 목표보다 낮으면 micro 로는 채울 방법이 없다.
-      if (ref_pos_max > 0.0 && rail_abs < ref_pos_max + 10.0) {
+      if (ref_pos_max > 0.0 && rail_abs < ref_pos_max + 3.0) {
         RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
-          "[공급 부족] 양압레일 %.0f kPa 이 챔버 목표 최대 %.0f kPa 보다 낮다(여유 %.0f kPa). "
-          "micro 로는 채울 수 없어 수요가 macro 로 몰린다. 레일 셋포인트는 %.0f kPa 다.",
+          "[공급 부족] 양압레일 %.0f kPa 로는 챔버 목표 최대 %.0f kPa 를 채울 수 없다 "
+          "(여유 %+.0f kPa). 수요가 macro 로 몰린다. 레일 셋포인트는 %.0f kPa 다. "
+          "이 라인 밸브는 배기(레일→대기)라 레일을 올릴 수 없다 — 펌프 능력을 확인할 것.",
           rail_abs, ref_pos_max, rail_abs - ref_pos_max, gen_rail_pos_sp_kpa_);
       }
-      if (ref_neg_min < 1e8 && rail_neg_abs > ref_neg_min - 10.0) {
+      // 여유가 **양수면 정상**이다. 문턱을 3 kPa 로 두어 진짜 부족할 때만 알린다.
+      // (10 kPa 로 두었더니 여유 8.9 kPa 인 정상 상태에도 "깊지 않다" 고 떠서
+      //  오탐이었다.)
+      if (ref_neg_min < 1e8 && rail_neg_abs > ref_neg_min - 3.0) {
         RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
-          "[공급 부족] 음압레일 %.1f kPa 이 챔버 목표 최저 %.1f kPa 보다 깊지 않다(여유 %.1f kPa). "
-          "더 내려갈 수 없다. 레일 셋포인트는 %.1f kPa 다.",
+          "[공급 부족] 음압레일 %.1f kPa 로는 챔버 목표 최저 %.1f kPa 에 못 미친다 "
+          "(여유 %+.1f kPa). 레일 셋포인트는 %.1f kPa 다.",
           rail_neg_abs, ref_neg_min, ref_neg_min - rail_neg_abs, gen_rail_neg_sp_kpa_);
       }
     }
