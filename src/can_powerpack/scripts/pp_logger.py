@@ -16,7 +16,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray, UInt16MultiArray
 
-SCHEMA_VERSION = 2           # 형식을 바꾸면 올린다. 과거 CSV 구분용(meta.json 에 기록)
+SCHEMA_VERSION = 3           # 형식을 바꾸면 올린다. 과거 CSV 구분용(meta.json 에 기록)
 NAMESPACE  = '/pack2'
 LOG_HZ     = 100.0
 NUM_AXES   = 3               # PositionController.axis0~2 (board17~19)
@@ -77,6 +77,13 @@ class PpLogger(Node):
         self._pwm      = [0] * (PWM_BOARDS * 3)      # 지령 [0..4095]
         self._curr     = [0.0] * (PWM_BOARDS * 3)    # 실측 전류 [mV], mA = mV/10
         self._vols     = [0.0] * (2 * NUM_AXES)      # active_volumes_ml
+        # controller/refgen_dbg: 축마다 12개
+        #   [angle, angle_ref, tau_ref, tau_ach, P⁺ref, P⁻ref,
+        #    ub_pos, lb_pos, lb_neg, ub_neg, starve_pos%, starve_neg%]
+        # control_mode=2 에서는 position_dbg 가 발행되지 않아 각도/목표가 비어
+        # 있었다. 슬루 경계와 유량부족률은 "왜 그 목표가 나왔는지" 를 설명한다.
+        self._rg       = [0.0] * (12 * NUM_AXES)
+        self._rg_seen  = False
 
         ns = NAMESPACE
         self.create_subscription(Float64MultiArray, f'{ns}/controller/position_dbg',
@@ -95,6 +102,8 @@ class PpLogger(Node):
                                  self._cb_curr, 10)
         self.create_subscription(Float64MultiArray, f'{ns}/controller/active_volumes_ml',
                                  self._cb_vol, 10)
+        self.create_subscription(Float64MultiArray, f'{ns}/controller/pressure_ref_dbg',
+                                 self._cb_refgen, 10)
 
         # 폴더 및 파일 생성
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -141,6 +150,12 @@ class PpLogger(Node):
         for a in range(NUM_AXES):
             header.append(f'vol_pos_ml_axis{a}')
             header.append(f'vol_neg_ml_axis{a}')
+        # 레퍼런스 생성기 내부 — 왜 그 목표가 나왔는지 설명하는 값들
+        for a in range(NUM_AXES):
+            header += [f'tau_ref_Nm_axis{a}', f'tau_ach_Nm_axis{a}',
+                       f'ub_pos_kpa_axis{a}', f'lb_pos_kpa_axis{a}',
+                       f'lb_neg_kpa_axis{a}', f'ub_neg_kpa_axis{a}',
+                       f'starve_pos_pct_axis{a}', f'starve_neg_pct_axis{a}']
 
         self._writer.writerow(header)
         self._header = header
@@ -209,6 +224,12 @@ class PpLogger(Node):
             for i, v in enumerate(msg.data):
                 if i < len(self._curr): self._curr[i] = float(v)
 
+    def _cb_refgen(self, msg):
+        with self._lock:
+            self._rg_seen = True
+            for i, v in enumerate(msg.data):
+                if i < len(self._rg): self._rg[i] = float(v)
+
     def _cb_vol(self, msg):
         with self._lock:
             for i, v in enumerate(msg.data):
@@ -223,6 +244,7 @@ class PpLogger(Node):
             pwm = list(self._pwm)
             cur = list(self._curr)
             vol = list(self._vols)
+            rg  = list(self._rg); rg_seen = self._rg_seen
 
         elapsed = (self.get_clock().now().nanoseconds - self._start_ns) / 1e9
 
@@ -230,6 +252,9 @@ class PpLogger(Node):
         axis_angles = []
         for a in range(NUM_AXES):
             angle, target, p_pos, p_neg, p_pid, p_ff, p_fric, vel = pos[a*8:(a+1)*8]
+            if rg_seen:                      # control_mode=2 는 position_dbg 를 안 낸다
+                angle, target = rg[12*a], rg[12*a + 1]
+                p_pos, p_neg  = rg[12*a + 4], rg[12*a + 5]
             pos_board_idx = POS_GIDS[a] + CHANNEL_BOARD_OFFSET - 1
             neg_board_idx = NEG_GIDS[a] + CHANNEL_BOARD_OFFSET - 1
             row += [
@@ -263,6 +288,12 @@ class PpLogger(Node):
         for a in range(NUM_AXES):
             row.append(f'{vol[a]:.4f}')
             row.append(f'{vol[NUM_AXES + a]:.4f}')
+        for a in range(NUM_AXES):
+            b = 12 * a
+            row += [f'{rg[b + 2]:.4f}', f'{rg[b + 3]:.4f}',
+                    f'{rg[b + 6]:.4f}', f'{rg[b + 7]:.4f}',
+                    f'{rg[b + 8]:.4f}', f'{rg[b + 9]:.4f}',
+                    f'{rg[b + 10]:.2f}', f'{rg[b + 11]:.2f}']
 
         self._writer.writerow(row)
         b0 = _pwm_base(POS_GIDS[0])
