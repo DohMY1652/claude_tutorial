@@ -40,80 +40,73 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 YAML = os.path.normpath(os.path.join(HERE, '..', 'config', 'valve_params.yaml'))
 
-IMAX = 0.3
+# ── 실측 상수 ────────────────────────────────────────────────────────────
+#
+# 지령 → 전류 이득 (실기 3개 실행 · 80 개 정상상태 구간 · R = 0.999):
+#       전류[mA] = 2.505 · 지령[%] − 0.6
+# 즉 실효 I_MAX = 0.2505 A 다. 모델은 0.3 A 를 가정하고 있었고, 그 20% 차이가
+# 모든 것을 어긋나게 했다.
+#
+# 더 나쁜 것은 이전 보정이 그 잘못된 값으로 **환산**됐다는 점이다. 2026-08-27
+# 실기는 8 Hz 로 스위칭하고 있어서 로그의 지령 열이 전류와 대응하지 않았고,
+# 그래서 전류로 구간을 나눈 뒤 "지령 = 전류/3.0" 으로 되돌렸다. 실제는 /2.505
+# 이므로 곡선 전체가 약 17% 아래로 밀렸다. 그 결과 모델은 크래킹을 41.1% 로
+# 봤지만 실제는 49~52% 였고, 실기에서 배기가 49.4% 로 19 초를 버티는데도
+# 열리지 않았다 (20260828_152809, 챔버가 141 kPa 에 고정).
+#
+# 그래서 이제 적합은 **전류(A) 기준**으로만 한다. 지령 환산을 거치지 않으므로
+# I_MAX 를 잘못 알아도 곡선이 밀리지 않는다.
+IMAX = 0.2505
 C_P = 0.00012
-PIN_REF = 190.0          # 보정에 쓴 라인압 [kPa] — 실기 로그의 중앙값
+PIN_REF = 190.0
 
-# C_k 는 밸브마다 **자기 상류압**으로 잡아야 한다.
-# F_net = I + C_z·z + C_p·Pin − C_k 에서 C_p·Pin 항이 상류압에 비례하는데,
-# macro 는 상류가 탱크(≈800 kPa) 라 C_p·Pin = 0.096 으로 C_k 의 68% 를 먹는다.
-# 전 밸브에 같은 C_k 를 쓰면 macro 는 지령 15% 에서 이미 반개가 되고, 시뮬에서
-# MPPI 가 macro 를 4~8% 만 열어도 챔버가 199 kPa 까지 치솟아 과압 세이프티가
-# 배기를 100% 로 래치했다 — 3 Hz 리밋사이클의 원인이었다.
-# 각 밸브가 **자기 동작점에서** 39.5% 에 반개가 되도록 C_k 를 따로 잡는다.
+# 전류 기준 최소자승 결과 (fit3). 충전은 11점 ±0.8%, 배기는 9점.
+# 배기의 원 적합은 k_shape ≈ 1059 (비례대역 1.7%p) 로 사실상 계단이 나왔다.
+# 같은 하드웨어이므로 충전과 같은 k_shape 를 쓰고 C_k 로 크래킹만 맞췄다
+# (면적 −8.7% 오차를 감수한다). 계단보다 완만한 쪽이 제어 가능하다.
+K_SHAPE = 284.5405
+FIT = {                      # 역할 → (A_max, C_k, C_k 를 적합한 상류압)
+    ('pos', 'micro'): (0.032258, 0.14605948, 190.0),
+    ('pos', 'atm'):   (0.042874, 0.15046800, 141.0),
+    ('pos', 'macro'): (0.032258 * (0.2845 / 0.58789258), 0.14605948, 190.0),
+    ('neg', 'micro'): (0.032258 * (1.778125 / 0.58789258), 0.14605948, 190.0),
+    ('neg', 'atm'):   (0.042874 * (1.778125 / 0.58789258), 0.15046800, 141.0),
+    ('neg', 'macro'): (0.032258 * (1.778125 / 0.58789258), 0.14605948, 190.0),
+}
+
+# 각 밸브가 실제로 겪는 상류압. C_p·Pin 항이 상류압에 비례하므로 C_k 를 그만큼
+# 옮겨야 밸브가 자기 동작점에서 적합했을 때와 같은 전류에 열린다.
 PIN_ROLE = {
     ('pos', 'micro'): 190.0,   # 양압 레일 → 챔버
-    ('pos', 'atm'):   130.0,   # 챔버 → 대기
+    ('pos', 'atm'):   141.0,   # 챔버 → 대기
     ('pos', 'macro'): 800.0,   # 탱크 → 챔버
     ('neg', 'micro'): 101.3,   # 챔버 → 음압 레일
     ('neg', 'atm'):   101.3,   # 대기 → 챔버
     ('neg', 'macro'): 101.3,   # 챔버 → 이젝터
 }
 
-# 2026-08-28 실기 20260828_113700 로 20~120 mA 공백을 메운 뒤의 최소자승 적합.
-#
-# 그 전에는 이 구간에 표본이 없어 "20 mA 닫힘 / 55% 전개" 두 점으로 완만하게
-# 보간했다(k_shape 63.2, 비례대역 23.2%p). 실기에서 그 곡선은 25%/75 mA 에서
-# 면적 0.0037 을 예측했지만 실제 유량은 0 이었고, 컨트롤러가 21~28% 에서 멈춰
-# 서서 레퍼런스를 20~33 kPa 아래로 놓쳤다.
-#
-# 새 실측 (배기·macro 닫힘, 라인압>챔버+30 kPa):
-#     ≤ 90 mA (30%) : 면적 ≈ 0        (50~60 mA 구간만 n=1407)
-#     42.5%         : 0.024834
-#     47.5%         : 0.031861
-#     52.5%         : 0.032521
-# 12점 최소자승 결과가 아래 값이고 전 점을 ±0.8% 안에서 재현한다.
-#
-# 비례대역은 5.2%p 다. 넓히고 싶어도 실기가 그렇지 않다 — 이 밸브는 사실상
-# 온/오프고, 그래서 (a) 명령 LPF 를 비대칭(열 때만 느리게)으로 두고
-# (b) 적분항으로 대역 안에서 미세 조정한다. 자세한 것은 HANDOFF S-8.
-K_SHAPE = 283.6416
-C_K_REF = 0.14604655      # PIN_REF(190 kPa) 기준. 다른 상류압은 C_p·ΔPin 만큼 옮긴다.
-
-# 고압 상류(레일·탱크)를 가진 충전 밸브에만 거는 **뻑뻑함 여유폭** [지령 %p].
-#
-# 시뮬 강건성 시험 결과가 심하게 비대칭이다 (플랜트를 모델 대비 옮겨 가며 측정):
-#     플랜트가 −2.9%p 헐거움 → 오차 +0.12, p-p  2.5  (정상)
-#     정합                   → 오차 −0.02, p-p  0.2
-#     플랜트가 +1.9%p 뻑뻑   → 오차 −0.02, p-p  0.5
-#     플랜트가 +2.9%p 뻑뻑   → 오차 +1.66, p-p 63.1  (붕괴)
-# 위험한 방향은 하나뿐이다: **모델은 유량이 있다고 믿는데 실제로는 0 일 때.**
-# 그러면 피드백이 아예 없어 지령이 대역을 한참 지나칠 때까지 램프업하고,
-# 크래킹을 넘는 순간 700 kPa/s 가 한꺼번에 터진다. 2026-08-28 실기에서
-# 25%/75 mA 로 20 초를 버틴 것이 정확히 이 상태였다.
-# 모델을 조금 뻑뻑하게 잡아 두면 항상 안전한 쪽에 있다.
-#
-# 배기 밸브에는 걸지 않는다. 거기서 뻑뻑하게 잡으면 과배기해서 정상상태가
-# 목표보다 내려앉는다 (여유폭 +6.8%p 시험에서 −14 kPa).
+# 뻑뻑함 여유폭 [지령 %p]. 위험한 방향은 하나뿐이다 — 모델은 유량이 있다고
+# 믿는데 실제로는 0 일 때. 그러면 피드백이 없어 지령이 대역을 한참 지나칠
+# 때까지 램프업한다. 자세한 것은 HANDOFF S-8·S-10.
 STIFF_MARGIN_PCT = 1.5
-STIFF_ROLES = {('pos', 'micro'), ('pos', 'macro')}   # 상류가 레일·탱크인 것만
-
-A_POS_MICRO = 0.032259
-A_POS_ATM   = 0.043300
+STIFF_ROLES = {('pos', 'micro'), ('pos', 'macro'), ('pos', 'atm')}
 
 
-def solve_shape(Pin=PIN_REF):
-    """적합 곡선을 상류압 Pin 으로 옮긴다. C_p·Pin 항이 상류압에 비례하므로
-    C_k 를 같은 만큼 옮겨야 밸브가 자기 동작점에서 같은 지령에 열린다."""
-    return K_SHAPE, C_K_REF + C_P * (Pin - PIN_REF)
+def _role(ch, valve):
+    return ('pos' if ch <= 5 else 'neg', valve)
 
 
 def role_ck(ch, valve):
-    role = ('pos' if ch <= 5 else 'neg', valve)
-    C_k = solve_shape(PIN_ROLE[role])[1]
+    role = _role(ch, valve)
+    _amax, C_k_fit, Pin_fit = FIT[role]
+    C_k = C_k_fit + C_P * (PIN_ROLE[role] - Pin_fit)
     if role in STIFF_ROLES:
         C_k += STIFF_MARGIN_PCT / 100.0 * IMAX      # 모델을 그만큼 뻑뻑하게
     return C_k
+
+
+def role_amax(ch, valve):
+    return FIT[_role(ch, valve)][0]
 
 
 def band(k, C_k):
@@ -144,19 +137,17 @@ def main():
     if not (a.apply or a.check):
         print(__doc__); return 0
 
-    k, C_k = solve_shape()
-    lo, hi = band(k, C_k)
-    print(f"k_shape = {k:.6f}   C_k = {C_k:.8f}   alpha_shape = 1.0")
-    print(f"반개 {(C_k - C_P*PIN_REF)/IMAX*100:.1f}%   "
-          f"비례대역 {lo:.1f}~{hi:.1f}% ({hi-lo:.1f}%p)   "
-          f"[기존 모델은 64.5~68.0%, 3.5%p]")
-    print(f"밸브별 C_k (자기 상류압 기준, 충전 밸브에 +{STIFF_MARGIN_PCT}%p 여유폭):")
-    for (sgn, v), Pin in PIN_ROLE.items():
-        ck = solve_shape(Pin)[1]
-        mark = ""
-        if (sgn, v) in STIFF_ROLES:
-            ck += STIFF_MARGIN_PCT / 100.0 * IMAX; mark = f"  (+{STIFF_MARGIN_PCT}%p)"
-        print(f"   {sgn}/{v:5s} Pin={Pin:6.1f} kPa → C_k = {ck:.8f}{mark}")
+    print(f"I_MAX = {IMAX} A (실측)   k_shape = {K_SHAPE}   alpha_shape = 1.0")
+    print(f"밸브별 (자기 상류압 기준, 충전·배기에 +{STIFF_MARGIN_PCT}%p 여유폭):")
+    for role in FIT:
+        Pin = PIN_ROLE[role]
+        ck = role_ck(0 if role[0] == 'pos' else 6, role[1])
+        half = (ck - C_P * Pin) / IMAX * 100
+        lo = (ck - C_P * Pin + math.log(0.1 / 0.9) / K_SHAPE) / IMAX * 100
+        hi = (ck - C_P * Pin + math.log(0.9 / 0.1) / K_SHAPE) / IMAX * 100
+        print(f"   {role[0]}/{role[1]:5s} Pin={Pin:6.1f}  A_max={role_amax(0 if role[0]=='pos' else 6, role[1]):.6f}  "
+              f"C_k={ck:.8f}  반개 {half:5.1f}%  대역 {lo:.1f}~{hi:.1f}%")
+    print()
 
     src = open(YAML, encoding='utf-8').read()
     out = []
@@ -170,13 +161,14 @@ def main():
         if m:
             valve = m.group(1)
         if ch is not None and valve is not None:
-            m = re.match(r'^(          )(A_max|k_shape|C_k|alpha_shape):\s*(\S+)\s*$', line)
+            m = re.match(r'^(          )(A_max|k_shape|C_k|alpha_shape|I_MAX):\s*(\S+)\s*$', line)
             if m:
                 ind, key, cur = m.group(1), m.group(2), float(m.group(3))
-                if key == 'k_shape':      val = k
+                if key == 'k_shape':      val = K_SHAPE
                 elif key == 'C_k':        val = role_ck(ch, valve)
                 elif key == 'alpha_shape': val = 1.0
-                else:                     val = new_amax(ch, valve, cur)
+                elif key == 'I_MAX':      val = IMAX
+                else:                     val = role_amax(ch, valve)
                 if abs(val - cur) > 1e-12:
                     changed += 1
                     if a.check and ch in (0, 6) and key in ('A_max', 'alpha_shape'):
