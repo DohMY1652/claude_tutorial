@@ -560,11 +560,33 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   // 평균이 목표 위에 앉는다 (시뮬: trim 8.9 → 0.0, 지령 54.3% → 44.9%, 오차가
   // +1.0 kPa 에 고착). 지금은 보통의 적분기처럼 오차 부호를 따라 자연히 줄어든다.
   // 폭주는 ki_u_limit_pct(기여분 상한)와 아래 anti-windup 이 막는다.
+  // 데드존 인식 적분 — 압력이 안 움직이면 빨리, 움직이기 시작하면 멈춘다.
+  //
+  // 이 밸브는 크래킹 아래에서 유량이 정확히 0 이라, 크래킹 위치를 조금만 낮게
+  // 잡아도 피드포워드가 데드존에 앉는다. 그때 적분기가 통상 속도로 기어오르면
+  // 수 초가 걸린다 (실기 20260829_152528: ch1 이 지령 43~45% 에서 1.4 초 정체 후
+  // 1.7 초에 걸쳐 62.9% 까지 올라가고서야 열렸다 — 총 3.2 초 지연).
+  // 반대로 크래킹을 높게 잡으면 피드포워드가 이미 충분한데 적분기가 계속 쌓여
+  // 오버슛한다 (같은 실기 ch1: 열리는 순간 0.18 초에 +23 kPa, 2 Hz 진동).
+  //
+  // 크래킹 위치를 정확히 아는 것으로 이 둘을 동시에 잡기는 어렵다 — 진동하는
+  // 채널은 지령을 0.3 초도 유지하지 않아 폐루프 로그로 측정 자체가 안 된다.
+  // 대신 **압력이 실제로 반응하는지**를 보고 적분 속도를 바꾼다:
+  //   · 원하는 방향으로 충분히 움직이는 중  → 적분 멈춤 (피드포워드가 일하고 있다)
+  //   · 안 움직임(데드존)                   → 부스트 배속으로 빠르게 통과
+  // 크래킹을 몰라도 두 경우가 모두 처리된다.
+  // 기본은 **꺼짐**이다 (integ_hold_rate_kpas <= 0). 시뮬에서는 모델과 플랜트가
+  // 가까워 데드존이 짧고, 그 조건에서는 정지·부스트가 오히려 정착을 늦춘다
+  // (플랜트 +3%p 뻑뻑: 정착 0.69 → 1.91 s, 부스트 6 배면 5.73 s).
+  // 실기의 긴 데드존(3.2 초)에서만 이득이 있을 수 있으므로 실기 검증 후 켤 것.
+  const bool hold_on = (cfg_.integ_hold_rate_kpas > 0.0f);
+  const bool responding = hold_on && (want_sign_ * dpdt_f_ > cfg_.integ_hold_rate_kpas);
+  const float ki_scale = responding ? 0.0f : cfg_.integ_deadzone_boost;
   if (cfg_.is_positive) {
-    pos_error_integral_ += err * dt_sec;
+    pos_error_integral_ += ki_scale * err * dt_sec;
     pos_error_integral_ = std::clamp(pos_error_integral_, -integral_limit, integral_limit);
   } else {
-    neg_error_integral_ -= err * dt_sec;
+    neg_error_integral_ -= ki_scale * err * dt_sec;
     neg_error_integral_ = std::clamp(neg_error_integral_, -integral_limit, integral_limit);
   }
   
@@ -1250,6 +1272,8 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.q_trim_limit          = get_param_or<double>(this, "MPC_parameters.q_trim_limit", 2.0);
   mpc_.crack_floor_rate_kpas = get_param_or<double>(this, "MPC_parameters.crack_floor_rate_kpas", 5.0);
   mpc_.crack_floor_min_err_kpa = get_param_or<double>(this, "MPC_parameters.crack_floor_min_err_kpa", 1.5);
+  mpc_.integ_hold_rate_kpas    = get_param_or<double>(this, "MPC_parameters.integ_hold_rate_kpas", 0.0);
+  mpc_.integ_deadzone_boost    = get_param_or<double>(this, "MPC_parameters.integ_deadzone_boost", 1.0);
 
   // ── 솔버 선택 ────────────────────────────────────────────────────────────
   mpc_.solver = get_param_or<std::string>(this, "MPC_parameters.solver", std::string("qp"));
@@ -2043,6 +2067,8 @@ void Controller::build_mpcs() {
       cfg.q_trim_limit          = (float)mpc_.q_trim_limit;
       cfg.crack_floor_rate_kpas = (float)mpc_.crack_floor_rate_kpas;
       cfg.crack_floor_min_err_kpa = (float)mpc_.crack_floor_min_err_kpa;
+      cfg.integ_hold_rate_kpas    = (float)mpc_.integ_hold_rate_kpas;
+      cfg.integ_deadzone_boost    = (float)mpc_.integ_deadzone_boost;
 
       // mppi_system 에서는 채널 솔버를 만들지 않는다 — Δu 를 중앙집중이 낸다.
       // prepare/finish(피드포워드·적분·크래킹·상태추정)는 그대로 쓰인다.

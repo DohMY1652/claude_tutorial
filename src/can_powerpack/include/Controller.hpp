@@ -251,6 +251,8 @@ public:
     float q_trim_limit = 2.0f;     // 유량 배율 보정 상한 (2.0 = 최대 3배/1/3배)
     float crack_floor_rate_kpas = 5.0f;  // |dP/dt| 가 이보다 작을 때만 크래킹 하한을 건다
     float crack_floor_min_err_kpa = 1.5f; // 오차가 이보다 클 때만 크래킹 하한을 건다
+    float integ_hold_rate_kpas = 0.0f;    // >0 이면: 압력이 그보다 빠르면 적분 멈춤 (0=끔)
+    float integ_deadzone_boost = 1.0f;    // 데드존(무반응)에서 적분 배속 (1=평소대로)
     ControlAug aug{};                 // Controller 가 매 틱 최신값을 밀어 넣는다
     // 밸브별 13-parameter (0=micro, 1=macro, 2=atm). build_mpcs 가 채운다.
     // **이것이 모델의 단일 출처다.** 아래 평면 필드는 하위 호환용으로 micro 값을 담는다.
@@ -750,6 +752,8 @@ private:
     double q_trim_limit{2.0};
     double crack_floor_rate_kpas{5.0};
     double crack_floor_min_err_kpa{1.5};
+    double integ_hold_rate_kpas{0.0};
+    double integ_deadzone_boost{1.0};
     // 솔버 선택 + MPPI 하이퍼파라미터
     std::string solver{"qp"};
     int    mppi_samples{128};
