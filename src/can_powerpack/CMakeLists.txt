@@ -169,6 +169,7 @@ install(PROGRAMS
   scripts/pp_logger.py
   scripts/pp_results.py
   scripts/valve_fit_from_log.py
+  scripts/chamber_volume_from_log.py
   scripts/position_ref_client.py
   scripts/valve_fit_model.py
   scripts/valve_fit_record.py

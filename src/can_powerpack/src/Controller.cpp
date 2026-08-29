@@ -1298,6 +1298,27 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
       vol_ml_[i] = (i < num_positive_channels_) ? tank_volume_pos_ml_ : tank_volume_neg_ml_;
     else
       vol_ml_[i] = default_volume_ml_;
+
+    // 채널별 부피 오버라이드 — channel_config.chN.volume_ml
+    //
+    // 챔버 부피는 요구 유량에 그대로 곱해진다 (m_dot = P_dot·V/(R·T)). 전 채널을
+    // 같은 값으로 두면 실제 부피가 큰 채널은 필요한 유량의 일부만 요구해 느리고,
+    // 작은 채널은 과요구해 진동한다.
+    //   실기 20260829_142216 (6축, 공급 정상): 같은 전류·차압에서 dP/dt 를 비교하면
+    //   유효 부피가 채널 간 수 배 차이났다. ch1·ch2 가 크고(정착 8~22 초, 밸브
+    //   통전 8~12%), ch3·ch4 가 작았다(ch4 는 p-p 33~45 kPa 로 진동).
+    //   크기의 절대값은 그 로그로 확정하지 못했지만(창을 좁히면 추정이 흩어진다)
+    //   순서는 일관됐다. 채널을 하나씩 돌려 재면 확정된다.
+    const double v_ov = get_param_or<double>(
+        this, "channel_config.ch" + std::to_string(i) + ".volume_ml", 0.0);
+    if (v_ov > 0.0) vol_ml_[i] = v_ov;
+  }
+  {
+    std::string vs;
+    for (int i = 0; i < num_total_channels_; ++i) {
+      char b[32]; snprintf(b, sizeof(b), " ch%d=%.0f", i, vol_ml_[(size_t)i]); vs += b;
+    }
+    RCLCPP_INFO(get_logger(), "[채널 부피 mL]%s", vs.c_str());
   }
   prev_vol_m3_.resize(num_total_channels_);
   for (int i = 0; i < num_total_channels_; ++i)
@@ -3252,7 +3273,9 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
           tank_abs, get_param_or<double>(this, "PressureRefGen.tank_stop_kpa", 450.0) + 101.325);
       }
       // 레일이 챔버 목표보다 낮으면 micro 로는 채울 방법이 없다.
-      if (ref_pos_max > 0.0 && rail_abs < ref_pos_max + 3.0) {
+      // 대기압 근처 목표(=사실상 수요 없음)에서는 알리지 않는다. 기동 직후
+      // 챔버·레일이 모두 101 kPa 일 때 "여유 +1 kPa" 라고 뜨는 오탐이 있었다.
+      if (ref_pos_max > 101.325 + 5.0 && rail_abs < ref_pos_max + 3.0) {
         RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
           "[공급 부족] 양압레일 %.0f kPa 로는 챔버 목표 최대 %.0f kPa 를 채울 수 없다 "
           "(여유 %+.0f kPa). 수요가 macro 로 몰린다. 레일 셋포인트는 %.0f kPa 다. "
@@ -3262,7 +3285,7 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
       // 여유가 **양수면 정상**이다. 문턱을 3 kPa 로 두어 진짜 부족할 때만 알린다.
       // (10 kPa 로 두었더니 여유 8.9 kPa 인 정상 상태에도 "깊지 않다" 고 떠서
       //  오탐이었다.)
-      if (ref_neg_min < 1e8 && rail_neg_abs > ref_neg_min - 3.0) {
+      if (ref_neg_min < 101.325 - 5.0 && rail_neg_abs > ref_neg_min - 3.0) {
         RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
           "[공급 부족] 음압레일 %.1f kPa 로는 챔버 목표 최저 %.1f kPa 에 못 미친다 "
           "(여유 %+.1f kPa). 레일 셋포인트는 %.1f kPa 다.",
