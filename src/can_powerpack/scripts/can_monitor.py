@@ -119,7 +119,7 @@ ENCODER_CALIB  = {i: (ENCODER_OFFSET, ENCODER_GAIN) for i in range(17, 23)}
 ENCODER_RAW_POINTS = {
     17: (907, 2200),   # raw 2114 @ 0도, raw 3392 @ 90도 — 20260829 재장착 후 재측정
     18: (904, 2205),   # raw 1120 @ 0도, raw 2350 @ 90도 — 20260829 재측정
-    19: (947, 2240),   # raw 160 @ 0도, raw 1444 @ 90도
+    19: (907, 2200),   # raw 160 @ 0도, raw 1444 @ 90도
 }
 
 

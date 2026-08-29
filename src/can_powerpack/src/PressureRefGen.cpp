@@ -210,8 +210,15 @@ void PressureRefGen::build_slew_box(const std::vector<AxisState>& axes, const Su
     // 이 하한이 걸리면 최적화는 같은 힘을 내기 위해 **양압을 더 쓸 수밖에 없다** —
     // 음압만 혹사하고 양압이 노는 문제도 함께 풀린다.
     // 여유폭을 0 이하로 두면 이 하한이 꺼진다.
+    // **대기압을 넘으면 안 된다.** 음압 챔버 목표가 대기압보다 높으면 힘을
+    // 빼는 쪽으로 작용한다 (F = P⁺·A − P⁻·A). 그런데 예전 식은 음압레일이
+    // 배기되지 않은 상태(Pnp ≈ 0)에서 loN = 0 + 15 kPa = **+15 kPa gauge**
+    // (= 116.3 kPa abs) 를 내놓았고, hiN = min(0, …) 이 그보다 낮아
+    // `if (hiN < loN) hiN = loN` 에 걸려 박스가 [+15, +15] 로 붙박였다.
+    // 실기 20260829_215726: 90° 를 줬는데 P⁻ 레퍼런스가 전 구간 116.3 kPa 고정.
+    // min(0, ...) 을 씌우면 레일이 진짜 음압일 때만 이 하한이 살아난다.
     if (p_.chamber_neg_headroom > 0.0)
-      loN = std::max(loN, Pnp + p_.chamber_neg_headroom);
+      loN = std::max(loN, std::min(0.0, Pnp + p_.chamber_neg_headroom));
 
     double hiN = std::min(0.0,             Pn0 + dN_up);
     if (hiN < loN) hiN = loN;

@@ -2185,19 +2185,27 @@ void Controller::on_sensor(const std_msgs::msg::UInt16MultiArray::SharedPtr m) {
 // 완만해진다 — 액추에이터를 보수적으로 움직일 때 여기부터 조인다.
 // target_slew_deg_per_s <= 0 이면 계단 그대로다.
 void Controller::slew_targets(double dt_sec) {
-  // ── TCP 수신 전: 슬루 상태를 **현재 각도에 붙여 둔다** ──────────────────
+  // ── 기동 시: 슬루 상태를 **현재 각도에서 한 번만** 출발시킨다 ────────────
   //
-  // 위치 루프는 명령이 오기 전까지 angle_ref = 측정각으로 돌지만(오차 0 유지),
-  // target_angle_slewed_ 는 0 에 그대로 있었다. 그래서 **첫 명령이 오는 순간**
-  // angle_ref 가 측정각에서 0 으로 계단 점프하고 거기서부터 램프가 시작됐다.
+  // 목표 자체는 처음부터 default_angle_deg (= 0) 다. 시작하면 모든 축이 0° 로
+  // 내려온다. 다만 **출발점**은 지금 팔이 있는 각도여야 한다 — 슬루 상태를 0 에서
+  // 시작하면 첫 틱에 angle_ref 가 측정각에서 0 으로 계단 점프한다.
   // 실기 20260829_165306: t=10.79 에 각도 19.9° 인데 목표가 0.45° 로 떨어졌다
   // (−19.4° 계단) — 액추에이터에 그대로 충격으로 간다.
   //
-  // 명령 전에는 슬루 상태를 측정각에 얹어 둔다. 첫 명령 순간 angle_ref 가
-  // 이어지고, 거기서부터 target_slew_deg_per_s 로 램프한다.
-  if (!pos_tcp_received_) {
+  // 한 번 씨앗을 심고 나면 평범하게 target_slew_deg_per_s 로 0 까지 램프한다.
+  // (예전에는 TCP 명령이 올 때까지 계속 측정각에 붙여 뒀다. 그러면 목표가 팔을
+  //  따라다니기만 하고 0 으로 안 갔다.)
+  if (!slew_seeded_) {
     std::array<double, 9> ang;
     { std::lock_guard<std::mutex> lk(sensors_mtx_); ang = encoder_angles_; }
+    // 엔코더가 아직 안 들어왔으면(전부 0) 다음 틱에 다시 시도한다 — 0 에서
+    // 출발했다가 진짜 각도가 들어오는 순간 계단이 되는 것을 막는다.
+    bool have = false;
+    for (size_t i = 0; i < pos_ctrl_cfg_.size() && !have; ++i) {
+      const int enc = std::clamp(pos_ctrl_cfg_[i].actuator_idx, 0, (int)ang.size() - 1);
+      if (std::abs(ang[(size_t)enc]) > 1e-9) have = true;
+    }
     if (target_angle_slewed_.size() != target_angle_deg_.size())
       target_angle_slewed_.assign(target_angle_deg_.size(), 0.0);
     for (size_t i = 0; i < target_angle_slewed_.size(); ++i) {
@@ -2206,6 +2214,16 @@ void Controller::slew_targets(double dt_sec) {
       target_angle_slewed_[i] = ang[(size_t)enc];
     }
     target_slew_rate_.assign(target_angle_slewed_.size(), 0.0);
+    if (have || slew_seed_ticks_++ > 500) {   // 500 틱(=1 s @500 Hz) 지나면 0 으로 확정
+      slew_seeded_ = true;
+      std::string vs;
+      for (size_t i = 0; i < target_angle_slewed_.size(); ++i) {
+        char b[32]; snprintf(b, sizeof(b), " ax%zu=%.1f°", i, target_angle_slewed_[i]); vs += b;
+      }
+      RCLCPP_INFO(get_logger(),
+        "기동 목표: 전 축 %.1f° 로 내려간다 (%.0f deg/s). 현재 각도에서 출발:%s",
+        target_angle_deg_.empty() ? 0.0 : target_angle_deg_[0], target_slew_dps_, vs.c_str());
+    }
     return;
   }
 
@@ -3123,7 +3141,9 @@ void Controller::run_position_control(double dt_sec)
     double angle_ref;
     {
       std::lock_guard<std::mutex> lk(mpc_ref_mtx_);
-      angle_ref = pos_tcp_received_ ? target_angle_slewed_[(size_t)a] : angle;
+      // 항상 슬루된 목표를 쓴다. 예전에는 TCP 수신 전에 측정각을 그대로 넣어
+      // 오차를 0 으로 두었는데, 그러면 기동 목표(0°)가 적용되지 않았다.
+      angle_ref = target_angle_slewed_[(size_t)a];
     }
 
     // 최초 진입: 속도 추정기 초기화만 하고 제어 출력은 건너뜀
@@ -3311,7 +3331,9 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     double angle_ref;
     {
       std::lock_guard<std::mutex> lk(mpc_ref_mtx_);
-      angle_ref = pos_tcp_received_ ? target_angle_slewed_[(size_t)a] : angle;
+      // 항상 슬루된 목표를 쓴다. 예전에는 TCP 수신 전에 측정각을 그대로 넣어
+      // 오차를 0 으로 두었는데, 그러면 기동 목표(0°)가 적용되지 않았다.
+      angle_ref = target_angle_slewed_[(size_t)a];
     }
 
     if (!state.initialized) {
