@@ -559,10 +559,42 @@ void CanBridge::tx_send() {
   //
   // 이 스트림은 **주기적 setpoint** 다. 늦게 도착한 setpoint 는 쓸모가 없는
   // 정도가 아니라 위험하다. 매번 큐를 비우고 최신 것만 실어 보낸다.
-  {
-    unsigned int dummy = 0;
-    canIoCtl(hnd_, canIOCTL_FLUSH_TX_BUFFER, &dummy, sizeof(dummy));
+  // **대책 — 버스를 건드리지 않고 backlog 자체를 못 만들게 한다.**
+  //
+  // 처음에는 매 주기 canIOCTL_FLUSH_TX_BUFFER 로 큐를 비웠다. **그게 버스를
+  // 죽였다.** 500 Hz 로 전송 중인 64 바이트 FD 프레임을 중간에 잘라내면 에러
+  // 프레임이 쏟아진다. 계측(브리지 단독, 같은 배선):
+  //     FLUSH 있음 → RX 31 Hz → 다음 창에서 완전 사망
+  //     FLUSH 없음 → RX 265~372 Hz, 안정
+  // canWrite 는 계속 canOK 를 반환했다 — 드라이버는 받아들이는데 버스가 죽는다.
+  //
+  // 그래서 큐를 비우는 대신 **버스가 안 살아 있으면 아예 넣지 않는다.**
+  // backlog 는 버스가 죽은 동안 계속 밀어 넣어서 생긴다. 수신이 끊긴 상태
+  // (rx_stale_) 에서 송신을 멈추면 밀리는 양이 워치독 시한(기본 200 ms)으로
+  // 묶인다 — 사고 때의 8.5 초가 아니라.
+  //
+  // 큐 잔량도 같이 본다 (읽기 전용이라 버스에 영향이 없다). 쌓이기 시작하면
+  // 그것만으로 이미 지령이 늦고 있다는 뜻이라 소리를 낸다.
+  if (rx_stale_.load(std::memory_order_relaxed)) {
+    if (!tx_paused_.exchange(true, std::memory_order_relaxed))
+      RCLCPP_ERROR(get_logger(),
+        "CAN 수신이 끊겼다 — **밸브 지령 송신을 멈춘다.** 버스가 죽은 채로 계속 "
+        "밀어 넣으면 드라이버 큐에 쌓였다가 버스가 살아나는 순간 묵은 지령이 "
+        "한꺼번에 쏟아진다 (20260829 액추에이터 파손 경로). 수신이 복구되면 "
+        "자동으로 재개한다.");
+    return;
   }
+  if (tx_paused_.exchange(false, std::memory_order_relaxed))
+    RCLCPP_INFO(get_logger(), "CAN 수신 복구 — 밸브 지령 송신 재개.");
+
+  {
+    unsigned int lvl = 0;
+    if (canIoCtl(hnd_, canIOCTL_GET_TX_BUFFER_LEVEL, &lvl, sizeof(lvl)) == canOK && lvl > 8)
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 500,
+        "CAN 송신 큐가 %u 프레임 밀렸다 — 지령이 그만큼 늦게 도착한다. "
+        "버스 부하·비트레이트를 확인할 것.", lvl);
+  }
+
   tx_check(canWrite(hnd_, CMD_ID_GRP1, payload_g1, 64,
                     canMSG_STD | canFDMSG_FDF | canFDMSG_BRS), 1);
 

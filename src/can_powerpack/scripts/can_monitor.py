@@ -117,10 +117,11 @@ ENCODER_CALIB  = {i: (ENCODER_OFFSET, ENCODER_GAIN) for i in range(17, 23)}
 # 보드별 raw ADC 실측값 (0도 / 90도) — 여기 raw 값만 입력하면
 # calib_from_raw_2pt()가 offset/gain을 자동 계산해서 ENCODER_CALIB에 반영함
 ENCODER_RAW_POINTS = {
-    17: (2114, 3392),   # raw 2114 @ 0도, raw 3392 @ 90도 — 20260829 재장착 후 재측정
-    18: (1120, 2350),   # raw 1120 @ 0도, raw 2350 @ 90도 — 20260829 재측정
-    19: (160, 1444),   # raw 160 @ 0도, raw 1444 @ 90도
+    17: (907, 2200),   # raw 2114 @ 0도, raw 3392 @ 90도 — 20260829 재장착 후 재측정
+    18: (904, 2205),   # raw 1120 @ 0도, raw 2350 @ 90도 — 20260829 재측정
+    19: (947, 2240),   # raw 160 @ 0도, raw 1444 @ 90도
 }
+
 
 # ── yaml 이 있으면 위 하드코딩 값을 덮어쓴다 (단일 출처) ──
 _CALIB_SOURCE = None

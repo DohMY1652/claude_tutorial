@@ -57,9 +57,9 @@
     # (angle = (orig_mV - offset) * gain,  orig_mV = (4125 - raw*3300/4095) / 0.825)
     EncoderCalibration:
       boards:
-        "17": { raw_0deg: 2114.0, raw_90deg: 3392.0 }   # 20260829 재장착 후 재측정 (이전 1200/2470)
-        "18": { raw_0deg: 1120.0,  raw_90deg: 2350.0 }
-        "19": { raw_0deg: 160.0, raw_90deg: 1444.0 }
+        "17": { raw_0deg: 907.0, raw_90deg: 2200.0 }   # 20260829 재장착 후 재측정 (이전 1200/2470)
+        "18": { raw_0deg: 902.0,  raw_90deg: 2205.0 }
+        "19": { raw_0deg: 947.0, raw_90deg: 2240.0 }
 
 # ==========================================
 # Node 2: PP Controller (Control Algorithm)
