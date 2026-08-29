@@ -1550,6 +1550,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   kd_vel_ff_ = get_param_or<double>(this,
       "PositionController.kd_vel_ff", 1.0);
   target_slew_rate_.assign(std::max(1, num_actuators_), 0.0);
+  band_sat_ticks_.assign(std::max(1, num_actuators_), 0);
 
   for (int a = 0; a < num_actuators_; ++a) {
     const std::string prefix = "PositionController.axis" + std::to_string(a) + ".";
@@ -3358,6 +3359,34 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     const double err = (target_follow_band_deg_ > 0.0)
         ? std::clamp(err_raw, -target_follow_band_deg_, target_follow_band_deg_)
         : err_raw;
+
+    // ── 오차가 밴드에 계속 붙어 있으면 알린다 ────────────────────────────
+    //
+    // 밴드에 붙으면 kp·err 이 상수가 되고, 적분도 integ_limit_nm 에서 멈추고,
+    // 마찰항도 포화한다 — **목표 각도가 더 이상 압력 레퍼런스에 실리지 않는다.**
+    // 45° 든 90° 든 같은 토크를 요구하게 된다.
+    //
+    // 액추에이터를 떼고 시험할 때 특히 그렇다: 팔이 안 움직이니 오차가 절대
+    // 안 줄고, 0.75 s (= (integ_limit/ki)/band) 만에 전부 포화한다. 실기
+    // 20260829_220606 (actuator_connected:=true, 액추에이터 미연결):
+    //     45° → τ 1.90 N·m,  90° → τ 1.92 N·m   (구분이 사라졌다)
+    // 그때는 **actuator_connected:=false** 로 돌려야 한다 — PID 를 끄고 중력 FF 를
+    // 목표각으로 계산하므로 각도 명령이 그대로 압력에 실린다.
+    if (actuator_connected_ && target_follow_band_deg_ > 0.0 &&
+        std::abs(err_raw) > target_follow_band_deg_ * 1.5) {
+      if (++band_sat_ticks_[(size_t)a] > (int)(3.0 / std::max(1e-6, dt_sec))) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "[axis%d] 추종 오차가 3 초 넘게 밴드(%.1f°)에 붙어 있다 — 실제 %.1f°. "
+          "이 상태에서는 kp·오차·적분·마찰이 모두 포화해 **목표 각도가 압력 "
+          "레퍼런스에 반영되지 않는다** (45° 와 90° 가 같은 토크가 된다). "
+          "액추에이터가 안 붙어 있다면 actuator_connected:=false 로 돌릴 것 — "
+          "그러면 중력 FF 를 목표각으로 계산해 각도가 그대로 압력에 실린다.",
+          a, target_follow_band_deg_, err_raw);
+        band_sat_ticks_[(size_t)a] = 0;
+      }
+    } else {
+      band_sat_ticks_[(size_t)a] = 0;
+    }
 
     // 적분 (부호 반전 시 리셋 + 클램프)
     double& I = tau_integ_[(size_t)a];

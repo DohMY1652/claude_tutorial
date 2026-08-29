@@ -882,6 +882,8 @@ private:
   std::vector<double> target_slew_rate_;
   // D 항이 목표 속도를 얼마나 빼고 볼지 (0=예전 −kd·vel, 1=완전 피드포워드).
   double kd_vel_ff_{1.0};
+  // 추종 오차가 밴드에 붙어 있는 연속 틱 수 (축별). 오래 붙으면 경고한다.
+  std::vector<int> band_sat_ticks_;
   // 슬루 상태를 현재 각도에서 한 번 출발시켰나 (기동 계단 방지).
   bool slew_seeded_{false};
   int  slew_seed_ticks_{0};
