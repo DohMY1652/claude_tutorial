@@ -2619,6 +2619,44 @@ void Controller::on_timer() {
   }
 
   // ----------------------------------------------------------------
+  // 0-. **센서가 유효해지기 전에는 밸브를 절대 건드리지 않는다**
+  //
+  // raw 0 = 그 보드 프레임을 한 번도 못 받았다는 뜻이다. 예전에는 그걸 그대로
+  // 환산해 (0 − 1112) × 0.25 + 101.325 = **−176.7 kPa** 를 진짜 압력으로 믿었다.
+  // 컨트롤러는 "챔버가 대기압보다 278 kPa 낮다" 로 보고 micro·macro 를 활짝 열고,
+  // 그 지령이 CAN 송신 큐에 쌓였다. CAN 이 8.5 초 뒤 살아나자 backlog 가 순서대로
+  // 쏟아져 탱크 580 kPa 가 챔버로 들어갔고(228 kPa) 팔이 스토퍼를 넘었다 —
+  // 20260829_201659, 액추에이터 파손.
+  //
+  // 0 kPa 로 붙잡아 두는 것도 안 된다 (그것도 진공이라 똑같이 채우려 든다).
+  // 필요한 보드(라인 4 개 + 활성 채널) 가 **하나라도** 아직 안 왔으면 제어를
+  // 시작하지 않는다. 여기서 return 하면 PWM 이 안 나가고, 브리지의 PWM 워치독이
+  // 200 ms 뒤 안전 상태(채널 폐쇄 + 라인 전개)로 간다.
+  // ----------------------------------------------------------------
+  {
+    std::string bad;
+    for (int bid = 1; bid <= 16; ++bid) {
+      const int idx = bid - 1;
+      if (snap_sensors[idx] > 0) sensor_seen_[(size_t)idx] = true;
+      if (sensor_seen_[(size_t)idx]) continue;
+      const int gid = bid - channel_board_offset_;
+      const bool is_line = (bid == P_pos_board_id_ || bid == P_neg_board_id_ ||
+                            bid == P_macro_board_id_ || bid == P_macro_neg_board_id_);
+      const bool needed = is_line ||
+          (gid >= 0 && gid < num_total_channels_ && active_channels_.count(gid) > 0);
+      if (needed) bad += (bad.empty() ? "" : ", ") + std::to_string(bid);
+    }
+    if (!bad.empty()) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
+        "센서 대기: board %s 의 프레임이 **한 번도** 안 왔다 (raw=0). 제어를 "
+        "시작하지 않는다 — 이 상태로 돌면 압력을 −176.7 kPa 로 읽고 밸브를 활짝 "
+        "연다 (20260829 액추에이터 파손 경로). CAN 배선·보드 전원을 확인할 것.",
+        bad.c_str());
+      return;
+    }
+  }
+
+  // ----------------------------------------------------------------
   // 0. Sensor zero-calibration: boards 1~16 초기화 (0.5초간 평균)
   // ----------------------------------------------------------------
   if (!sensor_zeroed_) {
@@ -2683,6 +2721,17 @@ void Controller::on_timer() {
     if (!is_line_board && (gid < 0 || gid >= num_total_channels_ || active_channels_.count(gid) == 0)) {
       filt_out_[idx] = sensor_.kpa_atm();
       raw_out_[idx]  = sensor_.kpa_atm();
+      continue;
+    }
+    // raw 0 = 그 보드 프레임을 **못 받았다** (CAN 두절·보드 전원). 이걸 그대로
+    // 환산하면 (0 − 1112) × 0.25 + 101.325 = **−176.7 kPa** 라는 물리적으로
+    // 불가능한 값이 나오고, 컨트롤러는 "대기압보다 278 kPa 낮다" 로 믿어 밸브를
+    // 활짝 연다. 20260829_201659 의 액추에이터 파손이 정확히 그 경로였다.
+    // 직전 값을 유지하고 소리를 낸다 (브리지의 RX 워치독가 별도로 안전 상태로 간다).
+    if (snap_sensors[idx] == 0) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
+        "board %d raw=0 — 프레임이 없다. 압력을 직전 값(%.1f kPa)으로 유지한다. "
+        "그대로 환산하면 −176.7 kPa 가 되어 밸브가 활짝 열린다.", bid, filt_out_[idx]);
       continue;
     }
     double raw_kpa = sensor_.kpa(bid, snap_sensors[idx]);

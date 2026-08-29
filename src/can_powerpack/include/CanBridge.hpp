@@ -88,6 +88,9 @@ private:
   int tx_min_interval_ms_{0};                 // 0 = 명령마다 송신
   std::chrono::steady_clock::time_point last_tx_{};
   void tx_send();                             // 실제 CAN 기록 (cmd_mtx_ 를 잡는다)
+  void tx_check(canStatus st, int grp);       // canWrite 반환값 확인 (조용한 실패 금지)
+  int  tx_err_streak_{0};
+  long long node_start_ns_{0};                // RX 워치독 기준 (한 번도 못 받은 경우)
 
   uint8_t current_mode_{0};
   uint8_t control_type_{0};

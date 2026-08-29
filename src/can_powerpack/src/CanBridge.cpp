@@ -109,6 +109,8 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
 
   targets_.resize(NUM_BOARDS + 1);
   // 워치독: 0 이면 끔. 실기에서는 반드시 켤 것.
+  node_start_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
   wd_timeout_ms_  = this->declare_parameter<int>("pwm_watchdog_ms", 200);
   rx_timeout_ms_  = this->declare_parameter<int>("can_rx_watchdog_ms", 200);
   wd_vent_index_  = this->declare_parameter<int>("pwm_watchdog_vent_index",  0);   // board1 v1
@@ -461,15 +463,24 @@ void CanBridge::tx_routine() {
   if (rx_timeout_ms_ > 0) {
     const long long now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-    const long long last = last_rx_ns_.load(std::memory_order_relaxed);
-    if (last != 0) {
+    // last_rx_ns_ 가 0 이면 **아직 한 프레임도 못 받았다**. 예전에는 그 경우를
+    // 통째로 건너뛰어(if (last != 0)) 워치독이 꺼져 있었다 — CAN 이 늦게 올라오는
+    // 시작 구간이 무방비였다. 20260829_201659 에서 8.5 초 동안 그 상태로 컨트롤러가
+    // 밸브를 열었고, 그 지령이 나중에 한꺼번에 나가 액추에이터를 부쉈다.
+    // 기준을 노드 기동 시각으로 두면 "처음부터 안 온다" 도 똑같이 잡힌다.
+    const long long last_raw = last_rx_ns_.load(std::memory_order_relaxed);
+    const long long last = (last_raw != 0) ? last_raw : node_start_ns_;
+    {
       const double age_ms = (double)(now_ns - last) / 1e6;
       if (age_ms > (double)rx_timeout_ms_) {
         if (!rx_stale_.exchange(true, std::memory_order_relaxed))
           RCLCPP_ERROR(get_logger(),
-            "CAN 수신 워치독: %d ms 동안 보드 프레임이 없다 — 센서값이 얼어붙었다. "
+            "CAN 수신 워치독: %d ms 동안 보드 프레임이 %s — %s. "
             "채널 밸브 폐쇄 + 라인 밸브 전개. 배선·전원·버스를 확인할 것.",
-            rx_timeout_ms_);
+            rx_timeout_ms_,
+            (last_raw == 0) ? "**한 번도** 없었다" : "없다",
+            (last_raw == 0) ? "컨트롤러가 센서를 못 읽는 채로 돈다"
+                            : "센서값이 얼어붙었다");
         std::lock_guard<std::mutex> lk(cmd_mtx_);
         apply_safe_state();
       }
@@ -527,7 +538,33 @@ void CanBridge::tx_send() {
   payload_g1[60] = current_mode_;
   payload_g1[61] = control_type_;
   payload_g1[63] = heartbeat_cnt_;
-  canWrite(hnd_, CMD_ID_GRP1, payload_g1, 64, canMSG_STD | canFDMSG_FDF | canFDMSG_BRS);
+
+  // ── **묵은 지령을 절대 큐에 남기지 않는다** ───────────────────────────
+  //
+  // canWrite 는 비동기다 — 드라이버 송신 큐에 넣고 바로 돌아온다. 버스가 죽어
+  // 있으면(보드 미기동·전원·비트레이트 불일치) 프레임이 ACK 를 못 받고 큐에
+  // 쌓이기만 하다가, 버스가 살아나는 순간 **밀린 것이 순서대로 전부 나간다.**
+  // 보드는 그 옛날 지령을 차례로 실행한다.
+  //
+  // 20260829_201659 에서 실제로 액추에이터가 부서졌다. CAN 이 8.5 초 늦게
+  // 올라왔고, 그동안 컨트롤러는 센서를 −167 kPa 로 읽어 "세게 채워라" 를 계속
+  // 냈다. 버스가 살아나자 그 backlog 가 쏟아졌다:
+  //
+  //     t=8.5~10.7  지령 macro 62%  → 실측 전류 0.3 mA   (아무것도 안 나갔다)
+  //     t=10.7~11.5 지령 macro  0%  → 실측 전류 155 mA   (= 62%, 2 초 전 지령)
+  //
+  // 그 사이 과압 세이프티가 소프트웨어에서는 제대로 래치됐는데(배기 100%),
+  // 그 지령도 같은 큐 뒤에 서 있어서 0.8 초 늦게 도착했다. 탱크 580 kPa 가
+  // 챔버로 쏟아져 228 kPa 까지 올랐고 팔이 스토퍼를 넘어 129°/136°/276° 로 갔다.
+  //
+  // 이 스트림은 **주기적 setpoint** 다. 늦게 도착한 setpoint 는 쓸모가 없는
+  // 정도가 아니라 위험하다. 매번 큐를 비우고 최신 것만 실어 보낸다.
+  {
+    unsigned int dummy = 0;
+    canIoCtl(hnd_, canIOCTL_FLUSH_TX_BUFFER, &dummy, sizeof(dummy));
+  }
+  tx_check(canWrite(hnd_, CMD_ID_GRP1, payload_g1, 64,
+                    canMSG_STD | canFDMSG_FDF | canFDMSG_BRS), 1);
 
   // Group 2: boards 11..17 (7 boards × 6 bytes = 42 bytes PWM + meta → 48 bytes)
   // Layout matches can_control.py: mode@42, type@43, heartbeat@47
@@ -542,5 +579,17 @@ void CanBridge::tx_send() {
   payload_g2[42] = current_mode_;
   payload_g2[43] = control_type_;
   payload_g2[47] = heartbeat_cnt_;
-  canWrite(hnd_, CMD_ID_GRP2, payload_g2, 48, canMSG_STD | canFDMSG_FDF | canFDMSG_BRS);
+  tx_check(canWrite(hnd_, CMD_ID_GRP2, payload_g2, 48,
+                    canMSG_STD | canFDMSG_FDF | canFDMSG_BRS), 2);
+}
+
+// canWrite 의 반환값을 **반드시** 본다. 예전에는 버렸다 — 버스가 죽어 큐가
+// 넘치는 동안(canERR_TXBUFOFL) 아무 신호도 없었고, 조용히 backlog 를 쌓았다.
+void CanBridge::tx_check(canStatus st, int grp) {
+  if (st == canOK) { tx_err_streak_ = 0; return; }
+  ++tx_err_streak_;
+  RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 500,
+    "CAN 송신 실패 (그룹 %d, status %d, 연속 %d 회) — 밸브 지령이 보드에 "
+    "도달하지 않는다. 버스·전원·비트레이트를 확인할 것. 큐를 비우므로 묵은 "
+    "지령이 나중에 쏟아지지는 않는다.", grp, (int)st, tx_err_streak_);
 }

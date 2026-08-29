@@ -973,6 +973,8 @@ private:
   void declare_aug_params();
   void push_aug_to_mpcs();
   bool   sensor_zeroed_{true};   // true = use YAML offsets directly (no auto-calib at startup)
+  // 보드별 "프레임을 한 번이라도 받았나". 전부 받기 전에는 제어를 시작하지 않는다.
+  std::array<bool, 16> sensor_seen_{};
   int    sensor_zero_tick_{0};
   std::array<double, NUM_CAN_BOARDS> sensor_zero_sum_{};
   std::array<int,    NUM_CAN_BOARDS> sensor_zero_cnt_{};
