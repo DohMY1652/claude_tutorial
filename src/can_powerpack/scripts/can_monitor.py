@@ -22,6 +22,65 @@ ADC_REF_MV = 3300.0
 ADC_RES    = 4095.0
 TO_MV = ADC_REF_MV / ADC_RES
 
+# ================= 1.5 캘리브레이션: powerpack_config.yaml 을 단일 출처로 =================
+#
+# 예전에는 압력 보정과 엔코더 2 점을 **여기에 손으로 복사**해 뒀다. 같은 값이
+# powerpack_config.yaml 의 Sensor_calibration / EncoderCalibration 에도 있어서
+# 셋이 따로 놀았다. 20260829 에 이것 때문에 두 번 헤맸다 — 팝업 모니터는 0 도를
+# 158 도로 찍는데 이 스크립트는 0 도로 정확히 찍어서, 브리지 계산이 틀린 줄 알았다.
+#
+# 이제 yaml 을 읽어 덮어쓴다. yaml 을 못 찾거나 못 읽으면 아래 하드코딩 값으로
+# 그대로 돈다 (이 스크립트는 ROS 없이도 떠야 한다) — 대신 무엇을 쓰는지 밝힌다.
+def _load_calib_from_yaml():
+    """(pressure, encoder_2pt, 출처설명) 을 돌려준다. 실패하면 (None, None, 사유)."""
+    import glob
+    here = os.path.dirname(os.path.abspath(__file__))
+    # **설치본을 먼저 본다.** ROS 노드들이 실제로 읽는 것이 그것이라, 소스만 고치고
+    # 빌드를 안 한 상태에서도 이 화면이 "지금 돌고 있는 값" 을 보여 줘야 한다.
+    # (오늘 colcon build 가 Finished 를 찍고도 설치본이 한 세대 뒤처진 일이 두 번 있었다.)
+    cands = [
+        # lib/can_powerpack/can_monitor.py  →  share/can_powerpack/config/...
+        os.path.join(here, '..', '..', 'share', 'can_powerpack', 'config', 'powerpack_config.yaml'),
+        # 소스트리에서 바로 실행한 경우: scripts/  →  config/
+        os.path.join(here, '..', 'config', 'powerpack_config.yaml'),
+    ] + sorted(glob.glob(os.path.join(here, '..', '..', '..', '..',
+                                      'src', '*', 'config', 'powerpack_config.yaml')))
+    for path in cands:
+        path = os.path.normpath(path)
+        if not os.path.exists(path):
+            continue
+        try:
+            import yaml
+            with open(path) as f:
+                doc = yaml.safe_load(f)
+        except Exception as e:
+            return None, None, f'{path} 를 못 읽었다 ({e})'
+        # /pack2/pp_controller 와 /pack2/can_bridge 아래 아무 데나 있을 수 있다
+        sens = enc = None
+        def walk(node):
+            nonlocal sens, enc
+            if not isinstance(node, dict):
+                return
+            for k, v in node.items():
+                if k == 'Sensor_calibration' and isinstance(v, dict):
+                    sens = v.get('boards') or sens
+                elif k == 'EncoderCalibration' and isinstance(v, dict):
+                    enc = v.get('boards') or enc
+                else:
+                    walk(v)
+        walk(doc)
+        if not sens and not enc:
+            continue
+        pres = {int(b): (float(d['offset']), float(d['gain']))
+                for b, d in (sens or {}).items()
+                if isinstance(d, dict) and 'offset' in d and 'gain' in d and int(b) <= 16}
+        pts  = {int(b): (float(d['raw_0deg']), float(d['raw_90deg']))
+                for b, d in (enc or {}).items()
+                if isinstance(d, dict) and 'raw_0deg' in d and 'raw_90deg' in d}
+        return pres, pts, path
+    return None, None, 'powerpack_config.yaml 을 못 찾았다'
+
+
 # [압력 센서 캘리브레이션 설정]
 # 공식: Pressure = (Original_mV - Offset) * Gain + 101.325
 # 딕셔너리 형식: { Board_ID : (Offset_mV, Gain) }
@@ -62,6 +121,16 @@ ENCODER_RAW_POINTS = {
     18: (860, 2000),    # raw  860 @ 0도, raw 2000 @ 90도
     19: (2115, 3155),   # raw 2115 @ 0도, raw 3155 @ 90도
 }
+
+# ── yaml 이 있으면 위 하드코딩 값을 덮어쓴다 (단일 출처) ──
+_CALIB_SOURCE = None
+_p, _e, _src = _load_calib_from_yaml()
+if _p or _e:
+    if _p: PRESSURE_CALIB.update(_p)
+    if _e: ENCODER_RAW_POINTS.update(_e)
+    _CALIB_SOURCE = _src
+else:
+    _CALIB_SOURCE = f'하드코딩 값 (yaml 미사용: {_src})'
 
 # 공유 데이터
 board_data = {i: [0.0, 0.0, 0.0, 0.0] for i in range(1, 23)} # [I1, I2, I3, Pressure]
@@ -178,6 +247,8 @@ def print_dashboard():
     # 화면 갱신용 문자열 생성
     output = "\033[H"  # 커서 홈으로 이동
     output += f"========== Pressure & Current Monitor ==========\n"
+    # 어떤 보정을 쓰는지 화면에 밝힌다 — yaml 과 어긋난 채로 오래 도는 걸 막는다
+    output += f" 보정: {_CALIB_SOURCE}\n"
     output += f" [System] RX Count: {rx_count}\n"
     output += f" [Formula] P = (Orig_mV - Offset) * Gain + 101.325\n"
     output += f"------------------------------------------------------------------\n"

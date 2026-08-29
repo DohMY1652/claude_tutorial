@@ -1770,3 +1770,52 @@ CAN 만 연결하고(펌프 off, 매크로 미연결) 제어기를 돌렸는데:
 - **`colcon build` 가 "Finished" 라고 해도 설치본이 갱신됐다는 뜻이 아니다.**
   이번 세션에서 두 번(설정 yaml, launch 파일) 설치본이 한 세대 뒤처졌다. 고친
   다음에는 `install/` 안의 파일을 직접 grep 해서 확인할 것.
+
+---
+
+## S-28. 캘리브레이션 단일 출처화 — 같은 값을 세 군데 손으로 복사하고 있었다 (2026-08-29)
+
+board 17 엔코더를 재장착해 2 점을 다시 쟀다 (**raw 2114 @ 0°, raw 3392 @ 90°**,
+이전 1200/2470). 그런데 이 값을 넣어야 할 곳이 셋이었다:
+
+1. `powerpack_config.yaml`  `EncoderCalibration.boards."17"` — CanBridge 가 실제로 쓰는 것
+2. `powerpack_config.yaml`  `Sensor_calibration.boards."17"` — Controller 의 별도 각도 경로
+3. `scripts/can_monitor.py` `ENCODER_RAW_POINTS[17]` — CAN 을 직접 읽는 대시보드
+
+셋이 따로 놀아서 오늘만 두 번 헤맸다. S-26 에서는 1 번이 안 먹어 팝업이 158° 를
+찍는데 3 번은 0° 를 찍었고, 그래서 "브리지 계산이 틀렸다" 로 오해했다.
+
+### 고친 것
+
+`can_monitor.py` 가 **`powerpack_config.yaml` 을 읽어** `PRESSURE_CALIB` 과
+`ENCODER_RAW_POINTS` 를 덮어쓴다. 하드코딩 표는 폴백으로 남겼다 (이 스크립트는
+ROS 없이도 떠야 한다). 화면 맨 위에 어느 파일을 썼는지 찍는다:
+
+```
+ 보정: /home/.../install/can_powerpack/share/can_powerpack/config/powerpack_config.yaml
+```
+
+**설치본을 먼저** 본다 — ROS 노드가 실제로 읽는 게 그것이라, 소스만 고치고 빌드를
+안 한 상태에서도 "지금 돌고 있는 값" 을 보여 줘야 한다.
+
+`can_test.py` 는 보드 구분 없이 일반 기본값(offset 1740, gain **+**0.0757) 하나로
+모든 엔코더를 읽고 있었다 — 실측 보드는 gain 이 **음수**라 각도가 반대로 나온다.
+`can_monitor` 에서 `ENCODER_CALIB` 을 빌려 쓰도록 바꿨다.
+
+여전히 손으로 맞춰야 하는 것은 yaml 안의 1 번 ↔ 2 번뿐이다 (2 번은 1 번의 2 점에서
+계산한 offset/gain 이다). 검산은 아래로 한다:
+
+```
+python3 - <<'EOF'
+TO=3300.0/4095.0; o=lambda r:(4125.0-r*TO)/0.825
+r0,r90 = 2114.0, 3392.0          # EncoderCalibration 의 2 점
+print(f'offset={o(r0):.4f}  gain={90.0/(o(r90)-o(r0)):.8f}')   # → Sensor_calibration
+EOF
+```
+
+### 현재 board 17
+
+```
+raw 2114 →  0.00°     raw 2753 → 45.00°     raw 3392 → 90.00°
+offset 2935.0427 mV,  gain -0.07209507 deg/mV
+```

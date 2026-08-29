@@ -52,6 +52,17 @@ TO_MV = ADC_REF_MV / ADC_RES
 ENCODER_OFFSET = 1740.0
 ENCODER_GAIN   = 105.0 / (3127.0 - 1740.0)
 
+# 보드별 2 점 실측 보정. **단일 출처는 powerpack_config.yaml 이다** —
+# can_monitor.py 가 그 yaml 을 읽어 ENCODER_CALIB 을 만든다. 여기서 그걸 그대로
+# 빌려 쓴다. 못 가져오면 위 일반 기본값으로 도는데, 실측 보드는 gain 이 **음수**라
+# 각도가 반대로 읽힌다 — 그래서 무엇을 쓰는지 반드시 밝힌다.
+try:
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    from can_monitor import ENCODER_CALIB, _CALIB_SOURCE as _ENC_SRC
+except Exception as _e:
+    ENCODER_CALIB, _ENC_SRC = {}, f'일반 기본값 (can_monitor 를 못 읽었다: {_e})'
+
 # ================= 2. 테스트 파라미터 =================
 NUM_BOARDS = 22
 CONTROLLABLE_BOARDS = range(1, NUM_BOARDS + 1)   # 1~22 (18~22는 향후 액추에이터 대비)
@@ -90,8 +101,9 @@ def calc_original_voltage_mv(adc_mv):
     return (4125.0 - adc_mv) / 0.825
 
 
-def calc_angle_deg(orig_mv):
-    return (orig_mv - ENCODER_OFFSET) * ENCODER_GAIN
+def calc_angle_deg(orig_mv, board_id):
+    offset, gain = ENCODER_CALIB.get(board_id, (ENCODER_OFFSET, ENCODER_GAIN))
+    return (orig_mv - offset) * gain
 
 
 def open_channel():
@@ -133,7 +145,7 @@ def rx_thread_func(ch):
 
                     if board_id in ENCODER_BOARDS:
                         orig_mv = calc_original_voltage_mv(raw[3] * TO_MV)
-                        angle = calc_angle_deg(orig_mv)
+                        angle = calc_angle_deg(orig_mv, board_id)
                         with lock:
                             board_angles[board_id] = angle
         except (canlib.canNoMsg, canlib.canError):
