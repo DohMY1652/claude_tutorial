@@ -2651,15 +2651,19 @@ void Controller::on_timer() {
   for (int bid = 1; bid <= NUM_CAN_BOARDS; ++bid) {
     int idx = bid - 1;
 
-    // 엔코더 보드 (17~22): 반전증폭 역산(1~5V→3.3V~0V) 후 orig_mV 기준 각도 계산
+    // 엔코더 보드 (17~22): **여기서 각도를 만들지 않는다.**
+    //
+    // board/sensors 는 보드 1~16 만 싣는다 (CanBridge 가 PWM_BOARDS=16 개만 낸다).
+    // 그래서 snap_sensors[16..21] 은 언제나 0 이고, 그걸 반전증폭 역산에 넣으면
+    // (4125−0)/0.825 = 5000 mV 라 보정에 따라 −85° 니 +247° 니 하는 상수가 나온다.
+    // 실제 각도는 CanBridge 가 board/analog 로 내고 encoder_angles_ 로 들어온다.
+    //
+    // 이 죽은 경로 때문에 Sensor_calibration 에 엔코더 보정 사본을 두게 됐고,
+    // 그 사본이 EncoderCalibration 과 어긋나 두 번 사고를 냈다 (S-28 board 17,
+    // S-30 board 18). 사본은 지웠고 여기서는 0 을 낸다 — controller/sensors_kpa
+    // 를 보는 쪽에 "이 슬롯엔 압력이 없다" 가 분명해진다.
     if (bid >= 17 && bid <= 22) {
-      double adc_mv = std::clamp((double)snap_sensors[idx] * (3300.0 / 4095.0), 0.0, 3300.0);
-      double orig_mv = (4125.0 - adc_mv) / 0.825;
-      const auto& ec = sensor_.boards[(size_t)idx];
-      double angle_deg = (orig_mv - ec.offset) * ec.gain;
-      if (!filter_initialized_) filt_state_[idx] = angle_deg;
-      filt_state_[idx] = sensor_filter_alpha_ * angle_deg + (1.0 - sensor_filter_alpha_) * filt_state_[idx];
-      filt_out_[idx]   = filt_state_[idx];
+      filt_out_[idx] = 0.0;
       continue;
     }
 

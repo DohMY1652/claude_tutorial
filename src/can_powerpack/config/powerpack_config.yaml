@@ -59,7 +59,7 @@
       boards:
         "17": { raw_0deg: 2114.0, raw_90deg: 3392.0 }   # 20260829 재장착 후 재측정 (이전 1200/2470)
         "18": { raw_0deg: 1120.0,  raw_90deg: 2350.0 }
-        "19": { raw_0deg: 2115.0, raw_90deg: 3155.0 }
+        "19": { raw_0deg: 160.0, raw_90deg: 1444.0 }
 
 # ==========================================
 # Node 2: PP Controller (Control Algorithm)
@@ -126,15 +126,15 @@
         "14": { offset: 1032.0,  gain: -0.02525 }   # gid 9  (Board 14, 음압 ch9)
         "15": { offset: 1010.0,  gain: -0.02525 }   # gid 10 (Board 15, 음압 ch10)
         "16": { offset: 1030.0,  gain: -0.02525 }   # gid 11 (Board 16, 음압 ch11)
-        # Board 17~22: 엔코더 보드 (angle = (orig_mV - offset) * gain [deg])
-        # 반전증폭 역산 후 orig_mV 기준: 1740mV=0도, 3127mV=105도
-        # gain = 105 / (3127 - 1740) ≈ 0.07570 deg/mV
-        "17": { offset: 2935.0427,  gain: -0.07209507 }   # can_monitor.py ENCODER_RAW_POINTS[17] = raw 2114,3392 @0°/90°
-        "18": { offset: 3905.9829,  gain: -0.07490854 }   # EncoderCalibration.boards.18 = raw 1120,2350 @0°/90°
-        "19": { offset: 2934.0659,  gain: -0.08859375 }   # can_monitor.py ENCODER_RAW_POINTS[19] = raw 2115,3155 @0°/90°
-        "20": { offset: 1740.0,  gain: 0.07570 }    # encoder ch3
-        "21": { offset: 1740.0,  gain: 0.07570 }    # encoder ch4
-        "22": { offset: 1740.0,  gain: 0.07570 }    # encoder ch5
+        # Board 17~22 (엔코더) 는 **여기 없다.** 엔코더 보정의 단일 출처는 위쪽
+        # can_bridge 의 `EncoderCalibration.boards.N.raw_0deg/raw_90deg` 하나다.
+        #
+        # 예전에는 여기에도 offset/gain 사본이 있었는데, 실제 각도를 만드는 것은
+        # CanBridge(board/analog) 이고 컨트롤러는 board/sensors(보드 1~16)만 받으므로
+        # 이 사본은 **한 번도 제어에 쓰이지 않았다** — 그냥 죽은 설정이었다.
+        # 그런데도 두 번 사고를 냈다: board 17 (S-28), board 18 (S-30) 모두 2 점만
+        # 고치고 이 사본을 안 고쳐서 값이 어긋났다. 그래서 지웠다.
+        # 엔코더를 새로 달면 EncoderCalibration 의 raw_0deg/raw_90deg 만 고칠 것.
 
     channel_config:
       ch0:
@@ -429,7 +429,19 @@
       # 101.3 → 51.3 → 101.0 kPa (≈1250 kPa/s) 로 튀었다 — 챔버가 따라갈 수 없는
       # 명령이라 밸브만 두들기고 액추에이터에는 충격으로 간다.
       # 150 이면 필요한 42 kPa 이동에 0.28 s 라 응답은 안 죽이고 떨림만 걸러진다.
-      ref_slew_kpa_per_s: 150.0
+      # 150 → 400. **150 은 정상 동작에서 이미 포화하고 있었다.**
+      # 되먹임 고리 안의 포화된 레이트 리미터는 최대 90° 의 위상 지연을 만든다 —
+      # 한계진동의 전형적인 원인이다. 실기 20260829_194658 (2 축, 목표 60° 유지):
+      #
+      #            제한의 90% 이상에 걸린 비율   각도 진폭(p-p)
+      #     axis0            7.2%                  18.5°
+      #     axis1           27.5%                  27.2°     ← 사용자가 지목한 축
+      #
+      # 두 축의 게인·질량·기하는 같다. 다른 것은 **리미터에 얼마나 걸리느냐** 뿐이고,
+      # 그게 그대로 진폭 차이로 나왔다. 억제하려던 떨림은 1250 kPa/s 였고 정상
+      # 수요는 평균 30~55 / 최대 183 kPa/s 다 — 400 이면 정상 수요에 2 배 여유를
+      # 두면서 떨림은 여전히 3 배로 자른다. 0 이하면 끔.
+      ref_slew_kpa_per_s: 400.0
       n_chamber: 1.4             # 챔버는 단열 (1스텝 20 ms ≪ 열 시상수 0.4~4 s)
       n_rail: 1.0                # 레일/탱크는 등온 (초 단위로 느림)
       preview_steps: 1           # 1 = 프리뷰 끔 (현재 수요만). 상위 계획기 붙으면 100(2s)
@@ -712,7 +724,7 @@
 
       axis2:
         # 공용 — enc/pos/neg = board19 / board7  / board13
-        mass_kg: 5.0
+        mass_kg: 2.0   # 3 축 확장 (20260829) — axis0·1 과 같은 리그 (150 mm · 2 kg)
         link_length_m: 0.15
         p_pos_max_kpa: 185.0
         p_neg_min_kpa: 27.0
