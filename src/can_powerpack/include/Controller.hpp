@@ -884,6 +884,8 @@ private:
   double kd_vel_ff_{1.0};
   // 추종 오차가 밴드에 붙어 있는 연속 틱 수 (축별). 오래 붙으면 경고한다.
   std::vector<int> band_sat_ticks_;
+  // 압력 추종 오차가 이보다 크면 외층 적분을 얼린다 [kPa]. 0 이하면 끔.
+  double integ_hold_perr_kpa_{8.0};
   // 슬루 상태를 현재 각도에서 한 번 출발시켰나 (기동 계단 방지).
   bool slew_seeded_{false};
   int  slew_seed_ticks_{0};

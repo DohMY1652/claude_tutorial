@@ -1549,6 +1549,8 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
       "PositionController.target_follow_band_deg", 5.0);
   kd_vel_ff_ = get_param_or<double>(this,
       "PositionController.kd_vel_ff", 1.0);
+  integ_hold_perr_kpa_ = get_param_or<double>(this,
+      "PositionController.integ_hold_pressure_err_kpa", 8.0);
   target_slew_rate_.assign(std::max(1, num_actuators_), 0.0);
   band_sat_ticks_.assign(std::max(1, num_actuators_), 0);
 
@@ -3388,10 +3390,33 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
       band_sat_ticks_[(size_t)a] = 0;
     }
 
+    // ── 내층이 아직 못 따라왔으면 적분하지 않는다 (역산 와인드업 방지) ──
+    //
+    // 외층은 토크를 요구하고 내층(압력 루프)이 그걸 압력으로 만든다. 챔버가
+    // 레퍼런스에 한참 못 미치는 동안은 **요구가 실현되지 않고 있는 것**이므로
+    // 그때 적분을 쌓으면 정의상 와인드업이다. 챔버가 따라잡는 순간 쌓인 적분이
+    // 그대로 추가 밀어냄이 되어 오버슈트가 된다.
+    //
+    // 실기 20260829_224219: 계단 직후 챔버가 0.3~1.0 초 정체하는 동안(밸브
+    // 모델이 유량을 9 배 과대평가해 지령이 크래킹 아래에 머물렀다 — S-41)
+    // 적분이 0.75 s 만에 상한까지 찼고, 오버슛이 19~54% 였다.
+    //
+    // 압력 추종 오차가 밴드보다 크면 얼린다. 0 이하면 끔(예전 동작).
+    bool inner_behind = false;
+    if (integ_hold_perr_kpa_ > 0.0) {
+      const int pb = cfg.pos_gid + channel_board_offset_ - 1;
+      const int nb = cfg.neg_gid + channel_board_offset_ - 1;
+      const double ep = (pb >= 0 && pb < NUM_CAN_BOARDS)
+          ? std::abs(gen_pos_ref_kpa_[(size_t)a] - filt_out_[(size_t)pb]) : 0.0;
+      const double en = (nb >= 0 && nb < NUM_CAN_BOARDS)
+          ? std::abs(gen_neg_ref_kpa_[(size_t)a] - filt_out_[(size_t)nb]) : 0.0;
+      inner_behind = (std::max(ep, en) > integ_hold_perr_kpa_);
+    }
+
     // 적분 (부호 반전 시 리셋 + 클램프)
     double& I = tau_integ_[(size_t)a];
     if ((err > 0.0 && I < 0.0) || (err < 0.0 && I > 0.0)) I = 0.0;
-    if (actuator_connected_) I += err * dt_sec;
+    if (actuator_connected_ && !inner_behind) I += err * dt_sec;
     const double I_lim = (std::abs(tp.ki) > 1e-12) ? tp.integ_limit_nm / tp.ki : 0.0;
     I = std::clamp(I, -I_lim, I_lim);
 

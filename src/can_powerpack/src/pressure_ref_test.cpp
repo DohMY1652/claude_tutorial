@@ -12,8 +12,10 @@
 #include "PressureRefGen.hpp"
 #include "PneumaticFlow.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 using pneu::P_ATM;
@@ -161,7 +163,66 @@ int main()
     std::printf("목표 −50 N → 달성 %.2f N (목표 0 과 같으면 클램프 정상)\n", r2.F_achieved[0]);
   }
 
-  std::printf("\n=== 5. 레퍼런스가 측정 잡음을 쫓지 않는가 (평활 기준점) ===\n");
+  // ========================================================================
+  // 6. **과도 응답 속도 — w_tank 가 탱크 부스트를 얼마나 막는가**
+  // ========================================================================
+  // 실기 20260829_224219 의 30°→60° 계단에서 지연의 정체를 재현한다.
+  // 그때 실측: 목표·τ_ref·P⁺ref 는 0.0~0.13 s 에 반응했는데 **실측 압력이
+  // 0.29~1.03 s** 걸렸다. 그 사이 macro(부스트) 지령은 내내 0% 였고 탱크는
+  // 520 kPa 로 가득했으며 starve 도 0% 였다 — 능력이 없어서가 아니라
+  // **목적함수가 탱크를 안 썼다.**
+  //
+  // 챔버가 레퍼런스를 향해 **물리적으로 가능한 최대 속도**(슬루 박스 경계)로
+  // 따라간다고 두고, 요구 힘의 90% 에 도달하는 데 몇 스텝 걸리는지 센다.
+  std::printf("\n=== 6. 과도 응답: w_tank 가 속도에 미치는 영향 ===\n");
+  {
+    // 실기 공급 상태 (20260829_224219 의 계단 순간)
+    const double RAIL_P = 168e3 - P_ATM, RAIL_N = 55e3 - P_ATM, TANK = 520e3 - P_ATM;
+    const double F_HOLD = 1.30 / 0.025;   // 30° 유지 토크 → 힘
+    const double F_STEP = 3.40 / 0.025;   // 60° 유지 토크 → 힘
+
+    std::printf("  공급: 레일⁺ %.0f / 레일⁻ %.0f / 탱크 %.0f kPa abs\n",
+                RAIL_P/1e3+P_ATM/1e3, RAIL_N/1e3+P_ATM/1e3, TANK/1e3+P_ATM/1e3);
+    std::printf("  힘 %.0f N → %.0f N 계단 (30°→60° 유지토크에 해당)\n\n", F_HOLD, F_STEP);
+    std::printf("  %8s %10s %10s %10s %10s %10s\n",
+                "w_tank", "90%도달", "P+ 이동", "P- 이동", "최종 P+", "최종 P-");
+
+    for (double wt : {15.0, 8.0, 4.0, 2.0, 1.0}) {
+      auto p = make_params(1);
+      p.w_tank = wt;
+      PressureRefGen gen(p);
+      gen.build_pump_table();
+      PressureRefGen::SupplyState sup;
+      sup.P_rail_pos = RAIL_P; sup.P_rail_neg = RAIL_N; sup.P_tank = TANK;
+      sup.P_ej = RAIL_N; sup.use_ej_meas = true;
+
+      // 유지 상태로 먼저 수렴시킨다
+      auto axes = std::vector<PressureRefGen::AxisState>{ axis_at(21e3, -3e3) };
+      for (int i = 0; i < 150; ++i) {
+        auto r = gen.step({F_HOLD}, axes, sup);
+        axes[0].P_pos = std::min(std::max(r.P_pos_ref[0], r.lb_pos[0]), r.ub_pos[0]);
+        axes[0].P_neg = std::min(std::max(r.P_neg_ref[0], r.lb_neg[0]), r.ub_neg[0]);
+      }
+      const double p0 = axes[0].P_pos, n0 = axes[0].P_neg;
+
+      // 계단
+      int n90 = -1;
+      for (int i = 0; i < 200; ++i) {
+        auto r = gen.step({F_STEP}, axes, sup);
+        axes[0].P_pos = std::min(std::max(r.P_pos_ref[0], r.lb_pos[0]), r.ub_pos[0]);
+        axes[0].P_neg = std::min(std::max(r.P_neg_ref[0], r.lb_neg[0]), r.ub_neg[0]);
+        const double F = axes[0].P_pos * p.Apos[0] - axes[0].P_neg * p.Aneg[0];
+        if (n90 < 0 && F >= F_HOLD + 0.9 * (F_STEP - F_HOLD)) n90 = i + 1;
+      }
+      std::printf("  %8.1f %9s %+9.1f %+9.1f %10.1f %10.1f\n", wt,
+                  n90 < 0 ? "미도달" : (std::to_string((int)(n90 * p.dt * 1000)) + " ms").c_str(),
+                  (axes[0].P_pos - p0)/1e3, (axes[0].P_neg - n0)/1e3,
+                  axes[0].P_pos/1e3 + P_ATM/1e3, axes[0].P_neg/1e3 + P_ATM/1e3);
+    }
+    std::printf("\n  P+ 이동이 크고 P- 이동이 작을수록 빠른 쪽(탱크 580 kPa)을 쓴다는 뜻이다.\n");
+  }
+
+  std::printf("\n=== 5. 레퍼런스가 측정 잡음을 쫓지 않는가 (평활 기준점) ===");
   {
     // 목표 힘은 **고정**인데 실측 챔버압만 ±15 kPa, 6 Hz 로 흔들리는 상황.
     // 이때 레퍼런스가 같이 흔들리면 그 진동이 다시 챔버를 흔들어 되먹임 고리가 된다
