@@ -1538,6 +1538,9 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   target_slew_dps_ = get_param_or<double>(this, "PositionController.target_slew_deg_per_s", 0.0);
   target_follow_band_deg_ = get_param_or<double>(this,
       "PositionController.target_follow_band_deg", 5.0);
+  kd_vel_ff_ = get_param_or<double>(this,
+      "PositionController.kd_vel_ff", 1.0);
+  target_slew_rate_.assign(std::max(1, num_actuators_), 0.0);
 
   for (int a = 0; a < num_actuators_; ++a) {
     const std::string prefix = "PositionController.axis" + std::to_string(a) + ".";
@@ -2192,50 +2195,30 @@ void Controller::slew_targets(double dt_sec) {
           ? std::clamp(pos_ctrl_cfg_[i].actuator_idx, 0, (int)ang.size() - 1) : (int)i;
       target_angle_slewed_[i] = ang[(size_t)enc];
     }
+    target_slew_rate_.assign(target_angle_slewed_.size(), 0.0);
     return;
   }
 
   if (target_slew_dps_ <= 0.0 || dt_sec <= 0.0) {
     target_angle_slewed_ = target_angle_deg_;
+    target_slew_rate_.assign(target_angle_slewed_.size(), 0.0);   // 계단이면 속도 FF 없음
     return;
   }
   if (target_angle_slewed_.size() != target_angle_deg_.size())
     target_angle_slewed_ = target_angle_deg_;
+  if (target_slew_rate_.size() != target_angle_slewed_.size())
+    target_slew_rate_.assign(target_angle_slewed_.size(), 0.0);
+  const std::vector<double> prev = target_angle_slewed_;
   const double step = target_slew_dps_ * dt_sec;
   for (size_t i = 0; i < target_angle_deg_.size(); ++i) {
     const double d = target_angle_deg_[i] - target_angle_slewed_[i];
     target_angle_slewed_[i] += std::clamp(d, -step, step);
   }
 
-  // ── 추종 오차 제한 (following-error clamp) ──────────────────────────────
-  //
-  // 목표가 **실제 팔보다 얼마나 앞서 갈 수 있는지** 를 묶는다. 이게 없으면 목표는
-  // target_slew_dps_ 로 계속 달려가고 팔은 못 따라와 오차가 무한정 벌어진다.
-  //
-  // 내려올 때 특히 나쁘다. 이 시스템은 **한 방향 힘만 낸다**(τ_ref = max(0, …)) —
-  // 하강은 오로지 중력이 시킨다. 목표가 15 deg/s 로 앞서 달아나면 오차가 −10° 를
-  // 넘고, 그러면 τ_ref 가 0 으로 떨어져 **완전 방출 = 자유낙하**가 된다. 떨어지다
-  // 오차 부호가 뒤집히면 다시 붙잡는다. 실기 20260829_191758 하강 구간이 그
-  // 붙잡기–놓기의 반복이었다 (0.2 s 에 −11.7° 급강하 뒤 +4.3° 되튐):
-  //
-  //     t=45.0  err −1.3  τ 4.00      t=47.6  err −10.3  τ 0.00   ← 자유낙하
-  //     t=45.2  err  +4.0 τ 1.35      t=47.8  err −12.3  τ 0.00
-  //
-  // 오차를 밴드 안에 묶으면 목표가 팔을 **끌고 내려간다** — 중력이 허용하는 속도로
-  // 저절로 맞춰진다. 올라갈 때도 적분 와인드업과 도달 못 할 큰 수요를 막는다.
-  // 0 이하면 끔(예전 동작).
-  if (target_follow_band_deg_ > 0.0) {
-    std::array<double, 9> ang;
-    { std::lock_guard<std::mutex> lk(sensors_mtx_); ang = encoder_angles_; }
-    for (size_t i = 0; i < target_angle_slewed_.size(); ++i) {
-      const int enc = (i < pos_ctrl_cfg_.size())
-          ? std::clamp(pos_ctrl_cfg_[i].actuator_idx, 0, (int)ang.size() - 1) : (int)i;
-      const double a = ang[(size_t)enc];
-      target_angle_slewed_[i] = std::clamp(target_angle_slewed_[i],
-                                           a - target_follow_band_deg_,
-                                           a + target_follow_band_deg_);
-    }
-  }
+  // 목표 슬루 **속도** 를 남긴다. 제어기의 D 항이 이 값을 피드포워드로 쓴다 —
+  // 그래야 D 가 "명령한 움직임" 이 아니라 "명령에서 벗어난 만큼" 만 억제한다.
+  for (size_t i = 0; i < target_angle_slewed_.size(); ++i)
+    target_slew_rate_[i] = (target_angle_slewed_[i] - prev[i]) / dt_sec;
 }
 
 // 토픽: actuator/volumes_ml  (Float64MultiArray, num_total_channels_ 개, 단위 mL)
@@ -3094,7 +3077,15 @@ void Controller::run_position_control(double dt_sec)
     // 비례해 무한정 커져 45°만 넘어도 p_pos_max_kpa에 곧장 포화되고, 45/60/90°가 전부 같은
     // 압력으로 뭉개진다 (20260818, 액추에이터 미연결 압력추종 테스트 중 확인).
     // → 액추에이터 미연결 시에는 PID를 끄고, 아래 중력 FF만으로 목표압력을 생성한다.
-    const double error = angle_ref - angle;
+    // 모드 2 와 같은 처리 — 목표는 건드리지 않고 **제어 오차만** 밴드로 자른다.
+    const double error_raw = angle_ref - angle;
+    const double error = (target_follow_band_deg_ > 0.0)
+        ? std::clamp(error_raw, -target_follow_band_deg_, target_follow_band_deg_)
+        : error_raw;
+    // D 항은 목표 속도를 빼고 본다 (명령한 움직임은 억제하지 않는다).
+    const double vel_ref_m1 = (a < (int)target_slew_rate_.size() && pos_tcp_received_)
+        ? target_slew_rate_[(size_t)a] : 0.0;
+    const double vel_err_m1 = vel - kd_vel_ff_ * vel_ref_m1;
     double p_pid = 0.0;
 
     if (actuator_connected_) {
@@ -3112,7 +3103,7 @@ void Controller::run_position_control(double dt_sec)
 
       p_pid = cfg.m1.kp * error
             + cfg.m1.ki * state.integral
-            - cfg.m1.kd * vel;   // 미분: 측정값 미분 (setpoint kick 방지)
+            - cfg.m1.kd * vel_err_m1;   // 미분: 측정 − 목표 속도
     }
 
     // ── 중력 피드포워드 ──
@@ -3258,7 +3249,19 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     state.prev_angle = angle;
     const double vel = state.vel_filt;
 
-    const double err = angle_ref - angle;
+    const double err_raw = angle_ref - angle;
+
+    // ── 추종 오차 제한 ────────────────────────────────────────────────
+    // **목표 자체는 건드리지 않는다.** 예전에는 target_angle_slewed_ 를 측정각
+    // ±밴드로 묶었는데, 그러면 팔이 멈춘 자리에서 목표까지 같이 얼어붙는다 —
+    // 80° 에서 0° 를 명령하면 팔이 14° 에 서고 목표는 9° 에서 멈췄다
+    // (실기 20260829_193558: angle − target 이 정확히 +5.00 에 붙어 있었다).
+    // 목표는 명령까지 끝까지 가야 한다. 묶어야 하는 것은 **제어기에 들어가는
+    // 오차** 뿐이다 — 적분 와인드업과 도달 못 할 큰 수요를 막는 것이 목적이니
+    // 여기서 자르면 충분하다.
+    const double err = (target_follow_band_deg_ > 0.0)
+        ? std::clamp(err_raw, -target_follow_band_deg_, target_follow_band_deg_)
+        : err_raw;
 
     // 적분 (부호 반전 시 리셋 + 클램프)
     double& I = tau_integ_[(size_t)a];
@@ -3267,8 +3270,27 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     const double I_lim = (std::abs(tp.ki) > 1e-12) ? tp.integ_limit_nm / tp.ki : 0.0;
     I = std::clamp(I, -I_lim, I_lim);
 
+    // ── D 항: 목표 속도 피드포워드 ────────────────────────────────────
+    //
+    // 예전에는 −kd·vel 이라 **명령한 움직임까지 억제**했다. 목표가 −15 deg/s 로
+    // 내려가라고 하는데 팔이 그대로 내려가면 D 가 +0.3 N·m 로 붙잡는다. 그래서
+    // 팔이 못 내려가다가, 중력이 이겨 −45 deg/s 로 미끄러지면 D 가 뒤늦게
+    // +0.9 로 튀어 붙잡는다 — 계단의 정체다.
+    //
+    // 실기 20260829_193558 하강(t 8~18): 목표는 15 deg/s 인데 실제 속도가
+    // −63.8 ~ +14.1 deg/s 로 요동했고 **15% 는 하강 중에 위로 되튀었다**.
+    // 그 순간 τ 는 1.2 → 3.5 N·m 로 튀었는데 챔버는 128 kPa 에서 못 따라와
+    // (목표 156) 붙잡기가 늦고 약했다.
+    //
+    // vel 대신 (vel − 목표속도) 를 쓰면 D 는 **명령에서 벗어난 만큼만** 억제한다.
+    // 명령한 속도로 내려가는 동안은 0 이고, −45 로 미끄러지면 그 초과분만 잡는다.
+    // kd_vel_ff_ 0 이면 예전 동작, 1 이면 완전 피드포워드.
+    const double vel_ref = (a < (int)target_slew_rate_.size() && pos_tcp_received_)
+        ? target_slew_rate_[(size_t)a] : 0.0;
+    const double vel_err = vel - kd_vel_ff_ * vel_ref;
+
     const double tau_pid = actuator_connected_
-        ? (tp.kp * err + tp.ki * I - tp.kd * vel) : 0.0;
+        ? (tp.kp * err + tp.ki * I - tp.kd * vel_err) : 0.0;
 
     // 중력 피드포워드. tau_ff_gain 으로 크기를 줄일 수 있다.
     //

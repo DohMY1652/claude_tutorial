@@ -874,6 +874,10 @@ private:
   // 한 방향 힘 시스템이라 하강은 중력에 맡길 수밖에 없다 — 목표가
   // 달아나면 τ_ref 가 0 으로 떨어져 자유낙하한다 (S-30 참조).
   double target_follow_band_deg_{5.0};
+  // 목표 슬루 속도 [deg/s] — D 항의 피드포워드. slew_targets() 가 매 틱 채운다.
+  std::vector<double> target_slew_rate_;
+  // D 항이 목표 속도를 얼마나 빼고 볼지 (0=예전 −kd·vel, 1=완전 피드포워드).
+  double kd_vel_ff_{1.0};
   void slew_targets(double dt_sec);
   bool   pos_tcp_received_{false};
 
