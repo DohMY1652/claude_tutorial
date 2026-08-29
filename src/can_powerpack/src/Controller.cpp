@@ -3510,6 +3510,32 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
         gen_neg_ref_kpa_[(size_t)a] = want_n;
       }
     }
+    // ── 공급이 없어 레퍼런스를 못 만드는 상태를 **직접** 알린다 ──────────
+    //
+    // 힘은 요구되는데 챔버 상한(ub⁺)이 대기압에 붙어 있으면 레퍼런스가 대기압에서
+    // 못 움직인다. 로그에는 "P⁺ 레퍼런스가 101.3 고정" 으로만 보여서 제어 버그처럼
+    // 읽힌다 — 실제로는 **레일에 공기가 없다는** 뜻이다.
+    // 20260829_222722 에서 탱크가 t=4.84 s 에 585 → 97 kPa 로 빠졌고(그 순간 부스트
+    // 0.000 g/s, 이젝터 0.000 g/s — 컨트롤러는 탱크를 안 쓰고 있었다) 그 뒤 모든
+    // 실험에서 레퍼런스가 대기압에 붙었다.
+    {
+      const double atm_g = 0.0;   // gauge 기준 대기압
+      double want = 0.0, head = 1e18;
+      for (int a = 0; a < N; ++a) {
+        want = std::max(want, tau_ref[(size_t)a]);
+        head = std::min(head, r.ub_pos[(size_t)a] - atm_g);
+      }
+      if (want > 0.2 && head < 2000.0) {   // 힘은 요구되는데 상한이 대기압 +2 kPa 미만
+        RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+          "레퍼런스를 못 만든다: 토크 %.2f N·m 가 요구되는데 챔버 상한이 %.1f kPa abs "
+          "(대기압) 다. 양압레일 %.1f / 탱크 %.1f kPa abs — **공급에 공기가 없다.** "
+          "레퍼런스 생성기는 레일이 못 주는 압력을 목표로 삼지 않는다(정상 동작). "
+          "컴프레서·탱크 배관을 확인할 것.",
+          want, to_abs_kpa(head + atm_g),
+          filt_out_[P_pos_board_id_ - 1], filt_out_[P_macro_board_id_ - 1]);
+      }
+    }
+
     gen_rail_pos_sp_kpa_ = to_abs_kpa(r.rail_pos_sp);
     gen_rail_neg_sp_kpa_ = to_abs_kpa(r.rail_neg_sp);
     gen_has_result_ = true;
