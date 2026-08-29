@@ -75,6 +75,14 @@ public:
     // 양압레일을 "가장 높은 챔버 레퍼런스 + 이 값" 으로 묶는다 [Pa]. 0 이하면 끔.
     // 셋포인트가 힘 수요로만 정해져 챔버가 쓸 압력보다 한참 위로 가는 것을 막는다.
     double rail_pos_headroom{60.0e3};
+    // 레일 셋포인트 감쇠 시정수 [s]. 0 이하면 끔.
+    //
+    // 셋포인트는 힘 수요(F_ref)로 정해지는데 그 수요는 위치 루프의 리플을 그대로
+    // 안고 있다. 그러면 **레일 → 챔버 상한 → 챔버 레퍼런스 → 토크 → 레일** 로
+    // 도는 되먹임이 생긴다. 레일은 초 단위로 느린 공유 공급원인데 20 ms 리플을
+    // 쫓게 만들 이유가 없다. 올릴 때는 즉시, 내릴 때는 이 시정수로 천천히
+    // (수요가 생기면 바로 대응하고, 사라지면 서서히 내려온다).
+    double rail_sp_decay_tau{2.0};
     // 챔버 레퍼런스를 레일에서 이만큼 떨어뜨린다 [Pa]. 0 이하면 끔.
     // 챔버는 음압레일보다 깊어질 수도, 양압레일보다 높아질 수도 없다.
     double chamber_neg_headroom{15.0e3};
@@ -222,4 +230,6 @@ private:
   bool        sup_f_init_{false};
   Eigen::VectorXd x_prev_;      // 직전 해 (평활항·warm start)
   bool has_prev_{false};
+  double rail_pos_sp_state_{0.0}, rail_neg_sp_state_{0.0};   // 셋포인트 엔벨로프
+  bool   rail_sp_init_{false};
 };

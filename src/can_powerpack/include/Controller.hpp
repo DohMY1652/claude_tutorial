@@ -780,6 +780,10 @@ private:
 
   std::vector<double> vol_ml_;
 
+  // 채널별 부피 배율 (channel_config.chN.volume_scale). 기하 모델 값에 곱한다.
+
+  std::vector<double> vol_scale_;
+
   bool sys_valve_operate_{false};
   RefTcpClient::Config ref_client_cfg_;
   std::unique_ptr<RefTcpClient> ref_client_;

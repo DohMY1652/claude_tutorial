@@ -1317,6 +1317,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   tank_volume_neg_ml_ = get_param_or<double>(this, "tank_volume_neg_ml", 400.0);
 
   vol_ml_.resize(num_total_channels_);
+  vol_scale_.assign(num_total_channels_, 1.0);
   for (int i = 0; i < num_total_channels_; ++i) {
     if (!actuator_connected_)
       vol_ml_[i] = (i < num_positive_channels_) ? tank_volume_pos_ml_ : tank_volume_neg_ml_;
@@ -1336,11 +1337,19 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     const double v_ov = get_param_or<double>(
         this, "channel_config.ch" + std::to_string(i) + ".volume_ml", 0.0);
     if (v_ov > 0.0) vol_ml_[i] = v_ov;
+
+    // 배율 — 액추에이터 연결 시 기하 모델 값에 곱한다 (volume_ml 은 그때 덮어써진다).
+    vol_scale_[(size_t)i] = std::max(1e-3, get_param_or<double>(
+        this, "channel_config.ch" + std::to_string(i) + ".volume_scale", 1.0));
   }
   {
     std::string vs;
     for (int i = 0; i < num_total_channels_; ++i) {
-      char b[32]; snprintf(b, sizeof(b), " ch%d=%.0f", i, vol_ml_[(size_t)i]); vs += b;
+      char b[48];
+      if (std::abs(vol_scale_[(size_t)i] - 1.0) > 1e-6)
+        snprintf(b, sizeof(b), " ch%d=%.0f(x%.2f)", i, vol_ml_[(size_t)i], vol_scale_[(size_t)i]);
+      else snprintf(b, sizeof(b), " ch%d=%.0f", i, vol_ml_[(size_t)i]);
+      vs += b;
     }
     RCLCPP_INFO(get_logger(), "[채널 부피 mL]%s", vs.c_str());
   }
@@ -1653,6 +1662,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     gp.Ppos_sp_max  = get_param_or<double>(this, "PressureRefGen.rail.pos_sp_max_kpa",  400.0) * 1000.0;
     gp.Fmax_ref     = get_param_or<double>(this, "PressureRefGen.rail.demand_ref_N",    150.0);
     gp.rail_pos_headroom = get_param_or<double>(this, "PressureRefGen.rail.pos_headroom_kpa", 60.0) * 1000.0;
+    gp.rail_sp_decay_tau  = get_param_or<double>(this, "PressureRefGen.rail.sp_decay_tau_s", 2.0);
     gp.chamber_neg_headroom = get_param_or<double>(this, "PressureRefGen.rail.chamber_neg_headroom_kpa", 15.0) * 1000.0;
     gp.chamber_pos_headroom = get_param_or<double>(this, "PressureRefGen.rail.chamber_pos_headroom_kpa", 15.0) * 1000.0;
     gp.supply_filter_tau_s  = get_param_or<double>(this, "PressureRefGen.rail.supply_filter_tau_s", 0.5);
@@ -2766,12 +2776,23 @@ void Controller::on_timer() {
           const double x_mm    = reel_radius_mm_ * ang[i] * M_PI / 180.0;   // 피스톤 변위
           const int    neg_gid = num_positive_channels_ + i;
 
-          vol_ml_[i] = tank_volume_pos_ml_
-              + A * std::max(0.0, vol_offset_pos_mm_ + x_mm) / 1000.0;
+          // 기하 모델에 **채널별 배율**을 곱한다.
+          //
+          // 절대 오버라이드(channel_config.chN.volume_ml)는 여기서 매 틱 덮어써져
+          // 소용이 없다 — 액추에이터가 붙어 있으면 부피가 각도의 함수이기 때문이다.
+          // 배율이면 각도 의존성은 그대로 두고 크기만 고친다.
+          //
+          // 실기 20260829_195910: 세 축이 같은 게인·질량·기하인데 axis1 만 진동했다
+          // (각도 p-p: ax0 4.6° / ax2 3.2° / **ax1 22.0°**). 같은 지령·차압에서
+          // dP/dt 를 재니 ch1 이 ch0 의 4.97 배였다. dP/dt = ṁ·R·T/V 이므로
+          // 유효 부피가 1/5 라는 뜻이고, 기하 모델이 146 mL 로 보는 동안 MPC 는
+          // 5 배 유량을 요구해 과개방하고 있었다.
+          vol_ml_[i] = vol_scale_[(size_t)i] * (tank_volume_pos_ml_
+              + A * std::max(0.0, vol_offset_pos_mm_ + x_mm) / 1000.0);
 
           if (neg_gid < num_total_channels_ && active_channels_.count(neg_gid))
-              vol_ml_[neg_gid] = tank_volume_neg_ml_
-                  + A * std::max(0.0, vol_offset_neg_mm_ - x_mm) / 1000.0;
+              vol_ml_[neg_gid] = vol_scale_[(size_t)neg_gid] * (tank_volume_neg_ml_
+                  + A * std::max(0.0, vol_offset_neg_mm_ - x_mm) / 1000.0);
       }
   }
 

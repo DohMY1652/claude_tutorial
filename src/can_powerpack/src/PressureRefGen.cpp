@@ -325,6 +325,40 @@ PressureRefGen::Result PressureRefGen::step(const std::vector<double>& F_ref_in,
   }
   decide_rail_setpoint(F_preview, res.rail_pos_sp, res.rail_neg_sp, res.demand_norm);
 
+  // ── 레일 셋포인트 엔벨로프 (올림 즉시 / 내림 감쇠) ──────────────────
+  //
+  // **되먹임 고리를 끊는다.** 셋포인트는 F_ref 로 정해지는데 F_ref 는 위치 루프의
+  // 리플을 그대로 안고 있다. 실기 20260829_195910 (3 축, 목표 60° 유지):
+  //
+  //     τ_ref 리플 2.0~4.1 N·m p-p → need = τ/(reel·A) = 41~84 kPa p-p
+  //     실측 레일 SP 리플            68.5 kPa p-p  (1.73 Hz)
+  //     실측 레일 압력 리플         126.1 kPa p-p  (1.73 Hz)
+  //
+  // 그 레일 리플이 세 축 챔버 레퍼런스에 30~43 kPa p-p 로 돌아왔고, 셋이 같은
+  // 1.0~1.7 Hz 로 물려 돌았다. axis0·2 는 흡수했지만(각도 p-p 4.6°/3.2°)
+  // axis1 은 ±11° 로 증폭했다 — "2 번째 축만 진동" 의 정체다.
+  //
+  // 레일은 초 단위로 느린 **공유** 공급원이다. 20 ms 리플을 쫓게 둘 이유가 없다.
+  // 수요가 늘면 즉시 올리고, 줄면 rail_sp_decay_tau 로 천천히 내린다.
+  if (p_.rail_sp_decay_tau > 0.0) {
+    const double k = p_.dt / (p_.dt + p_.rail_sp_decay_tau);
+    if (!rail_sp_init_) {
+      rail_pos_sp_state_ = res.rail_pos_sp;
+      rail_neg_sp_state_ = res.rail_neg_sp;
+      rail_sp_init_ = true;
+    }
+    // 양압: 높을수록 수요가 크다
+    rail_pos_sp_state_ = (res.rail_pos_sp > rail_pos_sp_state_)
+        ? res.rail_pos_sp
+        : rail_pos_sp_state_ + k * (res.rail_pos_sp - rail_pos_sp_state_);
+    // 음압: **낮을수록**(깊을수록) 수요가 크다 — 부호가 반대다
+    rail_neg_sp_state_ = (res.rail_neg_sp < rail_neg_sp_state_)
+        ? res.rail_neg_sp
+        : rail_neg_sp_state_ + k * (res.rail_neg_sp - rail_neg_sp_state_);
+    res.rail_pos_sp = rail_pos_sp_state_;
+    res.rail_neg_sp = rail_neg_sp_state_;
+  }
+
   // ── 2. 슬루 박스 ───────────────────────────────────────────────────
   Eigen::VectorXd lb(nx), ub(nx), dP_rail(N), dN_rail(N);
   build_slew_box(axes, sup, lb, ub, dP_rail, dN_rail);
