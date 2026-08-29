@@ -118,7 +118,7 @@ ENCODER_CALIB  = {i: (ENCODER_OFFSET, ENCODER_GAIN) for i in range(17, 23)}
 # calib_from_raw_2pt()가 offset/gain을 자동 계산해서 ENCODER_CALIB에 반영함
 ENCODER_RAW_POINTS = {
     17: (2114, 3392),   # raw 2114 @ 0도, raw 3392 @ 90도 — 20260829 재장착 후 재측정
-    18: (860, 2000),    # raw  860 @ 0도, raw 2000 @ 90도
+    18: (1120, 2350),    # raw  1250 @ 0도, raw 2494 @ 90도
     19: (2115, 3155),   # raw 2115 @ 0도, raw 3155 @ 90도
 }
 

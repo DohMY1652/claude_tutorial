@@ -95,10 +95,33 @@ void PressureRefGen::decide_rail_setpoint(const std::vector<std::vector<double>>
   // 대기압) 로 고정됐고, 챔버 목표 145.1 보다 낮아 micro 로는 채울 수가 없었다.
   // 그래서 수요가 전부 macro(탱크 590 kPa)로 가 폭주했다.
   // "목표 압력이 높으면 안 된다" 의 정체가 이것이다.
+  //
+  // **직전 챔버 레퍼런스만 보면 순환 고리가 생긴다.** 챔버 목표가 낮으면 레일 상한이
+  // 낮아지고, 레일이 낮으면 슬루 박스의 챔버 상한(hiP = 레일 − chamber_pos_headroom)이
+  // 낮아져 챔버 목표가 계속 낮게 나온다. 한 번 바닥에 붙으면 스스로 못 빠져나온다.
+  //
+  // 실기 20260829_165306 (1 축, 2 kg, 150 mm): 양압 레퍼런스가 전 구간 대기압
+  // (0 kPa gauge) 에 붙어 힘을 **전부 음압으로만** 냈다. 달성 토크가 4.18 N·m 에서
+  // 멈췄는데 이는 음압 단독 한계(101.3 kPa × 1963 mm² × 25 mm = 4.97 N·m)다.
+  // 70° 목표에서 60° 에 주저앉고 오차 10° 가 남았다.
+  //
+  // 그래서 "지금 요구되는 힘을 **양압만으로** 낼 때 필요한 챔버 압력" 을 상한의
+  // 바닥으로 깐다. F = P·A 이므로 P_need = F / A 다. 이러면 수요가 있을 때는 레일이
+  // 따라 올라가 챔버 천장이 열리고, 수요가 없으면 예전처럼 낮게 유지된다
+  // (원래 이 상한을 넣은 이유 — 레일이 필요량의 14 배로 뜨는 것 — 은 그대로 막힌다).
   if (p_.rail_pos_headroom > 0.0 && has_prev_ && x_prev_.size() >= p_.N) {
     double max_ref = 0.0;
     for (int i = 0; i < p_.N; ++i) max_ref = std::max(max_ref, x_prev_(i));
-    const double cap = max_ref + p_.rail_pos_headroom;
+
+    double need = 0.0;
+    for (int i = 0; i < p_.N; ++i) {
+      double peak = 0.0;
+      if (i < (int)F_preview.size())
+        for (double f : F_preview[(size_t)i]) peak = std::max(peak, f);
+      need = std::max(need, peak / std::max(1e-9, p_.Apos[(size_t)i]));
+    }
+
+    const double cap = std::max(max_ref, need) + p_.rail_pos_headroom;
     ppos_target = std::min(ppos_target, std::max(p_.Ppos_sp_min, cap));
   }
 

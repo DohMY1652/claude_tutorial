@@ -884,6 +884,9 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_refgen_dbg_;
 
   int      gen_period_ms_{20};       // 생성기 주기 (제어 tick 여러 개마다 1회)
+  // 생성기가 낸 압력 레퍼런스의 슬루 제한 [kPa/s]. 0 이하면 끔.
+  // 모드 1 의 ref_slew_kpa_per_s 와 같은 역할인데 모드 2 에는 없었다.
+  double   gen_ref_slew_kpa_s_{150.0};
   uint64_t gen_tick_{0};
   bool     gen_use_ej_meas_{true};   // board 4 측정 음압을 이젝터 하류압으로 사용
 
@@ -898,6 +901,10 @@ private:
     double kp{0.0786}, ki{0.0295}, kd{0.0049};
     double integ_limit_nm{2.0};
     double friction_nm{0.30};
+    // 마찰 보상 밴드 [deg]. 오차가 이 안이면 friction_nm 을 선형으로 준다.
+    // 0 에 가까우면 예전의 하드 sign 과 같아져 목표 근처에서 ±friction_nm 이
+    // 계단으로 뒤집힌다 (S-29 참조).
+    double friction_band_deg{1.0};
     // 중력 피드포워드 배율. 액추에이터 미연결 시험에서 목표 압력을 낮추는 데 쓴다.
     // 목표 압력에 거의 선형으로 반영된다. 액추에이터를 붙이면 1.0 으로 되돌릴 것.
     double tau_ff_gain{1.0};

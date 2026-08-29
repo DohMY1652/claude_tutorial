@@ -1598,6 +1598,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   // 최적화 기반 압력 레퍼런스 생성기 (control_mode 2)
   // ──────────────────────────────────────────
   gen_period_ms_    = get_param_or<int>(this,  "PressureRefGen.period_ms", 20);
+  gen_ref_slew_kpa_s_ = get_param_or<double>(this, "PressureRefGen.ref_slew_kpa_per_s", 150.0);
   gen_use_ej_meas_  = get_param_or<bool>(this, "PressureRefGen.use_ejector_measurement", true);
   gen_pos_ref_kpa_.assign(num_actuators_, sensor_.kpa_atm());
   gen_neg_ref_kpa_.assign(num_actuators_, sensor_.kpa_atm());
@@ -1615,6 +1616,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     tp.integ_limit_nm = get_param_or<double>(this, pre + "integ_limit_nm", 2.0);
     tp.friction_nm    = get_param_or<double>(this, pre + "friction_nm",    0.30);
     tp.tau_ff_gain    = get_param_or<double>(this, pre + "tau_ff_gain",    1.0);
+    tp.friction_band_deg = get_param_or<double>(this, pre + "friction_band_deg", 1.0);
   }
 
   {
@@ -2168,6 +2170,29 @@ void Controller::on_sensor(const std_msgs::msg::UInt16MultiArray::SharedPtr m) {
 // 완만해진다 — 액추에이터를 보수적으로 움직일 때 여기부터 조인다.
 // target_slew_deg_per_s <= 0 이면 계단 그대로다.
 void Controller::slew_targets(double dt_sec) {
+  // ── TCP 수신 전: 슬루 상태를 **현재 각도에 붙여 둔다** ──────────────────
+  //
+  // 위치 루프는 명령이 오기 전까지 angle_ref = 측정각으로 돌지만(오차 0 유지),
+  // target_angle_slewed_ 는 0 에 그대로 있었다. 그래서 **첫 명령이 오는 순간**
+  // angle_ref 가 측정각에서 0 으로 계단 점프하고 거기서부터 램프가 시작됐다.
+  // 실기 20260829_165306: t=10.79 에 각도 19.9° 인데 목표가 0.45° 로 떨어졌다
+  // (−19.4° 계단) — 액추에이터에 그대로 충격으로 간다.
+  //
+  // 명령 전에는 슬루 상태를 측정각에 얹어 둔다. 첫 명령 순간 angle_ref 가
+  // 이어지고, 거기서부터 target_slew_deg_per_s 로 램프한다.
+  if (!pos_tcp_received_) {
+    std::array<double, 9> ang;
+    { std::lock_guard<std::mutex> lk(sensors_mtx_); ang = encoder_angles_; }
+    if (target_angle_slewed_.size() != target_angle_deg_.size())
+      target_angle_slewed_.assign(target_angle_deg_.size(), 0.0);
+    for (size_t i = 0; i < target_angle_slewed_.size(); ++i) {
+      const int enc = (i < pos_ctrl_cfg_.size())
+          ? std::clamp(pos_ctrl_cfg_[i].actuator_idx, 0, (int)ang.size() - 1) : (int)i;
+      target_angle_slewed_[i] = ang[(size_t)enc];
+    }
+    return;
+  }
+
   if (target_slew_dps_ <= 0.0 || dt_sec <= 0.0) {
     target_angle_slewed_ = target_angle_deg_;
     return;
@@ -3225,8 +3250,13 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     const double tau_grav = tp.tau_ff_gain * cfg.mass_kg * 9.81 * cfg.link_length_m
                           * std::sin(ff_angle * M_PI / 180.0);
 
-    const double tau_fric = (actuator_connected_ && std::abs(err) > 0.3)
-        ? tp.friction_nm * (err > 0.0 ? 1.0 : -1.0) : 0.0;
+    // 마찰 보상. **하드 sign 은 err 이 0 을 지날 때마다 ±friction_nm 를 통째로
+    // 뒤집는다** — friction_nm 0.48 이면 0.96 N·m 계단이고, 이는 2 kg·150 mm 의
+    // 중력 최대치(2.94 N·m)의 33% 다. 목표 근처에서 이게 매 틱 진동한다.
+    // 밴드 안에서 선형으로 준다 (밴드 밖에서는 예전과 같은 ±friction_nm).
+    const double fb = std::max(1e-6, tp.friction_band_deg);
+    const double tau_fric = actuator_connected_
+        ? tp.friction_nm * std::clamp(err / fb, -1.0, 1.0) : 0.0;
 
     // 이 시스템은 한 방향 힘만 낸다 → 목표는 항상 ≥ 0
     tau_ref[(size_t)a] = std::max(0.0, tau_pid + tau_grav + tau_fric);
@@ -3277,9 +3307,29 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
 
     r = refgen_->step(F_ref, axes, sup);
 
+    // ── 압력 레퍼런스 슬루 제한 ────────────────────────────────────────
+    //
+    // 모드 1 에는 ref_slew_kpa_per_s 가 있었는데 모드 2 에는 없었다. 생성기 출력이
+    // 그대로 MPC 로 갔고, 힘 수요가 조금만 떨리면 레퍼런스가 통째로 튀었다.
+    // 실기 20260829_165306: 40 ms 사이에 P⁻ 레퍼런스가 101.3 → 51.3 → 101.0 kPa
+    // (≈1250 kPa/s), P⁺ 가 101.5 → 122.1 → 105.4 였다. 챔버가 따라갈 수 없는
+    // 명령이라 밸브만 두들기고 액추에이터에는 충격으로 간다.
+    //
+    // 0 이하면 끔(예전 동작).
+    const double gen_dt = std::max(1e-3, gen_period_ms_ / 1000.0);
+    const double max_step = gen_ref_slew_kpa_s_ * gen_dt;
     for (int a = 0; a < N; ++a) {
-      gen_pos_ref_kpa_[(size_t)a] = to_abs_kpa(r.P_pos_ref[(size_t)a]);
-      gen_neg_ref_kpa_[(size_t)a] = to_abs_kpa(r.P_neg_ref[(size_t)a]);
+      const double want_p = to_abs_kpa(r.P_pos_ref[(size_t)a]);
+      const double want_n = to_abs_kpa(r.P_neg_ref[(size_t)a]);
+      if (gen_ref_slew_kpa_s_ > 0.0 && gen_has_result_) {
+        gen_pos_ref_kpa_[(size_t)a] +=
+            std::clamp(want_p - gen_pos_ref_kpa_[(size_t)a], -max_step, max_step);
+        gen_neg_ref_kpa_[(size_t)a] +=
+            std::clamp(want_n - gen_neg_ref_kpa_[(size_t)a], -max_step, max_step);
+      } else {
+        gen_pos_ref_kpa_[(size_t)a] = want_p;
+        gen_neg_ref_kpa_[(size_t)a] = want_n;
+      }
     }
     gen_rail_pos_sp_kpa_ = to_abs_kpa(r.rail_pos_sp);
     gen_rail_neg_sp_kpa_ = to_abs_kpa(r.rail_neg_sp);
