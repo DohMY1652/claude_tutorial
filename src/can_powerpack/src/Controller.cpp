@@ -1536,6 +1536,8 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   target_angle_deg_.assign(num_actuators_, 0.0);
   target_angle_slewed_.assign(num_actuators_, 0.0);
   target_slew_dps_ = get_param_or<double>(this, "PositionController.target_slew_deg_per_s", 0.0);
+  target_follow_band_deg_ = get_param_or<double>(this,
+      "PositionController.target_follow_band_deg", 5.0);
 
   for (int a = 0; a < num_actuators_; ++a) {
     const std::string prefix = "PositionController.axis" + std::to_string(a) + ".";
@@ -2203,6 +2205,36 @@ void Controller::slew_targets(double dt_sec) {
   for (size_t i = 0; i < target_angle_deg_.size(); ++i) {
     const double d = target_angle_deg_[i] - target_angle_slewed_[i];
     target_angle_slewed_[i] += std::clamp(d, -step, step);
+  }
+
+  // ── 추종 오차 제한 (following-error clamp) ──────────────────────────────
+  //
+  // 목표가 **실제 팔보다 얼마나 앞서 갈 수 있는지** 를 묶는다. 이게 없으면 목표는
+  // target_slew_dps_ 로 계속 달려가고 팔은 못 따라와 오차가 무한정 벌어진다.
+  //
+  // 내려올 때 특히 나쁘다. 이 시스템은 **한 방향 힘만 낸다**(τ_ref = max(0, …)) —
+  // 하강은 오로지 중력이 시킨다. 목표가 15 deg/s 로 앞서 달아나면 오차가 −10° 를
+  // 넘고, 그러면 τ_ref 가 0 으로 떨어져 **완전 방출 = 자유낙하**가 된다. 떨어지다
+  // 오차 부호가 뒤집히면 다시 붙잡는다. 실기 20260829_191758 하강 구간이 그
+  // 붙잡기–놓기의 반복이었다 (0.2 s 에 −11.7° 급강하 뒤 +4.3° 되튐):
+  //
+  //     t=45.0  err −1.3  τ 4.00      t=47.6  err −10.3  τ 0.00   ← 자유낙하
+  //     t=45.2  err  +4.0 τ 1.35      t=47.8  err −12.3  τ 0.00
+  //
+  // 오차를 밴드 안에 묶으면 목표가 팔을 **끌고 내려간다** — 중력이 허용하는 속도로
+  // 저절로 맞춰진다. 올라갈 때도 적분 와인드업과 도달 못 할 큰 수요를 막는다.
+  // 0 이하면 끔(예전 동작).
+  if (target_follow_band_deg_ > 0.0) {
+    std::array<double, 9> ang;
+    { std::lock_guard<std::mutex> lk(sensors_mtx_); ang = encoder_angles_; }
+    for (size_t i = 0; i < target_angle_slewed_.size(); ++i) {
+      const int enc = (i < pos_ctrl_cfg_.size())
+          ? std::clamp(pos_ctrl_cfg_[i].actuator_idx, 0, (int)ang.size() - 1) : (int)i;
+      const double a = ang[(size_t)enc];
+      target_angle_slewed_[i] = std::clamp(target_angle_slewed_[i],
+                                           a - target_follow_band_deg_,
+                                           a + target_follow_band_deg_);
+    }
   }
 }
 

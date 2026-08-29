@@ -870,6 +870,10 @@ private:
   std::vector<double> target_angle_deg_;
   std::vector<double> target_angle_slewed_;   // 슬루 제한을 지난 목표 (제어가 쓰는 값)
   double target_slew_dps_{0.0};               // 각도 목표 슬루 [deg/s], 0=끔
+  // 목표가 측정각보다 앞설 수 있는 최대 오차 [deg]. 0 이하면 끔.
+  // 한 방향 힘 시스템이라 하강은 중력에 맡길 수밖에 없다 — 목표가
+  // 달아나면 τ_ref 가 0 으로 떨어져 자유낙하한다 (S-30 참조).
+  double target_follow_band_deg_{5.0};
   void slew_targets(double dt_sec);
   bool   pos_tcp_received_{false};
 

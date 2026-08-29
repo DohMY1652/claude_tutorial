@@ -82,14 +82,17 @@ def _setup(context, *_a, **_k):
     #
     # num_actuators=1 로 두고 axis0 의 gid 를 N 으로 돌려놓는 것과 같다.
     # 명시적으로 준 num_actuators / overrides 가 있으면 그쪽을 존중한다.
+    # 쉼표로 여러 개를 줄 수 있다: axis:=0,1 이면 2 축을 같이 돌린다.
+    # 선택한 순서대로 axis0, axis1, ... 에 배정된다 (엔코더도 board 17+ch 로 따라간다).
     axis = LaunchConfiguration('axis').perform(context)
     if axis:
-        a = int(axis)
+        sel = [int(x) for x in axis.replace(' ', '').split(',') if x]
         npos = int(overrides.get('num_positive_channels', 6))
-        overrides.setdefault('num_actuators', 1)
-        overrides.setdefault('PositionController.axis0.pos_gid', a)
-        overrides.setdefault('PositionController.axis0.neg_gid', npos + a)
-        overrides.setdefault('PositionController.axis0.actuator_idx', a)
+        overrides.setdefault('num_actuators', len(sel))
+        for k, a in enumerate(sel):
+            overrides.setdefault(f'PositionController.axis{k}.pos_gid', a)
+            overrides.setdefault(f'PositionController.axis{k}.neg_gid', npos + a)
+            overrides.setdefault(f'PositionController.axis{k}.actuator_idx', a)
 
     # can_bridge 에도 **자기가 선언한 키만** 넘긴다. overrides 를 통째로 넘기면
     # MPC_parameters.* 처럼 브리지가 선언하지 않은 파라미터가 섞여 노드가 뜨지 않는다.
@@ -149,8 +152,7 @@ def generate_launch_description():
         DeclareLaunchArgument('actuator_connected', default_value='',
                               description='true|false. 비우면 yaml 값'),
         DeclareLaunchArgument('axis', default_value='',
-            description='물리 채널 하나만 돌린다 (예: axis:=2 → 양압 ch2 / 음압 ch8 / '
-                        '엔코더 board19). 채널별 부피·밸브를 하나씩 잴 때 쓴다.'),
+            description='돌릴 물리 채널. 하나면 axis:=2 (양압 ch2 / 음압 ch8 / 엔코더 board19), 여럿이면 쉼표로 axis:=0,1. 비우면 yaml 그대로 (6 축).'),
         DeclareLaunchArgument('overrides', default_value='',
                               description="쉼표 구분 파라미터 오버라이드 (a.b=1.5,...)"),
         OpaqueFunction(function=_setup),

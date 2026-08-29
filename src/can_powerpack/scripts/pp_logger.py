@@ -16,7 +16,8 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray, UInt16MultiArray
 
-SCHEMA_VERSION = 4           # 형식을 바꾸면 올린다. 과거 CSV 구분용(meta.json 에 기록)
+SCHEMA_VERSION = 5           # 형식을 바꾸면 올린다. 과거 CSV 구분용(meta.json 에 기록)
+#   5: refgen 말미 6 개(rail SP·탱크·부스트·이젝터) 열 추가
 NAMESPACE  = '/pack2'
 LOG_HZ     = 100.0
 # powerpack_config.yaml 의 num_actuators 최대치(6)에 맞춘다. 실제로 6축보다 적게
@@ -86,6 +87,8 @@ class PpLogger(Node):
         # control_mode=2 에서는 position_dbg 가 발행되지 않아 각도/목표가 비어
         # 있었다. 슬루 경계와 유량부족률은 "왜 그 목표가 나왔는지" 를 설명한다.
         self._rg       = [0.0] * (12 * NUM_AXES)
+        # 말미 공용 6 개: [rail_pos_sp, rail_neg_sp, tank, tank_low, boost g/s, eject g/s]
+        self._rg_tail  = [0.0] * 6
         self._rg_seen  = False
 
         ns = NAMESPACE
@@ -159,6 +162,11 @@ class PpLogger(Node):
                        f'ub_pos_kpa_axis{a}', f'lb_pos_kpa_axis{a}',
                        f'lb_neg_kpa_axis{a}', f'ub_neg_kpa_axis{a}',
                        f'starve_pos_pct_axis{a}', f'starve_neg_pct_axis{a}']
+        # refgen_dbg 말미 공용 6 개. rail SP 가 없으면 "양압이 왜 느린가" 를
+        # 로그만으로 못 가른다 — 셋포인트가 낮은 것인지(제어), 셋포인트는 높은데
+        # 레일이 못 따라오는 것인지(공급) 구분이 안 된다.
+        header += ['rail_pos_sp_kpa', 'rail_neg_sp_kpa', 'tank_kpa',
+                   'tank_low', 'boost_gps', 'eject_gps']
 
         self._writer.writerow(header)
         self._header = header
@@ -228,10 +236,16 @@ class PpLogger(Node):
                 if i < len(self._curr): self._curr[i] = float(v)
 
     def _cb_refgen(self, msg):
+        # 메시지는 [축블록 12 개] × N + [공용 말미 6 개] 다. N 은 num_actuators 라
+        # NUM_AXES(6)보다 작을 수 있으므로 말미는 **뒤에서** 읽어야 한다 —
+        # 앞에서 세면 축 수가 다를 때 엉뚱한 값을 rail SP 로 적는다.
+        d = list(msg.data)
         with self._lock:
             self._rg_seen = True
-            for i, v in enumerate(msg.data):
-                if i < len(self._rg): self._rg[i] = float(v)
+            for i, v in enumerate(d[:len(self._rg)]):
+                self._rg[i] = float(v)
+            if len(d) >= 6:
+                self._rg_tail = [float(x) for x in d[-6:]]
 
     def _cb_vol(self, msg):
         with self._lock:
@@ -248,6 +262,7 @@ class PpLogger(Node):
             cur = list(self._curr)
             vol = list(self._vols)
             rg  = list(self._rg); rg_seen = self._rg_seen
+            rgt = list(self._rg_tail)
 
         elapsed = (self.get_clock().now().nanoseconds - self._start_ns) / 1e9
 
@@ -297,6 +312,8 @@ class PpLogger(Node):
                     f'{rg[b + 6]:.4f}', f'{rg[b + 7]:.4f}',
                     f'{rg[b + 8]:.4f}', f'{rg[b + 9]:.4f}',
                     f'{rg[b + 10]:.2f}', f'{rg[b + 11]:.2f}']
+        row += [f'{rgt[0]:.4f}', f'{rgt[1]:.4f}', f'{rgt[2]:.4f}',
+                f'{rgt[3]:.0f}', f'{rgt[4]:.4f}', f'{rgt[5]:.4f}']
 
         self._writer.writerow(row)
         b0 = _pwm_base(POS_GIDS[0])
