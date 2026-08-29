@@ -2604,3 +2604,47 @@ actuator_connected:=false 로 돌릴 것.
 
 확인: `actuator_connected:=false` 기동 — 부피 50 mL, τ=0.00(목표 0°), CAN 449 Hz,
 밴드 경고 0.
+
+---
+
+## S-39. position_ref_client 가 축 수를 못 알아보고 조용히 6 으로 돌아가던 문제 (2026-08-29)
+
+3 축(`axis:=0,1,2`)으로 돌리는데 클라이언트가 각도를 6 개 넣으라고 했다.
+축 수 자동 감지는 들어가 있었는데, **셸 환경에 기대고 있었다.**
+
+```python
+subprocess.run(['ros2', 'param', 'get', '/pack2/pp_controller', 'num_actuators'], ...)
+except Exception:
+    pass          # ← 여기서 통째로 삼키고
+return default    # ← 조용히 6
+```
+
+`setup.bash` 를 source 하지 않은 터미널에서는 `ros2` 가 PATH 에 없어 `FileNotFoundError`
+가 나고, 예외를 삼켜 아무 말 없이 6 으로 돌아간다. 재현:
+
+| 셸 | 결과 |
+|---|---|
+| `source install/setup.bash` 함 | 축 수 = **3** |
+| 안 함 (`python3 src/.../position_ref_client.py ...`) | 축 수 = **6** |
+
+### 고침
+
+1. **워크스페이스의 `install/setup.bash` 를 스스로 찾아 source 한다.** 스크립트
+   자기 경로에서 위로 올라가며 찾는다 (설치본 `lib/can_powerpack/` 과 소스본
+   `src/can_powerpack/scripts/` 양쪽에서 동작). `can_monitor.py` 가 yaml 을 찾는
+   방식과 같다.
+2. **실패하면 이유를 찍는다.** 조용한 폴백이 진짜 문제였다 — 사용자는 자동 감지가
+   됐는지 안 됐는지 알 방법이 없었다.
+3. 성공 시 "각도를 N 개 입력하면 된다" 를 같이 찍는다.
+
+확인 (사용자 명령 그대로, source 안 한 셸):
+```
+[position_ref_client] 컨트롤러 축 수 = 3 (--axes N 으로 직접 지정 가능)
+[position_ref_client] 각도를 3 개 입력하면 된다 (하나만 넣으면 전 축에 같은 값).
+```
+컨트롤러가 없을 때:
+```
+[position_ref_client] **경고** 컨트롤러에게 축 수를 못 물어봤다 → 기본값 6 축으로 진행한다.
+                      사유: Node not found
+                      pp_controller 가 떠 있는지 확인하거나, `--axes N` 으로 직접 지정할 것.
+```

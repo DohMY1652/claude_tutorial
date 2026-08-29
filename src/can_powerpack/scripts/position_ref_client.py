@@ -17,6 +17,7 @@ Controller의 RefTcpServer(기본 port 2293, 위치 모드)는 접속한 클라�
 조회가 안 되면 --axes N 으로 직접 지정한다. 개수가 틀리면 남는 값이 다음
 명령으로 해석되어 각도가 곧바로 0 으로 되돌아간다.
 """
+import os
 import socket
 import struct
 import sys
@@ -32,20 +33,59 @@ DEFAULT_HOST = '127.0.0.1'   # RefTcpServer는 pp_controller가 뜬 머신에서
 DEFAULT_PORT = 2293
 
 
+def _find_setup_bash():
+    """이 스크립트 위치에서 워크스페이스의 install/setup.bash 를 찾는다.
+
+    설치본:  <ws>/install/can_powerpack/lib/can_powerpack/position_ref_client.py
+    소스본:  <ws>/src/can_powerpack/scripts/position_ref_client.py
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    d = here
+    for _ in range(6):
+        cand = os.path.join(d, 'install', 'setup.bash')
+        if os.path.exists(cand):
+            return cand
+        nd = os.path.dirname(d)
+        if nd == d:
+            break
+        d = nd
+    return None
+
+
 def query_num_actuators(default=NUM_AXES):
-    """실행 중인 pp_controller 에게 num_actuators 를 물어본다. 실패하면 default."""
+    """실행 중인 pp_controller 에게 num_actuators 를 물어본다.
+
+    **셸 환경에 기대지 않는다.** 예전에는 그냥 `ros2 param get` 을 실행했는데,
+    setup.bash 를 source 하지 않은 터미널에서는 `ros2` 가 PATH 에 없어 조회가
+    실패했고, 예외를 통째로 삼켜 **조용히 기본값 6 으로 되돌아갔다.**
+    3 축으로 돌리는데 각도를 6 개 넣으라고 하는 것이 그 증상이다.
+    이제 워크스페이스의 install/setup.bash 를 스스로 찾아 source 하고,
+    그래도 실패하면 **이유를 찍는다**.
+    """
     import subprocess
+    cmd = 'ros2 param get /pack2/pp_controller num_actuators'
+    setup = _find_setup_bash()
+    if setup:
+        argv = ['bash', '-c', f'source "{setup}" >/dev/null 2>&1; {cmd}']
+    else:
+        argv = ['bash', '-c', cmd]
+    why = None
     try:
-        out = subprocess.run(
-            ['ros2', 'param', 'get', '/pack2/pp_controller', 'num_actuators'],
-            capture_output=True, text=True, timeout=8).stdout
-        for tok in out.replace(':', ' ').split():
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        for tok in r.stdout.replace(':', ' ').split():
             if tok.isdigit():
                 n = int(tok)
                 if 1 <= n <= 12:
                     return n
-    except Exception:
-        pass
+        why = (r.stderr or r.stdout).strip().splitlines()
+        why = why[-1] if why else '응답 없음'
+    except Exception as e:
+        why = f'{type(e).__name__}: {e}'
+    print(f"[position_ref_client] **경고** 컨트롤러에게 축 수를 못 물어봤다 "
+          f"→ 기본값 {default} 축으로 진행한다.")
+    print(f"                      사유: {why}")
+    print(f"                      pp_controller 가 떠 있는지 확인하거나, "
+          f"`--axes N` 으로 직접 지정할 것.")
     return default
 
 
@@ -74,6 +114,8 @@ def main():
         n_axes = query_num_actuators()
         print(f"[position_ref_client] 컨트롤러 축 수 = {n_axes} "
               f"(--axes N 으로 직접 지정 가능)")
+        print(f"[position_ref_client] 각도를 {n_axes} 개 입력하면 된다 "
+              f"(하나만 넣으면 전 축에 같은 값).")
     globals()['NUM_AXES'] = n_axes
 
     print(f"[position_ref_client] {host}:{port} 접속 중...")
