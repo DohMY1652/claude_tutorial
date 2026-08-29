@@ -24,6 +24,8 @@ BOARD_NAMES = {
 
 # board 5~16 은 채널 gid 0~11 이다 (powerpack_config 의 channel_board_offset).
 CHANNEL_BOARD_OFFSET = 5
+ENCODER_BOARD0 = 17          # 엔코더 보드 17~22 = axis0~5
+NUM_AXES_SHOWN = 6
 
 SEP  = '-' * 96
 SEP2 = '=' * 96
@@ -40,6 +42,7 @@ class MonitorNode(Node):
         # controller/pressure_ref_dbg 말미 6개:
         #   [rail_pos_sp, rail_neg_sp, tank, tank_low, boost g/s, eject g/s]
         self._rail_sp  = [float('nan'), float('nan')]
+        self._axis_ang = []          # [(현재각, 목표각)] × 축  (control_mode 2)
         self._tank_low = False
         self._encoders = []
         # position_dbg: 축마다 8개씩 이어붙임
@@ -75,9 +78,13 @@ class MonitorNode(Node):
         d = list(msg.data)
         if len(d) < 6:
             return
+        # 축마다 12 개 + 말미 6 개.  축 블록: [angle, angle_ref, tau_ref, tau_ach, ...]
+        n_ax = max(0, (len(d) - 6) // 12)
+        ax = [(d[12 * a], d[12 * a + 1]) for a in range(n_ax)]
         with self._lock:
             self._rail_sp = [d[-6], d[-5]]
             self._tank_low = d[-3] > 0.5
+            self._axis_ang = ax
 
     def _cb_refs(self, msg):
         with self._lock:
@@ -96,11 +103,12 @@ class MonitorNode(Node):
         with self._lock:
             return (list(self._kpa), dict(self._currents), list(self._refs),
                     list(self._encoders), self._pos_dbg,
-                    list(self._rail_sp), self._tank_low)
+                    list(self._rail_sp), self._tank_low, list(self._axis_ang))
 
 
 # ─────────────── 화면 구성 ───────────────
-def build_display(kpa, currents, refs, encoders, pos_dbg, rail_sp, tank_low, display_on):
+def build_display(kpa, currents, refs, encoders, pos_dbg, rail_sp, tank_low,
+                  axis_ang, display_on):
     if not display_on:
         return '\033[2J\033[H  [ Display OFF ]  press \'t\' to enable\n'
 
@@ -142,32 +150,42 @@ def build_display(kpa, currents, refs, encoders, pos_dbg, rail_sp, tank_low, dis
     if tank_low:
         o += '  [경고] 탱크 압력이 운전 하한 미만이다 — macro 부스트를 쓸 수 없다\n'
 
+    # ── 각도: 보드 하나당 한 행 ─────────────────────────────────────────
+    #
+    # 예전에는 'Encoders'(board/analog 9 개)와 'Position Control'(축별)이 따로 있어
+    # 같은 각도가 두 곳에 나왔다 — 화면에 12 개가 찍혔다. 한 표로 합친다.
+    # 목표각은 control_mode 2 면 pressure_ref_dbg, 1 이면 position_dbg 에서 온다.
     o += SEP + '\n'
-    o += ' Encoders\n'
-    if encoders:
-        for start in range(0, len(encoders), 3):
-            chunk = encoders[start:start+3]
-            parts = [f'Bd{17+start+i}: {deg:6.1f} deg' for i, deg in enumerate(chunk)]
-            o += '  ' + '   '.join(parts) + '\n'
-    else:
-        o += '  (no encoder data)\n'
+    o += '|  Enc | Axis |  Angle(deg) | Target(deg) |   Err(deg) |\n'
+    o += '|------|------|-------------|-------------|------------|\n'
 
-    # ── 위치 제어 상태 (position_dbg 수신 시만 표시) ──
-    # pos_dbg: 축마다 8개씩 이어붙임 [angle, angle_ref, p_pos, p_neg, p_pid, p_ff, p_friction, vel_dps] × N
-    o += SEP + '\n'
-    o += ' Position Control\n'
+    tgt = {}
+    for a, (_ang, ref) in enumerate(axis_ang or []):
+        tgt[a] = ref
+    if not tgt and pos_dbg and len(pos_dbg) >= 8:
+        for a in range(len(pos_dbg) // 8):
+            tgt[a] = pos_dbg[8 * a + 1]
+
+    for a in range(NUM_AXES_SHOWN):
+        bid = ENCODER_BOARD0 + a
+        now = encoders[a] if a < len(encoders) else float('nan')
+        ref = tgt.get(a, float('nan'))
+        now_s = f'{now:11.2f}' if now == now else ' ' * 11
+        if ref == ref and now == now:
+            ref_s, err_s = f'{ref:11.2f}', f'{ref - now:+10.2f}'
+        elif ref == ref:
+            ref_s, err_s = f'{ref:11.2f}', ' ' * 10
+        else:
+            ref_s, err_s = ' ' * 11, ' ' * 10
+        o += f'|  {bid:02d}  |  {a}   | {now_s} | {ref_s} | {err_s} |\n'
+
+    # 위치 제어 세부 (mode 1 에서만 나온다)
     if pos_dbg and len(pos_dbg) >= 8:
-        for start in range(0, len(pos_dbg) - len(pos_dbg) % 8, 8):
-            axis = start // 8
-            angle, angle_ref, p_pos, p_neg, p_pid, p_ff, p_fric, vel = pos_dbg[start:start+8]
-            err = angle_ref - angle
-            o += f' [Axis {axis}]\n'
-            o += (f'  Angle : now={angle:6.2f} deg   target={angle_ref:6.2f} deg'
-                  f'   err={err:+6.2f} deg   vel={vel:+6.1f} dps\n')
-            o += (f'  Output: P+={p_pos:6.1f} kPa   P-={p_neg:6.1f} kPa'
-                  f'   (pid={p_pid:+5.1f}  ff={p_ff:+5.1f}  fric={p_fric:+5.1f})\n')
-    else:
-        o += '  (위치 제어 비활성 또는 데이터 없음 — control_mode=0 이거나 TCP 미수신)\n'
+        o += SEP + '\n'
+        for a in range(len(pos_dbg) // 8):
+            _ang, _ref, p_pos, p_neg, p_pid, p_ff, p_fric, vel = pos_dbg[8 * a:8 * a + 8]
+            o += (f' [Axis {a}] vel={vel:+6.1f} dps   P+={p_pos:6.1f}  P-={p_neg:6.1f} kPa'
+                  f'   (pid={p_pid:+5.1f} ff={p_ff:+5.1f} fric={p_fric:+5.1f})\n')
 
     o += SEP2 + '\n'
     return o
@@ -211,9 +229,10 @@ def main():
                 if display_on:
                     os.system('clear')
 
-            kpa, currents, refs, encoders, pos_dbg, rail_sp, tank_low = node.snapshot()
+            (kpa, currents, refs, encoders, pos_dbg,
+             rail_sp, tank_low, axis_ang) = node.snapshot()
             sys.stdout.write(build_display(kpa, currents, refs, encoders, pos_dbg,
-                                           rail_sp, tank_low, display_on))
+                                           rail_sp, tank_low, axis_ang, display_on))
             sys.stdout.flush()
             time.sleep(0.1)
     except KeyboardInterrupt:

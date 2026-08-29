@@ -124,9 +124,9 @@
         # Board 17~22: 엔코더 보드 (angle = (orig_mV - offset) * gain [deg])
         # 반전증폭 역산 후 orig_mV 기준: 1740mV=0도, 3127mV=105도
         # gain = 105 / (3127 - 1740) ≈ 0.07570 deg/mV
-        "17": { offset: 1740.0,  gain: 0.07570 }    # encoder ch0
-        "18": { offset: 1740.0,  gain: 0.07570 }    # encoder ch1
-        "19": { offset: 1740.0,  gain: 0.07570 }    # encoder ch2
+        "17": { offset: 3827.8388,  gain: -0.07254921 }   # can_monitor.py ENCODER_RAW_POINTS[17] = raw 1200,2470 @0°/90°
+        "18": { offset: 4159.9512,  gain: -0.08082237 }   # can_monitor.py ENCODER_RAW_POINTS[18] = raw 860,2000 @0°/90°
+        "19": { offset: 2934.0659,  gain: -0.08859375 }   # can_monitor.py ENCODER_RAW_POINTS[19] = raw 2115,3155 @0°/90°
         "20": { offset: 1740.0,  gain: 0.07570 }    # encoder ch3
         "21": { offset: 1740.0,  gain: 0.07570 }    # encoder ch4
         "22": { offset: 1740.0,  gain: 0.07570 }    # encoder ch5

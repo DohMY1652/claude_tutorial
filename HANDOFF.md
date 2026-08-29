@@ -1611,3 +1611,48 @@ kd 0.04 는 **5 kg 기준으로 튜닝된 값**이고 2 kg 에서는 과하다. 
 3. 정상상태 오차가 남으면 `ki` 를 올리되 `integ_limit_nm` 을 함께 본다
 
 그리고 슬루를 더 조이면(8 deg/s) 그 자체로 진동이 줄어든다.
+
+---
+
+## S-25. 모니터 각도 표 통합 + 엔코더 보정 일치 (2026-08-29)
+
+### 각도가 12 개 나오던 문제
+
+모니터에 각도를 보여 주는 절이 **두 개**였다:
+- `Encoders` — `board/analog` 을 3 개씩 끊어 출력 (보드 17~25, 9 개)
+- `Position Control` — `position_dbg` 를 축마다 출력
+
+같은 각도가 두 곳에 찍혀 화면에 12 개가 됐다. **보드 순서 6 행 한 표**로 합쳤다:
+
+```
+|  Enc | Axis |  Angle(deg) | Target(deg) |   Err(deg) |
+|  17  |  0   |       44.93 |       45.00 |      +0.07 |
+|  18  |  1   |        0.00 |             |            |
+...
+|  22  |  5   |        0.03 |             |            |
+```
+
+목표각은 `control_mode 2` 면 `controller/pressure_ref_dbg` (축 블록의 [1]),
+`mode 1` 이면 `position_dbg` 에서 온다. 안 도는 축은 목표·오차를 비운다.
+위치 제어 세부(속도·pid·ff·마찰)는 mode 1 에서만 별도 한 줄로 남겼다.
+
+### 엔코더 보정 — 두 경로가 어긋나 있었다
+
+각도는 **CanBridge** 가 계산해 `board/analog` 로 낸다. 그 경로는 이미
+`EncoderCalibration.boards.N.raw_0deg/raw_90deg` 를 읽어 `can_monitor.py` 의
+`calib_from_raw_2pt()` 와 같은 식으로 offset/gain 을 만든다 — 값도 can_monitor 와
+같은 raw 1200/2470 (board 17) 이었다.
+
+그런데 **컨트롤러 쪽 `Sensor_calibration.boards.17~19` 는 일반 기본값**
+(offset 1740.0, gain 0.0757) 그대로였다. 같은 raw 2 점에서 계산한 값으로 맞췄다:
+
+| board | raw 0°/90° | offset | gain |
+|---|---|---|---|
+| 17 | 1200 / 2470 | 3827.8388 | −0.07254921 |
+| 18 | 860 / 2000 | 4159.9512 | −0.08082237 |
+| 19 | 2115 / 3155 | 2934.0659 | −0.08859375 |
+
+검산: raw 1200 → 0.00°, raw 2470 → 90.00° (board 17).
+
+> 실기에서 각도가 이상하면 **`EncoderCalibration.boards.N` 의 raw 2 점**을 먼저 볼 것.
+> 그쪽이 실제로 각도를 만드는 경로다. `Sensor_calibration` 은 컨트롤러의 보조 계산이다.
