@@ -589,10 +589,13 @@ void CanBridge::tx_send() {
 
   {
     unsigned int lvl = 0;
-    if (canIoCtl(hnd_, canIOCTL_GET_TX_BUFFER_LEVEL, &lvl, sizeof(lvl)) == canOK && lvl > 8)
+    // 임계 100 프레임. 500 Hz × 2 프레임 = 1000 프레임/s 이므로 100 ≈ **100 ms** 다.
+    // 정상 버퍼링은 9 프레임(≈9 ms) 수준이라 8 로 두면 매번 헛짖는다.
+    // 사고 때 문제가 된 backlog 는 2 초(≈2000 프레임)였다.
+    if (canIoCtl(hnd_, canIOCTL_GET_TX_BUFFER_LEVEL, &lvl, sizeof(lvl)) == canOK && lvl > 100)
       RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 500,
-        "CAN 송신 큐가 %u 프레임 밀렸다 — 지령이 그만큼 늦게 도착한다. "
-        "버스 부하·비트레이트를 확인할 것.", lvl);
+        "CAN 송신 큐가 %u 프레임(≈%.0f ms) 밀렸다 — 지령이 그만큼 늦게 도착한다. "
+        "버스 부하·비트레이트를 확인할 것.", lvl, lvl / 1.0);
   }
 
   tx_check(canWrite(hnd_, CMD_ID_GRP1, payload_g1, 64,
