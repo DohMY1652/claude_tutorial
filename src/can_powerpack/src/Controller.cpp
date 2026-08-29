@@ -1534,6 +1534,8 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   pos_ctrl_cfg_.assign(num_actuators_, PositionCtrlConfig{});
   pos_ctrl_state_.assign(num_actuators_, PositionCtrlState{});
   target_angle_deg_.assign(num_actuators_, 0.0);
+  target_angle_slewed_.assign(num_actuators_, 0.0);
+  target_slew_dps_ = get_param_or<double>(this, "PositionController.target_slew_deg_per_s", 0.0);
 
   for (int a = 0; a < num_actuators_; ++a) {
     const std::string prefix = "PositionController.axis" + std::to_string(a) + ".";
@@ -2159,6 +2161,26 @@ void Controller::on_sensor(const std_msgs::msg::UInt16MultiArray::SharedPtr m) {
   on_timer();
 }
 
+// 각도 목표를 슬루 제한으로 램프시킨다.
+//
+// TCP 로 들어온 목표를 계단으로 주면 레퍼런스 생성기가 즉시 큰 힘을 요구하고
+// 액추에이터가 그만큼 세게 튄다. 목표를 램프시키면 압력 레퍼런스도 따라서
+// 완만해진다 — 액추에이터를 보수적으로 움직일 때 여기부터 조인다.
+// target_slew_deg_per_s <= 0 이면 계단 그대로다.
+void Controller::slew_targets(double dt_sec) {
+  if (target_slew_dps_ <= 0.0 || dt_sec <= 0.0) {
+    target_angle_slewed_ = target_angle_deg_;
+    return;
+  }
+  if (target_angle_slewed_.size() != target_angle_deg_.size())
+    target_angle_slewed_ = target_angle_deg_;
+  const double step = target_slew_dps_ * dt_sec;
+  for (size_t i = 0; i < target_angle_deg_.size(); ++i) {
+    const double d = target_angle_deg_[i] - target_angle_slewed_[i];
+    target_angle_slewed_[i] += std::clamp(d, -step, step);
+  }
+}
+
 // 토픽: actuator/volumes_ml  (Float64MultiArray, num_total_channels_ 개, 단위 mL)
 // 활성 채널만 업데이트. 비활성 채널은 default_volume_ml_ 유지.
 void Controller::on_volume(const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
@@ -2656,6 +2678,7 @@ void Controller::on_timer() {
   // 위치 제어: filt_out_ 갱신 이후, ref_snapshot 이전에 실행
   // 각도 → 압력 레퍼런스 변환 후 mpc_ref_kpa_ 에 기록
   // ----------------------------------------------------------------
+  slew_targets(std::max(1e-6, dt_ctrl_sec_));
   if (control_mode_ == 1) {
     run_position_control(std::max(1e-6, dt_ctrl_sec_));
   } else if (control_mode_ == 2) {
@@ -2986,7 +3009,7 @@ void Controller::run_position_control(double dt_sec)
     double angle_ref;
     {
       std::lock_guard<std::mutex> lk(mpc_ref_mtx_);
-      angle_ref = pos_tcp_received_ ? target_angle_deg_[(size_t)a] : angle;
+      angle_ref = pos_tcp_received_ ? target_angle_slewed_[(size_t)a] : angle;
     }
 
     // 최초 진입: 속도 추정기 초기화만 하고 제어 출력은 건너뜀
@@ -3166,7 +3189,7 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     double angle_ref;
     {
       std::lock_guard<std::mutex> lk(mpc_ref_mtx_);
-      angle_ref = pos_tcp_received_ ? target_angle_deg_[(size_t)a] : angle;
+      angle_ref = pos_tcp_received_ ? target_angle_slewed_[(size_t)a] : angle;
     }
 
     if (!state.initialized) {

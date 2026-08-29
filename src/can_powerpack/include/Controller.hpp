@@ -868,6 +868,9 @@ private:
 
   // TCP에서 수신한 축별 목표 각도 (mpc_ref_mtx_ 로 보호). 크기 = num_actuators_
   std::vector<double> target_angle_deg_;
+  std::vector<double> target_angle_slewed_;   // 슬루 제한을 지난 목표 (제어가 쓰는 값)
+  double target_slew_dps_{0.0};               // 각도 목표 슬루 [deg/s], 0=끔
+  void slew_targets(double dt_sec);
   bool   pos_tcp_received_{false};
 
   // 위치 제어 디버그 토픽
