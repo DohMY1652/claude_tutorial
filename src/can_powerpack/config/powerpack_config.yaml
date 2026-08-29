@@ -57,7 +57,7 @@
     # (angle = (orig_mV - offset) * gain,  orig_mV = (4125 - raw*3300/4095) / 0.825)
     EncoderCalibration:
       boards:
-        "17": { raw_0deg: 1200.0, raw_90deg: 2470.0 }
+        "17": { raw_0deg: 2114.0, raw_90deg: 3392.0 }   # 20260829 재장착 후 재측정 (이전 1200/2470)
         "18": { raw_0deg: 860.0,  raw_90deg: 2000.0 }
         "19": { raw_0deg: 2115.0, raw_90deg: 3155.0 }
 
@@ -129,7 +129,7 @@
         # Board 17~22: 엔코더 보드 (angle = (orig_mV - offset) * gain [deg])
         # 반전증폭 역산 후 orig_mV 기준: 1740mV=0도, 3127mV=105도
         # gain = 105 / (3127 - 1740) ≈ 0.07570 deg/mV
-        "17": { offset: 3827.8388,  gain: -0.07254921 }   # can_monitor.py ENCODER_RAW_POINTS[17] = raw 1200,2470 @0°/90°
+        "17": { offset: 2935.0427,  gain: -0.07209507 }   # can_monitor.py ENCODER_RAW_POINTS[17] = raw 2114,3392 @0°/90°
         "18": { offset: 4159.9512,  gain: -0.08082237 }   # can_monitor.py ENCODER_RAW_POINTS[18] = raw 860,2000 @0°/90°
         "19": { offset: 2934.0659,  gain: -0.08859375 }   # can_monitor.py ENCODER_RAW_POINTS[19] = raw 2115,3155 @0°/90°
         "20": { offset: 1740.0,  gain: 0.07570 }    # encoder ch3
