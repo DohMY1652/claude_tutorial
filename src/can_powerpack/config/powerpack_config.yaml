@@ -48,13 +48,18 @@
     encoder_gain: 0.07570    # deg/mV = 105 / (3127 - 1740)                        — 보드별 override 없을 때 기본값
 
     # 보드별 엔코더 캘리브레이션 override (raw ADC 실측 2점 보정: 0도/90도)
+    #
+    # **반드시 실수로 적을 것** (1200 이 아니라 1200.0). 정수로 적으면
+    # declare_parameter<double> 이 타입 불일치로 던지고, 이 rclcpp 버전에서는 그 뒤
+    # get_parameter 도 실패해 값이 통째로 무시된다. 그러면 브리지가 일반 기본값
+    # (offset 1740.0, gain +0.0757) 으로 돌아 0도가 158도로 읽힌다.
     # raw_0deg/raw_90deg 값만 입력하면 CanBridge가 offset/gain을 자동 계산함
     # (angle = (orig_mV - offset) * gain,  orig_mV = (4125 - raw*3300/4095) / 0.825)
     EncoderCalibration:
       boards:
-        "17": { raw_0deg: 1200, raw_90deg: 2470 }
-        "18": { raw_0deg: 860,  raw_90deg: 2000 }
-        "19": { raw_0deg: 2115, raw_90deg: 3155 }
+        "17": { raw_0deg: 1200.0, raw_90deg: 2470.0 }
+        "18": { raw_0deg: 860.0,  raw_90deg: 2000.0 }
+        "19": { raw_0deg: 2115.0, raw_90deg: 3155.0 }
 
 # ==========================================
 # Node 2: PP Controller (Control Algorithm)

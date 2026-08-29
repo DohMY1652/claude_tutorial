@@ -74,7 +74,8 @@ def _setup(context, *_a, **_k):
         executable='can_bridge_node',
         name='can_bridge',
         namespace='pack2',
-        output='log',
+        output='screen',   # 'log' 였다 — 엔코더 캘리브레이션 실패 ERROR 가 터미널에
+                           # 안 떠서 0도가 158도로 읽히는 것을 며칠 못 봤다,
         parameters=[config_path, *fitted, bridge_overrides],
     )
 
