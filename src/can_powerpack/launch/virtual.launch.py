@@ -81,6 +81,7 @@ def _launch_setup(context, *_args, **_kwargs):
         if f.endswith('valve_params.yaml'):
             sim_params.update(_load_params(f, f'/{NAMESPACE}/pp_controller'))
 
+
     sim_params['actuator_connected'] = actuator_connected
 
     ctrl_overrides = {'actuator_connected': actuator_connected}
@@ -98,6 +99,23 @@ def _launch_setup(context, *_args, **_kwargs):
         except ValueError:
             ctrl_overrides[k.strip()] = v.strip() in ('true', 'True') if v.strip() in (
                 'true', 'True', 'false', 'False') else v.strip()
+
+    # 축 선택: axis:=N 이면 **물리 채널 N 하나만** 돌린다.
+    #
+    # 채널별 부피·밸브는 채널을 하나씩 돌려야 잴 수 있다. 여럿을 같이 돌리면
+    # 같은 레일을 나눠 쓰느라 차압이 흔들려 추정이 흩어진다 (6축 로그에서 같은
+    # 채널이 창마다 0.15~2.45 배로 튀었다 — HANDOFF S-20).
+    #
+    # num_actuators=1 로 두고 axis0 의 gid 를 N 으로 돌려놓는 것과 같다.
+    # 명시적으로 준 num_actuators / ctrl_overrides 가 있으면 그쪽을 존중한다.
+    axis = LaunchConfiguration('axis').perform(context)
+    if axis:
+        a = int(axis)
+        npos = int(ctrl_overrides.get('num_positive_channels', 6))
+        ctrl_overrides.setdefault('num_actuators', 1)
+        ctrl_overrides.setdefault('PositionController.axis0.pos_gid', a)
+        ctrl_overrides.setdefault('PositionController.axis0.neg_gid', npos + a)
+        ctrl_overrides.setdefault('PositionController.axis0.actuator_idx', a)
 
     virtual_system = Node(
         package='can_powerpack',
@@ -148,6 +166,9 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'solver', default_value='',
             description="비우면 yaml 값 사용. 'qp' 또는 'mppi'. 채널 MPC 의 솔버를 고른다."),
+        DeclareLaunchArgument(
+            'axis', default_value='',
+            description='물리 채널 하나만 돌린다 (예: axis:=2 → 양압 ch2 / 음압 ch8 / 엔코더 board19). 채널별 부피·밸브를 하나씩 잴 때 쓴다.'),
         DeclareLaunchArgument(
             'overrides', default_value='',
             description="쉼표로 구분한 파라미터 오버라이드. 예: "

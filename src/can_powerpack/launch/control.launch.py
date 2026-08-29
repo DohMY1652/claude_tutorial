@@ -40,6 +40,23 @@ def _setup(context, *_a, **_k):
             overrides[k.strip()] = (vs in ('true', 'True')) if vs in (
                 'true', 'True', 'false', 'False') else vs
 
+    # 축 선택: axis:=N 이면 **물리 채널 N 하나만** 돌린다.
+    #
+    # 채널별 부피·밸브는 채널을 하나씩 돌려야 잴 수 있다. 여럿을 같이 돌리면
+    # 같은 레일을 나눠 쓰느라 차압이 흔들려 추정이 흩어진다 (6축 로그에서 같은
+    # 채널이 창마다 0.15~2.45 배로 튀었다 — HANDOFF S-20).
+    #
+    # num_actuators=1 로 두고 axis0 의 gid 를 N 으로 돌려놓는 것과 같다.
+    # 명시적으로 준 num_actuators / overrides 가 있으면 그쪽을 존중한다.
+    axis = LaunchConfiguration('axis').perform(context)
+    if axis:
+        a = int(axis)
+        npos = int(overrides.get('num_positive_channels', 6))
+        overrides.setdefault('num_actuators', 1)
+        overrides.setdefault('PositionController.axis0.pos_gid', a)
+        overrides.setdefault('PositionController.axis0.neg_gid', npos + a)
+        overrides.setdefault('PositionController.axis0.actuator_idx', a)
+
     # can_bridge 에도 **자기가 선언한 키만** 넘긴다. overrides 를 통째로 넘기면
     # MPC_parameters.* 처럼 브리지가 선언하지 않은 파라미터가 섞여 노드가 뜨지 않는다.
     #
@@ -96,6 +113,9 @@ def generate_launch_description():
                               description='축(=채널쌍) 수. 1..6. 비우면 yaml 값'),
         DeclareLaunchArgument('actuator_connected', default_value='',
                               description='true|false. 비우면 yaml 값'),
+        DeclareLaunchArgument('axis', default_value='',
+            description='물리 채널 하나만 돌린다 (예: axis:=2 → 양압 ch2 / 음압 ch8 / '
+                        '엔코더 board19). 채널별 부피·밸브를 하나씩 잴 때 쓴다.'),
         DeclareLaunchArgument('overrides', default_value='',
                               description="쉼표 구분 파라미터 오버라이드 (a.b=1.5,...)"),
         OpaqueFunction(function=_setup),

@@ -1880,10 +1880,34 @@ Controller::~Controller()
 }
 
 void Controller::build_mpcs() {
+  // 활성 채널은 **축별 gid 설정**에서 온다. 예전에는 0..num_actuators-1 로
+  // 하드코딩돼 있어서, PositionController.axisN.pos_gid 를 바꿔도 그 채널의
+  // MPC 가 만들어지지 않아 무시됐다.
+  //
+  // 이 덕분에 축 하나로 임의의 물리 채널을 돌릴 수 있다 (채널별 부피·밸브를
+  // 하나씩 재려면 필수다 — 여럿을 같이 돌리면 레일을 나눠 쓰느라 차압이 흔들려
+  // 측정이 흩어진다).
+  //   예: ch2 만 → num_actuators=1, axis0.pos_gid=2, axis0.neg_gid=8,
+  //               axis0.actuator_idx=2   (control.launch.py 의 axis:=2 가 이걸 한다)
+  //
+  // 주의: pos_ctrl_cfg_ 는 이 함수보다 **뒤에** 로드되므로 파라미터를 직접 읽는다.
   active_channels_.clear();
   for (int i = 0; i < num_actuators_; ++i) {
-    active_channels_.insert(i);                              // 양압 gid 0..N-1
-    active_channels_.insert(num_positive_channels_ + i);    // 음압 gid num_pos..num_pos+N-1
+    const std::string pfx = "PositionController.axis" + std::to_string(i) + ".";
+    const int pg = get_param_or<int>(this, pfx + "pos_gid", i);
+    const int ng = get_param_or<int>(this, pfx + "neg_gid", num_positive_channels_ + i);
+    if (pg >= 0 && pg < num_total_channels_) active_channels_.insert(pg);
+    else RCLCPP_ERROR(get_logger(), "axis%d.pos_gid=%d 가 범위 밖이다 (0~%d)",
+                      i, pg, num_total_channels_ - 1);
+    if (ng >= 0 && ng < num_total_channels_) active_channels_.insert(ng);
+    else RCLCPP_ERROR(get_logger(), "axis%d.neg_gid=%d 가 범위 밖이다 (0~%d)",
+                      i, ng, num_total_channels_ - 1);
+  }
+  {
+    std::string s;
+    for (int gid : active_channels_) { char b[16]; snprintf(b, sizeof(b), " %d", gid); s += b; }
+    RCLCPP_INFO(get_logger(), "[활성 채널 gid]%s  (보드 = gid + %d)",
+                s.c_str(), channel_board_offset_);
   }
   const std::set<int>& active_channels = active_channels_;
 

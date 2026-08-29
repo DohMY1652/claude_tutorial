@@ -1372,3 +1372,52 @@ kPa (A 는 34~73) 로 커져 밸브가 잠깐만 열려도 왈칵 쏟아지고, 
 
 기동 직후 챔버·레일이 모두 대기압일 때 "여유 +1 kPa" 라고 경고가 떴다. 목표가
 대기압 ±5 kPa 안이면(=사실상 수요 없음) 알리지 않게 했다.
+
+---
+
+## S-21. 축 선택 — 채널을 하나씩 돌린다 (2026-08-29)
+
+채널별 부피·밸브는 **채널을 하나씩** 돌려야 잴 수 있다. 여럿을 같이 돌리면 같은
+레일을 나눠 쓰느라 차압이 흔들려 추정이 흩어진다 (S-20: 같은 채널이 창마다
+0.15~2.45 배로 튀었다).
+
+### 무엇이 막고 있었나
+
+`PositionController.axisN.pos_gid` / `neg_gid` / `actuator_idx` 는 이미 파라미터화
+돼 있었다. 그런데 `build_mpcs()` 가 활성 채널을 **`0..num_actuators-1` 로 하드코딩**
+해서, gid 를 바꿔도 그 채널의 MPC 가 만들어지지 않아 무시됐다.
+
+활성 채널을 축별 gid 설정에서 도출하도록 고쳤다. 기동 시 확인용 한 줄을 찍는다:
+```
+[활성 채널 gid] 2 8  (보드 = gid + 5)
+```
+(`pos_ctrl_cfg_` 는 `build_mpcs()` 보다 뒤에 로드되므로 파라미터를 직접 읽는다.)
+
+### 쓰는 법
+
+```bash
+ros2 launch can_powerpack control.launch.py axis:=2 actuator_connected:=false overrides:=period_ms=3
+```
+
+`axis:=N` 하나면 된다 — `num_actuators=1`, `axis0.pos_gid=N`,
+`axis0.neg_gid=6+N`, `axis0.actuator_idx=N` 을 대신 넣어 준다. 명시적으로 준
+`num_actuators` 나 `overrides` 가 있으면 그쪽을 존중한다 (`setdefault`).
+
+각도는 하나만 보낸다:
+```bash
+python3 src/can_powerpack/scripts/position_ref_client.py 127.0.0.1 2293
+# "컨트롤러 축 수 = 1" 확인 후 "70" 처럼 한 개
+```
+
+검증 (시뮬 `axis:=2`, 목표 70°): ch2 만 159.3 kPa 로 올라가고 오차 +0.27,
+나머지 다섯 채널은 대기압 그대로에 밸브 전류 0.0 mA.
+
+### 부피 측정 절차
+
+채널마다 60 초 이상, 압력을 오르내리게 한 뒤:
+```bash
+python3 src/can_powerpack/scripts/chamber_volume_from_log.py \
+    ~/result/<ch0>/<ch0>.csv ~/result/<ch1>/<ch1>.csv ... --axes 6
+```
+여러 로그를 함께 주면 각 로그에서 자기 채널만 뽑아 합친다. 창 간 흩어짐이 3 배를
+넘으면 스스로 경고한다. 결과를 `channel_config.chN.volume_ml` 에 넣는다.
