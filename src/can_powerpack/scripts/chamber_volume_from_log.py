@@ -71,6 +71,56 @@ def inv_volume(A, ax, lo, hi):
     return float(np.median(dP[m][ok] / (line[m][ok] * ph[ok]))), int(ok.sum())
 
 
+def integral_volume(A, ax, vp):
+    """충전 구간 **전체를 적분**해 절대 부피를 낸다.
+
+    ∫q dt = ΔP·V/(R·T·lpm2kgps/1000)  이고  q = A_eff(I)·Pin·φ 이므로
+        V = (R·T·lpm2kgps/1000)·∫A_eff·Pin·φ dt / ΔP
+    순간 dP/dt 를 쓰는 방법과 달리 밸브 2차 동특성(τ≈25 ms)이 적분에서 상쇄되고,
+    한 구간이 통째로 한 표본이 되어 잡음에도 강하다.
+
+    대신 밸브 모델 A_eff(I) 의 **절대값**에 의존한다. 모델이 일정 배율로 틀리면
+    모든 채널이 같은 배율로 틀린다 — 채널 간 비율은 그대로 옳다.
+    """
+    t = A['time_sec']
+    act = A[f'p_pos_actual_kpa_axis{ax}']
+    line = A['p_line_pos_kpa']
+    c1 = A[f'cur_mA_pos_bd{ax + 5}_v1micro_axis{ax}']
+    c2 = A[f'cur_mA_pos_bd{ax + 5}_v2atm_axis{ax}']
+    c3 = A[f'cur_mA_pos_bd{ax + 5}_v3macro_axis{ax}']
+
+    Am, ks, Ck, Cp, Cz = vp['A_max'], vp['k_shape'], vp['C_k'], vp['C_p'], vp['C_z']
+
+    def a_eff(I_a, pin):
+        x = ks * (I_a + Cz * 0.0 + Cp * pin - Ck)
+        return Am / (1.0 + math.exp(-x)) if -x < 700 else 0.0
+
+    # 충전만 있는 연속 구간: micro 통전, 배기·macro 닫힘, 레일이 충분히 높음
+    ok = (c1 > 60) & (c2 < 8) & (c3 < 8) & (line > act + MIN_DP)
+    out = []
+    i = 0
+    n = len(t)
+    while i < n:
+        if not ok[i]:
+            i += 1; continue
+        j = i
+        while j < n and ok[j]:
+            j += 1
+        seg = slice(i, j)
+        dur = t[j - 1] - t[i]
+        dP = act[j - 1] - act[i]
+        if dur >= 0.25 and dP >= 3.0:
+            # 전류는 mA 로 기록된다. 모델의 F_net 은 A 단위다.
+            q = np.array([a_eff(c / 1000.0, p) * p * phi(p, a)
+                          for c, p, a in zip(c1[seg], line[seg], act[seg])])
+            iq = float(np.trapz(q, t[seg]))                 # [LPM·s]
+            if iq > 1e-9:
+                V = iq * LPM2KGPS * RGAS * TEMPK / 1000.0 / dP   # [m^3]
+                out.append((V * 1e6, dur, dP, int(j - i)))       # mL
+        i = j
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('csv', nargs='+')
@@ -104,6 +154,49 @@ def main():
         spread = float(vals.max() / vals.min()) if vals.min() > 0 else float('inf')
         inv[ax] = float(np.median(vals))
         print(f"{ax:3d} {len(rows):6d} {ntot:7d} {inv[ax]:10.4f} {spread:7.1f}x")
+
+    # ── 적분법 (절대 부피) ────────────────────────────────────────────
+    import yaml
+    vpath = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         '..', 'config', 'valve_params.yaml')
+    vp_all = None
+    try:
+        vp_all = yaml.safe_load(open(os.path.normpath(vpath)))[
+            '/pack2/pp_controller']['ros__parameters']['channel_config']
+    except Exception as e:
+        print(f'\n(적분법 건너뜀 — valve_params.yaml 을 못 읽었다: {e})')
+
+    if vp_all is not None:
+        print()
+        print('=== 적분법 (충전 구간 전체를 적분한 절대 부피) ===')
+        print(f"{'축':>3s} {'구간수':>7s} {'중앙 mL':>9s} {'사분위 mL':>16s} {'총 ΔP':>8s}")
+        absv = {}
+        for path in a.csv:
+            rows = list(csv.DictReader(open(path)))
+            if not rows:
+                continue
+            A = {k: np.array([float(r[k]) for r in rows]) for k in rows[0]}
+            for ax in range(a.axes):
+                key = f'ch{ax}'
+                if key not in vp_all:
+                    continue
+                vp = {k: float(vp_all[key]['micro'][k])
+                      for k in ('A_max', 'k_shape', 'C_k', 'C_p', 'C_z')}
+                segs = integral_volume(A, ax, vp)
+                if segs:
+                    absv.setdefault(ax, []).extend(segs)
+        for ax in sorted(absv):
+            vs = np.array([s[0] for s in absv[ax]])
+            dp = sum(s[2] for s in absv[ax])
+            q1, q3 = np.percentile(vs, [25, 75])
+            print(f'{ax:3d} {len(vs):7d} {np.median(vs):9.1f} {q1:7.1f}~{q3:6.1f} {dp:8.0f}')
+        if absv:
+            print()
+            print('powerpack_config.yaml 에 넣을 형태 (적분법):')
+            for ax in sorted(absv):
+                vs = np.array([s[0] for s in absv[ax]])
+                print(f'      ch{ax}:')
+                print(f'        volume_ml: {np.median(vs):.1f}')
 
     if not inv:
         return 2
