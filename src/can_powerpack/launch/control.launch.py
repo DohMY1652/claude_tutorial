@@ -5,7 +5,41 @@ from launch_ros.actions import Node
 import os
 from ament_index_python.packages import get_package_share_directory, get_package_prefix
 
+
+# ── 겹치는 노드 감시 ──────────────────────────────────────────────────────
+# virtual.launch.py 의 시뮬레이터는 `name='can_bridge'` 로 실기 브리지의 **노드 이름을
+# 그대로 뺏어 쓴다.** 둘 다 떠 있으면 같은 토픽에 번갈아 퍼블리시하고, 구독자는 실기값과
+# 시뮬값을 섞어 받는다. ROS 는 이걸 오류로 보지 않는다. 20260829 에 시뮬레이터를 안 내린
+# 채로 20 분간 실험 4 회를 날렸다 — 엔코더가 0°↔105° 로 튀고 대기압인 board 5 가
+# 305 kPa 로 읽혔다. 띄우기 전에 막는다.
+def _abort_if_conflicting(other_pattern, other_name, this_name):
+    import os, subprocess
+    r = subprocess.run(['pgrep', '-af', other_pattern], capture_output=True, text=True)
+    if r.returncode != 0:
+        return
+    # pgrep -f 는 **명령줄 어디든** 걸린다 — 이름만 언급한 셸 한 줄(`pkill -f
+    # virtual_powerpack` 같은 것)까지 잡아 엉뚱하게 막는다. argv[0] 의 basename 이
+    # 정확히 일치하는, 진짜 그 실행 파일인 프로세스만 남긴다.
+    hits = []
+    for ln in r.stdout.splitlines():
+        pid, _, cmd = ln.partition(' ')
+        if not cmd or pid == str(os.getpid()):
+            continue
+        if os.path.basename(cmd.split()[0]) == other_pattern:
+            hits.append(ln)
+    if not hits:
+        return
+    procs = '\n'.join('      ' + ln for ln in hits)
+    raise RuntimeError(
+        f"\n\n  {other_name} 이(가) 이미 돌고 있다 — {this_name} 과 노드 이름이 겹친다.\n"
+        f"{procs}\n\n"
+        f"  둘 다 /pack2/can_bridge 라 같은 토픽에 번갈아 퍼블리시한다. 그 데이터는\n"
+        f"  실기값과 시뮬값이 섞인 쓰레기다 (ROS 는 경고조차 안 한다).\n\n"
+        f"      pkill -f {other_pattern}\n\n"
+        f"  로 내리고 다시 띄울 것.\n")
+
 def _setup(context, *_a, **_k):
+    _abort_if_conflicting('virtual_powerpack', '시뮬레이터(virtual.launch.py)', '실기 브리지')
     pkg_share   = get_package_share_directory('can_powerpack')
     pkg_prefix  = get_package_prefix('can_powerpack')
     config_path  = os.path.join(pkg_share,  'config', 'powerpack_config.yaml')

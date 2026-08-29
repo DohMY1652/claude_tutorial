@@ -292,6 +292,25 @@ void CanBridge::diag_routine() {
     }
   }
   RCLCPP_INFO(get_logger(), "CAN 수신 [%s]", alive.c_str());
+
+  // ── 같은 토픽에 다른 퍼블리셔가 있나 ────────────────────────────────
+  // virtual.launch.py 의 시뮬레이터(virtual_powerpack)는 `name='can_bridge'` 로
+  // **이 노드 이름을 그대로 뺏어 쓴다.** 그래서 시뮬레이터를 안 내리고 실기를 띄우면
+  // 두 노드가 같은 토픽에 번갈아 퍼블리시하고, 구독자는 실기값과 시뮬값을 섞어 받는다.
+  // ROS 는 이걸 오류로 보지 않는다 — 조용히 절반씩 섞인다. 20260829 에 20 분 동안
+  // 이 상태로 실험 4 회를 날렸다: 엔코더가 0°↔105° 로 튀고, 대기압인 board 5 가
+  // 305 kPa 로 읽혔다. can_monitor.py 는 CAN 을 직접 읽어 멀쩡했기에 더 헷갈렸다.
+  {
+    const int n = count_publishers(pub_sensors_->get_topic_name());
+    if (n > 1)
+      RCLCPP_ERROR(get_logger(),
+        "토픽 %s 에 퍼블리셔가 **%d 개**다 — 이 노드 말고 다른 놈이 같은 토픽에 쓰고 있다. "
+        "십중팔구 virtual.launch.py 시뮬레이터가 안 죽고 남아 있는 것이다 (그놈도 노드 "
+        "이름이 can_bridge 다). 이 상태의 데이터는 실기값과 시뮬값이 **번갈아 섞인** "
+        "쓰레기다. `pkill -f virtual_powerpack` 로 내리고 다시 띄울 것.",
+        pub_sensors_->get_topic_name(), n);
+  }
+
   if (!dead.empty())
     RCLCPP_ERROR(get_logger(),
       "CAN 수신 없음: board %s — 프레임이 **0** 이다. 0 이면 배선·전원·펌웨어 문제이고, "
@@ -406,6 +425,11 @@ void CanBridge::sensor_routine() {
   for (size_t i = 0; i < a_raw.size(); ++i) {
     int board_id = ANALOG_BOARD_START + (int)i;
     if (!active_encoder_boards_.empty() && !active_encoder_boards_.count(board_id)) continue;
+    // raw 0 = 그 보드 프레임을 **한 번도 못 받았다** (배선/전원/펌웨어). 그대로
+    // 역산하면 (4125−0)/0.825 = 5000 mV 라 기본 보정에서 246.8° 같은 큰 각도가
+    // 나온다. 그 값이 위치 제어로 흘러가면 오차가 통째로 뒤집힌다 — 0° 로 둔다.
+    // (프레임이 정말 0 인 보드는 diag_routine 이 매 주기 ERROR 로 따로 짖는다.)
+    if (a_raw[i] == 0) { msg_a.data[i] = 0.0; continue; }
     double adc_mv = std::clamp((double)a_raw[i] * (3300.0 / 4095.0), 0.0, 3300.0);
     double orig_mv = (4125.0 - adc_mv) / 0.825;
     msg_a.data[i] = (orig_mv - enc_offset_[board_id]) * enc_gain_[board_id];
