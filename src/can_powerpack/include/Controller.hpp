@@ -251,6 +251,7 @@ public:
     float q_trim_limit = 2.0f;     // 유량 배율 보정 상한 (2.0 = 최대 3배/1/3배)
     float crack_floor_rate_kpas = 5.0f;  // |dP/dt| 가 이보다 작을 때만 크래킹 하한을 건다
     float crack_floor_min_err_kpa = 1.5f; // 오차가 이보다 클 때만 크래킹 하한을 건다
+    float crack_floor_stall_ms{250.0f};   // 정체가 이만큼 지속돼야 하한을 건다 [ms]
     float integ_hold_rate_kpas = 0.0f;    // >0 이면: 압력이 그보다 빠르면 적분 멈춤 (0=끔)
     float integ_deadzone_boost = 1.0f;    // 데드존(무반응)에서 적분 배속 (1=평소대로)
     ControlAug aug{};                 // Controller 가 매 틱 최신값을 밀어 넣는다
@@ -412,6 +413,8 @@ private:
   bool  u_lpf_init_{false};
   bool  safety_latched_ext_{false};
   float dpdt_f_{0.0f};        // 측정 압력 변화율 [kPa/s], τ=100 ms
+  int   crack_stall_cnt_{0};  // 정체 누설 카운터 (정체 +1 / 반응 −2)
+  bool  crack_latched_{false};// 크래킹 하한이 걸려 있나
   float p_prev_meas_{-1.0f};  // 직전 틱 측정압 [kPa] (유량 역산용)
   float neg_error_integral_{0.0f};
 
@@ -752,6 +755,7 @@ private:
     double q_trim_limit{2.0};
     double crack_floor_rate_kpas{5.0};
     double crack_floor_min_err_kpa{1.5};
+    double crack_floor_stall_ms{250.0};
     double integ_hold_rate_kpas{0.0};
     double integ_deadzone_boost{1.0};
     // 솔버 선택 + MPPI 하이퍼파라미터

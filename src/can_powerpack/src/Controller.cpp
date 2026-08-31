@@ -1008,11 +1008,44 @@ void AcadosMpc::finish(const std::array<float,3>& du3,
   //   (n2)가 하한으로 발사돼 +8.5 kPa 를 밀어 올렸고 2.8 Hz 진동이 재개됐다.
   // 이 문턱 아래에서는 적분 트림(하한 뒤에 더해진다)이 계속 다듬으므로
   // 정상상태 오차가 남지는 않는다.
-  if (err_abs_ >= cfg_.crack_floor_min_err_kpa &&
-      want_sign_ * dpdt_f_ < cfg_.crack_floor_rate_kpas) {
-    for (int j = 0; j < 3; ++j) {
-      if (u_want_[(size_t)j] && u0[(size_t)j] < u_crack_[(size_t)j])
-        u0[(size_t)j] = std::clamp(u_crack_[(size_t)j], 0.0f, 100.0f);
+  // ── 정체 **지속** 을 봐야 한다 (S-43) ──────────────────────────────────
+  //
+  // 예전에는 위 두 조건이 **그 순간** 참이면 바로 하한을 걸었다. 그런데
+  // dpdt_f_ 는 τ=100 ms 로 걸러도 잡음이 크다 (계단 직후 정체 구간에서도
+  // σ=3.4 kPa/s, +5 를 10% 의 시간 동안 넘는다). 그래서 하한이 간헐적으로만
+  // 걸렸고, 정작 구제해야 할 0.3~1.0 초 정체는 못 살렸다.
+  //
+  // 로그 재현(20260829_224219/_224816, 3 축): 예전 조건(1.5 kPa·즉시)이면
+  // 전체 시간의 **33~66%** 동안 하한이 걸린 상태가 된다 — 그건 하한이 아니라
+  // 상시 개방이고, 목표 근처에서 릴레이 진동을 만든다.
+  //
+  // 대신 **누설 카운터**로 "정체가 얼마나 지속됐나" 를 센다.
+  //   정체 1 틱 → +1,  반응하거나 오차가 작으면 → −2 (그리고 래치 해제)
+  // 잡음은 0 근처에 머물고 진짜 정체만 쌓인다. 같은 로그로 문턱을 골랐다:
+  //
+  //     오차문턱  지속   발동횟수(계단직후)   하한이 걸린 시간
+  //       1.5    즉시     326~497 (48~52%)     33~66%   ← 예전
+  //       5.0   150 ms     90~141 (52~61%)      7~12%
+  //     **8.0   250 ms     28~ 40 (59~83%)    1.4~4.0%**  ← 채택
+  //
+  // 오차 8 kPa 문턱은 유지 중 압력오차 중앙값(약 3 kPa)보다 충분히 위라
+  // 정상 유지에서는 아예 안 걸린다.
+  {
+    const int need = (dt_sec_ > 1e-6)
+        ? std::max(1, (int)std::lround(cfg_.crack_floor_stall_ms / 1000.0 / dt_sec_)) : 1;
+    const bool big_err    = (err_abs_ >= cfg_.crack_floor_min_err_kpa);
+    const bool responding = (want_sign_ * dpdt_f_ > cfg_.crack_floor_rate_kpas);
+    if (!big_err || responding) {
+      crack_stall_cnt_ = std::max(0, crack_stall_cnt_ - 2);
+      crack_latched_ = false;
+    } else if (++crack_stall_cnt_ >= need) {
+      crack_latched_ = true;
+    }
+    if (crack_latched_) {
+      for (int j = 0; j < 3; ++j) {
+        if (u_want_[(size_t)j] && u0[(size_t)j] < u_crack_[(size_t)j])
+          u0[(size_t)j] = std::clamp(u_crack_[(size_t)j], 0.0f, 100.0f);
+      }
     }
   }
 
@@ -1272,6 +1305,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.q_trim_limit          = get_param_or<double>(this, "MPC_parameters.q_trim_limit", 2.0);
   mpc_.crack_floor_rate_kpas = get_param_or<double>(this, "MPC_parameters.crack_floor_rate_kpas", 5.0);
   mpc_.crack_floor_min_err_kpa = get_param_or<double>(this, "MPC_parameters.crack_floor_min_err_kpa", 1.5);
+  mpc_.crack_floor_stall_ms = get_param_or<double>(this, "MPC_parameters.crack_floor_stall_ms", 250.0);
   mpc_.integ_hold_rate_kpas    = get_param_or<double>(this, "MPC_parameters.integ_hold_rate_kpas", 0.0);
   mpc_.integ_deadzone_boost    = get_param_or<double>(this, "MPC_parameters.integ_deadzone_boost", 1.0);
 
@@ -2089,6 +2123,7 @@ void Controller::build_mpcs() {
       cfg.q_trim_limit          = (float)mpc_.q_trim_limit;
       cfg.crack_floor_rate_kpas = (float)mpc_.crack_floor_rate_kpas;
       cfg.crack_floor_min_err_kpa = (float)mpc_.crack_floor_min_err_kpa;
+      cfg.crack_floor_stall_ms   = (float)mpc_.crack_floor_stall_ms;
       cfg.integ_hold_rate_kpas    = (float)mpc_.integ_hold_rate_kpas;
       cfg.integ_deadzone_boost    = (float)mpc_.integ_deadzone_boost;
 
