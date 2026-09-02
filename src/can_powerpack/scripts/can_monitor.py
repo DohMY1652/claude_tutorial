@@ -120,7 +120,12 @@ ENCODER_RAW_POINTS = {
     17: (907, 2200),   # raw 2114 @ 0도, raw 3392 @ 90도 — 20260829 재장착 후 재측정
     18: (904, 2205),   # raw 1120 @ 0도, raw 2350 @ 90도 — 20260829 재측정
     19: (907, 2200),   # raw 160 @ 0도, raw 1444 @ 90도
+    20: (904, 2200),
+    21: (907, 2200),
+    22: (907, 2200),
 }
+
+
 
 
 # ── yaml 이 있으면 위 하드코딩 값을 덮어쓴다 (단일 출처) ──
@@ -137,6 +142,39 @@ else:
 board_data = {i: [0.0, 0.0, 0.0, 0.0] for i in range(1, 23)} # [I1, I2, I3, Pressure]
 encoder_raw = {i: (0, 0, 0, 0) for i in range(17, 23)}       # 엔코더 보드 raw ADC (Raw1~Raw4)
 last_recv_time = {i: 0.0 for i in range(1, 23)}
+
+# ── 보드별 수신 주파수 ──────────────────────────────────────────────────────
+# 왜 필요한가: 20260902 에 브리지의 CAN **송신 주기**가 4 ms(250 Hz)로 너무 빨라
+# 보드들이 자기 프레임을 못 내보냈다. 보드 16~22 가 1~2 Hz 로 굶었고, 그 결과
+# 밸브 지령이 1.1 초 늦게 도착해 챔버가 304 kPa 까지 올라갔다(과압한계 190).
+# 그때 이 증상은 **브리지 로그에만** 보였다 — 이 모니터로도 바로 보이게 한다.
+# 실측 기준(20260902): 브리지 없이 can_monitor 단독이면 **전 보드 500 Hz**
+# (총 11000 f/s). 브리지가 붙으면 그 송신 주기만큼 깎인다 —
+#   TX 50 ms → 보드당 약 420 Hz,  TX 30 ms → 약 360 Hz,
+#   TX  4 ms → 보드 1~10 은 200 Hz, 보드 16~22 는 **0~7 Hz (죽는다)**
+# 100 Hz 아래면 병든 것이다.
+rx_count_board = {i: 0 for i in range(1, 23)}     # 누적 수신 프레임
+_hz_prev_cnt   = {i: 0 for i in range(1, 23)}     # 직전 창의 누적값
+_hz_value      = {i: 0.0 for i in range(1, 23)}   # 계산된 주파수 [Hz]
+_hz_last_t     = 0.0
+HZ_WINDOW_S    = 1.0                              # 주파수 산출 창
+
+
+def update_board_hz():
+    """HZ_WINDOW_S 마다 보드별 수신 주파수를 갱신한다."""
+    global _hz_last_t
+    now = time.time()
+    if _hz_last_t == 0.0:
+        _hz_last_t = now
+        return
+    dt = now - _hz_last_t
+    if dt < HZ_WINDOW_S:
+        return
+    for i in range(1, 23):
+        c = rx_count_board[i]
+        _hz_value[i] = (c - _hz_prev_cnt[i]) / dt
+        _hz_prev_cnt[i] = c
+    _hz_last_t = now
 running = True
 
 # 통계
@@ -237,13 +275,28 @@ def rx_thread_func(ch):
                     board_data[board_id] = [val_pa4, val_pa5, val_pa6, val_pa7]
 
                 last_recv_time[board_id] = time.time()
+                rx_count_board[board_id] += 1
 
         except (canlib.canNoMsg, canlib.canError):
             continue
 
 # ================= 5. 메인: 대시보드 출력 =================
+def _hz_str(hz):
+    """주파수를 표시하고 병든 값에 표시를 단다.
+
+    단독 500 Hz, 브리지 붙으면 360~420 Hz 가 정상이다. 브리지 송신 주기가
+    너무 빠르면 **번호가 높은 보드부터** 굶는다 (20260902: 보드 16~22 가 0~7 Hz).
+    `?` = 250 Hz 미만, `!` = 100 Hz 미만, `!!` = 사실상 죽음.
+    """
+    if hz <= 0.5:   return f"{hz:6.0f}!!"
+    if hz < 100.0:  return f"{hz:6.0f} !"
+    if hz < 250.0:  return f"{hz:6.0f} ?"
+    return f"{hz:6.0f}  "
+
+
 def print_dashboard():
     now = time.time()
+    update_board_hz()
 
     # 화면 갱신용 문자열 생성
     output = "\033[H"  # 커서 홈으로 이동
@@ -253,8 +306,8 @@ def print_dashboard():
     output += f" [System] RX Count: {rx_count}\n"
     output += f" [Formula] P = (Orig_mV - Offset) * Gain + 101.325\n"
     output += f"------------------------------------------------------------------\n"
-    output += f"|  ID  |  I1 (mA)  |  I2 (mA)  |  I3 (mA)  | Pressure(kPa) | State |\n"
-    output += f"|------|-----------|-----------|-----------|---------------|-------|\n"
+    output += f"|  ID  |  I1 (mA)  |  I2 (mA)  |  I3 (mA)  | Pressure(kPa) |   Rx(Hz) | State |\n"
+    output += f"|------|-----------|-----------|-----------|---------------|----------|-------|\n"
 
     active_cnt = 0
     for bid in range(1, 17):
@@ -266,12 +319,13 @@ def print_dashboard():
         else:
             status = "Lost"
         p_str = f"{vals[3]:8.3f}"
-        output += f"|  {bid:02d}  | {vals[0]:8.1f}  | {vals[1]:8.1f}  | {vals[2]:8.1f}  |   {p_str}    | {status:^5} |\n"
+        output += (f"|  {bid:02d}  | {vals[0]:8.1f}  | {vals[1]:8.1f}  | {vals[2]:8.1f}  |   {p_str}    |"
+                   f" {_hz_str(_hz_value[bid])} | {status:^5} |\n")
 
     output += f"==================================================================\n"
     output += f"\n"
-    output += f"|  ID  |  Raw1 |  Raw2 |  Raw3 |  Raw4 |    Angle (deg)   | State |\n"
-    output += f"|------|-------|-------|-------|-------|------------------|-------|\n"
+    output += f"|  ID  |  Raw1 |  Raw2 |  Raw3 |  Raw4 |    Angle (deg)   |   Rx(Hz) | State |\n"
+    output += f"|------|-------|-------|-------|-------|------------------|----------|-------|\n"
 
     for bid in range(17, 23):
         vals = board_data[bid]
@@ -282,10 +336,19 @@ def print_dashboard():
             active_cnt += 1
         else:
             status = "Lost"
-        output += f"|  {bid:02d}  | {raw[0]:5d} | {raw[1]:5d} | {raw[2]:5d} | {raw[3]:5d} |     {vals[3]:8.2f} deg   | {status:^5} |\n"
+        output += (f"|  {bid:02d}  | {raw[0]:5d} | {raw[1]:5d} | {raw[2]:5d} | {raw[3]:5d} |     {vals[3]:8.2f} deg   |"
+                   f" {_hz_str(_hz_value[bid])} | {status:^5} |\n")
 
     output += f"==================================================================\n"
+    _tot = sum(_hz_value.values())
+    _live = [(b, h) for b, h in _hz_value.items() if last_recv_time[b] != 0]
+    _min = min(_live, key=lambda x: x[1]) if _live else (0, 0.0)
     output += f" Active Boards: {active_cnt} / 22\n"
+    output += (f" [Bus] 총 수신 {_tot:6.0f} f/s   최저 보드 {_min[0]:02d} = {_min[1]:5.0f} Hz"
+               f"   (단독 500 / 브리지와 함께 360~420 Hz 가 정상)\n")
+    if _min[1] < 100.0 and _live:
+        output += (" [경고] 보드가 굶고 있다 — 브리지 CAN **송신 주기**가 너무 빠른지 확인할 것\n"
+                   "        (can_tx_fallback_ms. 4 ms 면 보드 16~22 가 1~2 Hz 로 죽는다. 30 ms 이상 권장)\n")
     output += f" * Press Ctrl+C to exit.\n"
 
     sys.stdout.write(output)
