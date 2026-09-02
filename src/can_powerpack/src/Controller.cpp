@@ -1238,6 +1238,13 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
 : rclcpp::Node("pp_controller", opts)
 {
   period_ms_ = this->declare_parameter<int>("period_ms", 2);  // 2ms default (500Hz event-driven)
+  // 틱 개수로 박혀 있던 상수들을 제어 주기로부터 다시 계산한다 — 주기를 바꿔도
+  // **걸리는 시간이 그대로**여야 한다.
+  {
+    const int p = std::max(1, period_ms_);
+    zero_samples_    = std::max(1, (int)std::lround(ZERO_CALIB_MS       / p));
+    slew_seed_limit_ = std::max(1, (int)std::lround(SLEW_SEED_TIMEOUT_MS / p));
+  }
   enable_thread_pinning_ = this->declare_parameter<bool>("enable_thread_pinning", true);
   cpu_pins_param_ = this->declare_parameter<std::vector<int64_t>>("cpu_pins", std::vector<int64_t>{0,1,2,3});
 
@@ -2252,7 +2259,7 @@ void Controller::slew_targets(double dt_sec) {
       target_angle_slewed_[i] = ang[(size_t)enc];
     }
     target_slew_rate_.assign(target_angle_slewed_.size(), 0.0);
-    if (have || slew_seed_ticks_++ > 500) {   // 500 틱(=1 s @500 Hz) 지나면 0 으로 확정
+    if (have || slew_seed_ticks_++ > slew_seed_limit_) {  // 1 s 지나면 0 으로 확정
       slew_seeded_ = true;
       std::string vs;
       for (size_t i = 0; i < target_angle_slewed_.size(); ++i) {
@@ -2724,7 +2731,7 @@ void Controller::on_timer() {
     }
     sensor_zero_tick_++;
 
-    if (sensor_zero_tick_ >= ZERO_SAMPLES) {
+    if (sensor_zero_tick_ >= zero_samples_) {
       for (int i = 0; i < 16; ++i) {
         if (sensor_zero_cnt_[i] == 0) continue;
         const double meas = sensor_zero_sum_[i] / sensor_zero_cnt_[i];

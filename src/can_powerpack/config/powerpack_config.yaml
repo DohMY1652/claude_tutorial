@@ -40,6 +40,11 @@
     can_rx_watchdog_ms: 200      # 이 시간 프레임이 없으면 안전 상태 (0 = 끔)
     can_diag_period_s: 5.0       # 보드별 수신 Hz 진단 주기 (0 = 끔)
 
+    # **제어 루프 주기.** 컨트롤러의 제어 틱은 board/sensors 구독 콜백에서 돌기
+    # 때문에 이 발행 주기가 곧 제어 주기다. 20260902 에 2 ms(500 Hz) → 10 ms(100 Hz).
+    # pp_controller 의 period_ms 와 **반드시 같은 값**이어야 한다 (공칭 dt 로 쓰인다).
+    sensor_period_ms: 10
+
     num_actuators: 6    # 6축 전체 구동
     current_mode: 0   # 0=Normal(PID), 1=Debug(PWM direct)  — master 기본값으로 복귀. 밸브 피팅(config/valve_params.yaml)은
                       # Debug 모드에서 했으므로, 이 모드에서 크래킹/응답 특성이 다르면 재피팅이 필요할 수 있다.
@@ -70,7 +75,20 @@
 # ==========================================
 /pack2/pp_controller:
   ros__parameters:
-    period_ms: 2
+    # 20260902: 500 Hz(2 ms) → 100 Hz(10 ms).
+    # CAN 실측: 지령 프레임 1개당 보드가 약 1.2 ms 멈춰 센서 수신이 깎인다.
+    # 500 Hz 제어를 해도 can_tx_min_interval_ms 10 ms 가 5 개 중 4 개를 버렸으므로
+    # 실제로 나가던 지령은 이미 100 Hz 였다 — 주기를 맞춰 헛도는 계산을 없앤다.
+    # **주기를 바꿀 때 같이 봐야 하는 것** (전수 조사함):
+    #   · 적분항은 전부 `* dt` 라 무관              ✓
+    #   · vel_raw = Δangle/dt 라 무관               ✓
+    #   · cmd_lpf_hz 는 exp(-2π f dt) 라 무관       ✓
+    #   · MPC_PHASES = 1 이라 채널 데시메이션 없음  ✓
+    #   · obs_bridge_alpha 는 mppi_estimator=false 라 안 쓰임 ✓
+    #   · PressureRefGen 은 gen_period_ms/period_ms 로 데시메이션해 20 ms 유지 ✓
+    #   · vel_filter_alpha 는 **고정 계수라 아래에서 0.03 → 0.15 로 다시 맞췄다**
+    #   · ZERO_SAMPLES / slew_seed 틱은 시간 기준으로 바꿨다 (Controller.cpp)
+    period_ms: 10
     cpu_pins: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 
     # ──────────────────────────────────────────
@@ -686,13 +704,29 @@
         # kd=0.04 를 곱하면 **±2.66 N·m** — 2 kg·150 mm 의 중력 최대치(2.94 N·m)의
         # 90% 다. D 항 잡음 하나가 중력 전체와 맞먹는다.
         #
+        # ── 제어 500 Hz (dt=2 ms) 시절, 원시 잡음 ±158 dps ──
         #   alpha  τ[ms]   vel잡음    kd·vel    중력 대비
-        #    0.30    6.7   ±66 dps   2.66 Nm     90%
-        #    0.05   40.0   ±25 dps   1.01 Nm     34%
-        #    0.03   66.7   ±20 dps   0.78 Nm     27%
+        #    0.30    6.7   ±66 dps   2.66 Nm     91%
+        #    0.05   40.0   ±25 dps   1.01 Nm     35%
+        #    0.03   66.7   ±20 dps   0.78 Nm     27%   ← 예전 설정
         #
         # 지연 67 ms 는 목표 슬루 15 deg/s 에서 1° 라 무시할 만하다.
-        vel_filter_alpha: 0.03
+        #
+        # ── 20260902 제어 100 Hz (dt=10 ms) 전환 ──
+        # alpha 는 dt 보정이 없는 고정 계수라 τ = dt/alpha 가 그대로 5 배가 된다.
+        # 0.03 을 그냥 두면 τ 가 67 → 333 ms 로 늘어 D 항이 무력해진다.
+        # 한편 유한차분 간격이 5 배라 **원시 잡음은 158 → 32 dps 로 떨어진다.**
+        #   alpha  τ[ms]   vel잡음    kd·vel    중력 대비
+        #    0.30   33.3   ±13 dps   0.53 Nm     18%
+        #    0.15   66.7   ± 9 dps   0.36 Nm     12%   ← 지금 (τ 를 그대로 유지)
+        #    0.075 133.3   ± 6 dps   0.25 Nm      9%
+        #
+        # 0.15 는 예전 τ(67 ms)를 그대로 두면서 D 항 잡음만 0.78 → 0.36 N·m 로
+        # 절반 넘게 줄인다. **여지가 생겼다**: 0.30 으로 올리면 지연이 67 → 33 ms
+        # 로 반이 되는데 그때 잡음(±13 dps, 0.53 N·m)도 예전 0.03 보다 낮다.
+        # 지연 문제를 쫓는다면 다음 실기에서 시험해 볼 값이다 — 다만 D 항은 루프
+        # 이득이므로 한 번에 하나만 바꾸고 진동을 볼 것 (S-41/S-42 교훈).
+        vel_filter_alpha: 0.15
         default_angle_deg: 0.0   # TCP 미연결 시 기본 목표 각도
         actuator_idx: 0    # 엔코더 인덱스 (board17)
         pos_gid: 0         # 양압 채널 (board5)
@@ -736,7 +770,7 @@
         link_length_m: 0.15
         p_pos_max_kpa: 185.0
         p_neg_min_kpa: 27.0
-        vel_filter_alpha: 0.03   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
+        vel_filter_alpha: 0.15   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
         default_angle_deg: 0.0
         actuator_idx: 1
         pos_gid: 1
@@ -762,7 +796,7 @@
         link_length_m: 0.15
         p_pos_max_kpa: 185.0
         p_neg_min_kpa: 27.0
-        vel_filter_alpha: 0.03   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
+        vel_filter_alpha: 0.15   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
         default_angle_deg: 0.0
         actuator_idx: 2
         pos_gid: 2
@@ -788,7 +822,7 @@
         link_length_m: 0.15
         p_pos_max_kpa: 185.0
         p_neg_min_kpa: 27.0
-        vel_filter_alpha: 0.03   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
+        vel_filter_alpha: 0.15   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
         default_angle_deg: 0.0
         actuator_idx: 3
         pos_gid: 3
@@ -814,7 +848,7 @@
         link_length_m: 0.15
         p_pos_max_kpa: 185.0
         p_neg_min_kpa: 27.0
-        vel_filter_alpha: 0.03   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
+        vel_filter_alpha: 0.15   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
         default_angle_deg: 0.0
         actuator_idx: 4
         pos_gid: 4
@@ -840,7 +874,7 @@
         link_length_m: 0.15
         p_pos_max_kpa: 185.0
         p_neg_min_kpa: 27.0
-        vel_filter_alpha: 0.03   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
+        vel_filter_alpha: 0.15   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
         default_angle_deg: 0.0
         actuator_idx: 5
         pos_gid: 5

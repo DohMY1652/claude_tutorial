@@ -115,6 +115,7 @@ private:
   std::unique_ptr<std::atomic<float>[]>    current_snapshot_;   // [bid*3 + v]
   std::unique_ptr<std::atomic<uint16_t>[]> analog_snapshot_;    // [0..8] → board 17..25
   size_t sensors_n_{0}, currents_n_{0}, analog_n_{0};
+  int sensor_period_ms_{2};   // board/sensors 발행 주기 = 제어 루프 주기
   // LPF 상태 — rx_loop 만 만진다 (공유 아님).
   std::vector<double>   sensors_filt_;
   std::set<int> active_encoder_boards_;                     // board IDs to read (empty = all)

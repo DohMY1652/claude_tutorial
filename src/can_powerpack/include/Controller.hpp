@@ -893,6 +893,10 @@ private:
   // 슬루 상태를 현재 각도에서 한 번 출발시켰나 (기동 계단 방지).
   bool slew_seeded_{false};
   int  slew_seed_ticks_{0};
+  // 측정 각도를 못 받아도 이 시간이 지나면 목표를 0° 로 확정한다. 위와 같은
+  // 이유로 틱이 아니라 시간 기준이다 (예전엔 500 틱 = 1 s @500 Hz 로 박혀 있었다).
+  static constexpr double SLEW_SEED_TIMEOUT_MS = 1000.0;
+  int  slew_seed_limit_{500};
   void slew_targets(double dt_sec);
   bool   pos_tcp_received_{false};
 
@@ -956,8 +960,12 @@ private:
   std::chrono::steady_clock::time_point start_time_;
   double elapsed_time_sec_ = 0.0;
 
-  // Sensor zero-calibration at startup
-  static constexpr int ZERO_SAMPLES = 250;   // ~0.5 sec at 500 Hz
+  // Sensor zero-calibration at startup.
+  // **틱 개수가 아니라 시간으로 잡아야 한다.** 예전에는 250 틱으로 박혀 있어
+  // period_ms 를 2 → 10 으로 바꾸면 표본 수는 그대로인 채 0점 보정이 0.5 s 에서
+  // 2.5 s 로 늘어났다. 생성자에서 period_ms_ 로부터 계산한다.
+  static constexpr double ZERO_CALIB_MS = 500.0;   // 0점 보정에 쓸 시간
+  int zero_samples_{250};
   // 0점 재보정이 yaml 기준에서 얼마나 벗어났는지 알리기 위해 원본을 보관한다.
   std::array<double, NUM_CAN_BOARDS> yaml_offset_{};
   double zero_tolerance_kpa_{8.0};

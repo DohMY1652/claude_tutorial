@@ -169,7 +169,15 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
   const int tx_ms = tx_fallback_ms_;
   tx_timer_     = this->create_wall_timer(std::chrono::milliseconds(std::max(1, tx_ms)),
                                           std::bind(&CanBridge::tx_routine,     this));
-  sensor_timer_ = this->create_wall_timer(2ms, std::bind(&CanBridge::sensor_routine, this));
+  // **이 타이머가 제어 주기다.** 컨트롤러의 제어 틱은 board/sensors 구독 콜백에서
+  // 돌기 때문에(Controller.cpp: sub_sensors_ → on_sensor), 여기서 발행하는 주기가
+  // 그대로 제어 루프 주기가 된다. 예전에는 2 ms 로 박혀 있어 pp_controller 의
+  // period_ms 를 바꿔도 실제 주기는 500 Hz 그대로였다 — period_ms 는 공칭 dt 로만
+  // 쓰였다. **둘을 반드시 같은 값으로 맞출 것.**
+  sensor_period_ms_ = this->declare_parameter<int>("sensor_period_ms", 2);
+  sensor_timer_ = this->create_wall_timer(
+      std::chrono::milliseconds(std::max(1, sensor_period_ms_)),
+      std::bind(&CanBridge::sensor_routine, this));
   if (diag_period_s_ > 0.0)
     diag_timer_ = this->create_wall_timer(
         std::chrono::milliseconds((int)std::lround(diag_period_s_ * 1000.0)),
