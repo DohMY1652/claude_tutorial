@@ -160,6 +160,7 @@ install(PROGRAMS
   scripts/encoder_calib.py
   scripts/can_monitor.py
   scripts/can_control.py
+  scripts/can_control_auto.py
   scripts/can_test.py
   scripts/log_topics.py
   scripts/self_test_ref_server.py
