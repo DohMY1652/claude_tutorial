@@ -124,10 +124,16 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
   RCLCPP_INFO(get_logger(),
     "PWM 워치독: %d ms (0=끔). 시한 초과 시 채널 밸브 폐쇄 + 라인 밸브(idx %d, %d) 전개",
     wd_timeout_ms_, wd_vent_index_, wd_admit_index_);
-  sensors_snapshot_.assign(PWM_BOARDS + 1, 0);
+  sensors_n_  = (size_t)(PWM_BOARDS + 1);
+  currents_n_ = (size_t)(PWM_BOARDS + 1) * 3;
+  analog_n_   = (size_t)(NUM_BOARDS - ANALOG_BOARD_START + 1);      // 9 values (boards 17..25)
+  sensors_snapshot_ = std::make_unique<std::atomic<uint16_t>[]>(sensors_n_);
+  current_snapshot_ = std::make_unique<std::atomic<float>[]>(currents_n_);
+  analog_snapshot_  = std::make_unique<std::atomic<uint16_t>[]>(analog_n_);
+  for (size_t i = 0; i < sensors_n_;  ++i) sensors_snapshot_[i].store(0, std::memory_order_relaxed);
+  for (size_t i = 0; i < currents_n_; ++i) current_snapshot_[i].store(0.0f, std::memory_order_relaxed);
+  for (size_t i = 0; i < analog_n_;   ++i) analog_snapshot_[i].store(0, std::memory_order_relaxed);
   sensors_filt_.assign(PWM_BOARDS + 1, 0.0);
-  current_snapshot_.resize(PWM_BOARDS + 1, {0.0, 0.0, 0.0});
-  analog_snapshot_.assign(NUM_BOARDS - ANALOG_BOARD_START + 1, 0);  // 9 values (boards 17..25)
 
   // Single flat sensor publisher: board/sensors
   // Index i (0-based) = board_id (i+1)
@@ -347,8 +353,8 @@ void CanBridge::rx_loop() {
         if (dlc >= 8 && (active_encoder_boards_.empty() || active_encoder_boards_.count(bid))) {
           uint16_t raw_a;
           memcpy(&raw_a, &data[6], 2);  // bytes 6-7 = raw[3] = PA7
-          std::lock_guard<std::mutex> lk(sensor_mtx_);
-          analog_snapshot_[bid - ANALOG_BOARD_START] = raw_a;
+          const size_t ai = (size_t)(bid - ANALOG_BOARD_START);
+          if (ai < analog_n_) analog_snapshot_[ai].store(raw_a, std::memory_order_relaxed);
         }
       } else if (dlc >= 8) {
         // MPC/PID boards (1..18): 8-byte payload
@@ -358,7 +364,6 @@ void CanBridge::rx_loop() {
         memcpy(&raw_i3, &data[4], 2);
         memcpy(&raw_p,  &data[6], 2);
 
-        std::lock_guard<std::mutex> lk(sensor_mtx_);
 
         double p_mv_raw = 5000.0 - ((double)raw_p * 4000.0 / 4095.0);
         if (p_mv_raw < 0) p_mv_raw = 0;
@@ -379,29 +384,37 @@ void CanBridge::rx_loop() {
         double c2_raw = (double)raw_i2 * TO_MV;
         double c3_raw = (double)raw_i3 * TO_MV;
 
-        auto& cs = current_snapshot_[bid];
-        if (cs[0] == 0.0 && cs[1] == 0.0 && cs[2] == 0.0) {
-          cs = {c1_raw, c2_raw, c3_raw};
-        } else {
-          cs[0] = cs[0] * (1.0 - LPF_ALPHA) + c1_raw * LPF_ALPHA;
-          cs[1] = cs[1] * (1.0 - LPF_ALPHA) + c2_raw * LPF_ALPHA;
-          cs[2] = cs[2] * (1.0 - LPF_ALPHA) + c3_raw * LPF_ALPHA;
-        }
+          const size_t ci = (size_t)bid * 3;
+          if (ci + 2 < currents_n_) {
+            const double raw3[3] = {c1_raw, c2_raw, c3_raw};
+            const float p0 = current_snapshot_[ci + 0].load(std::memory_order_relaxed);
+            const float p1 = current_snapshot_[ci + 1].load(std::memory_order_relaxed);
+            const float p2 = current_snapshot_[ci + 2].load(std::memory_order_relaxed);
+            const bool  first = (p0 == 0.0f && p1 == 0.0f && p2 == 0.0f);
+            const float prev[3] = {p0, p1, p2};
+            for (int v = 0; v < 3; ++v) {
+              const double nv = first ? raw3[v]
+                  : (double)prev[v] * (1.0 - LPF_ALPHA) + raw3[v] * LPF_ALPHA;
+              current_snapshot_[ci + v].store((float)nv, std::memory_order_relaxed);
+            }
+          }
       }
     }
   }
 }
 
 void CanBridge::sensor_routine() {
-  std::vector<uint16_t> p_raw;
-  std::vector<std::array<double, 3>> c_raw;
-  std::vector<uint16_t> a_raw;
-  {
-    std::lock_guard<std::mutex> lk(sensor_mtx_);
-    p_raw = sensors_snapshot_;
-    c_raw = current_snapshot_;
-    a_raw = analog_snapshot_;
-  }
+  // 락 없이 원소별로 읽는다 (쓰는 쪽은 rx_loop 하나뿐, relaxed 로 충분).
+  std::vector<uint16_t> p_raw(sensors_n_);
+  std::vector<std::array<double, 3>> c_raw(sensors_n_);
+  std::vector<uint16_t> a_raw(analog_n_);
+  for (size_t i = 0; i < sensors_n_; ++i)
+    p_raw[i] = sensors_snapshot_[i].load(std::memory_order_relaxed);
+  for (size_t i = 0; i < sensors_n_; ++i)
+    for (size_t v = 0; v < 3; ++v)
+      c_raw[i][v] = (double)current_snapshot_[i * 3 + v].load(std::memory_order_relaxed);
+  for (size_t i = 0; i < analog_n_; ++i)
+    a_raw[i] = analog_snapshot_[i].load(std::memory_order_relaxed);
 
   // Publish pressure: boards 1..18, index i = board (i+1)
   std_msgs::msg::UInt16MultiArray msg_p;

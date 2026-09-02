@@ -58,8 +58,12 @@
     EncoderCalibration:
       boards:
         "17": { raw_0deg: 907.0, raw_90deg: 2200.0 }   # 20260829 재장착 후 재측정 (이전 1200/2470)
-        "18": { raw_0deg: 902.0,  raw_90deg: 2205.0 }
+        "18": { raw_0deg: 902.0, raw_90deg: 2205.0 }
         "19": { raw_0deg: 907.0, raw_90deg: 2200.0 }
+        "20": { raw_0deg: 904.0, raw_90deg: 2200.0 } 
+        "21": { raw_0deg: 907.0, raw_90deg: 2200.0 }
+        "22": { raw_0deg: 907.0, raw_90deg: 2200.0 }
+
 
 # ==========================================
 # Node 2: PP Controller (Control Algorithm)

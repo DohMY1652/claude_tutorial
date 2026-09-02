@@ -98,10 +98,25 @@ private:
   uint8_t heartbeat_cnt_{0};
 
   // === Sensor (RX) ===
-  std::vector<uint16_t> sensors_snapshot_;                  // [bid], bid = 0..PWM_BOARDS (발행용)
-  std::vector<double>   sensors_filt_;                      // [bid] LPF 상태 (절단 방지)
-  std::vector<std::array<double, 3>> current_snapshot_;     // [bid][0..2], bid 0..18
-  std::vector<uint16_t> analog_snapshot_;                   // [0..8] → board 17..25
+  // ── 수신 스냅샷은 **락 없이** 쓴다 ─────────────────────────────────────
+  //
+  // 예전에는 이 셋을 sensor_mtx_ 로 감쌌다. 그런데 쓰는 쪽(rx_loop)은 **초당
+  // 11000 프레임**이고 읽는 쪽(sensor_routine)은 500 Hz 로 벡터 3 개를 통째로
+  // 복사하며 같은 락을 잡았다. 그 경합에 수신이 밀려 드라이버 큐가 넘쳤고,
+  // 보드가 ID 순서로 순환 송신하므로 **뒤처진 수신기가 매 주기 꼬리(높은 ID)를
+  // 놓쳤다** — 보드 16~22 만 1~3 Hz 로 굶던 것이 이것이다.
+  //   계측 20260902: 같은 송신율에서 파이썬 시험 6284 f/s(균일 286 Hz) 대
+  //   C++ 브리지 2300 f/s(1~213 Hz). 파이썬보다 2.7 배 못 받고 있었다.
+  //
+  // 쓰는 쪽은 rx_loop 하나뿐이고 읽는 쪽은 값을 한 번에 하나씩만 보면 되므로
+  // 원소별 원자 접근(relaxed)으로 충분하다. 원소 간 시점이 살짝 어긋날 수 있는데,
+  // 어차피 보드마다 도착 시각이 다르므로 락이 있어도 같은 성질이다.
+  std::unique_ptr<std::atomic<uint16_t>[]> sensors_snapshot_;   // [bid] 0..PWM_BOARDS
+  std::unique_ptr<std::atomic<float>[]>    current_snapshot_;   // [bid*3 + v]
+  std::unique_ptr<std::atomic<uint16_t>[]> analog_snapshot_;    // [0..8] → board 17..25
+  size_t sensors_n_{0}, currents_n_{0}, analog_n_{0};
+  // LPF 상태 — rx_loop 만 만진다 (공유 아님).
+  std::vector<double>   sensors_filt_;
   std::set<int> active_encoder_boards_;                     // board IDs to read (empty = all)
   // 보드별 엔코더 캘리브레이션 (index = board_id, [0]은 미사용). 기본값은 encoder_offset/encoder_gain,
   // EncoderCalibration.boards.<id> 로 보드별 override 가능.
@@ -109,7 +124,6 @@ private:
   std::array<double, NUM_BOARDS + 1> enc_gain_{};
   // 실측 2점(raw_0deg/raw_90deg)으로 캘리브레이션됐는지 — 기동 경고에 쓴다
   std::array<bool, NUM_BOARDS + 1> enc_measured_{};     // deg/mV
-  std::mutex sensor_mtx_;
 
   // board/sensors  : boards 1..18 pressure (18 values, index 0 = board 1)
   rclcpp::Publisher<std_msgs::msg::UInt16MultiArray>::SharedPtr pub_sensors_;
