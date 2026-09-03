@@ -152,6 +152,12 @@ if(CANLIB_LIBRARY)
   )
 endif()
 
+# Teensy 프레임 해독기 검증 — 실기 캡처(test/data/teensy_5s.bin)로 돌린다.
+# ROS·CAN 에 의존하지 않으므로 하드웨어 없이 언제든 돌릴 수 있다.
+#   ./build/can_powerpack/test_teensy_frame src/can_powerpack/test/data/teensy_5s.bin
+add_executable(test_teensy_frame test/test_teensy_frame.cpp)
+target_include_directories(test_teensy_frame PRIVATE include)
+
 # (2) Python 스크립트 설치
 install(PROGRAMS
   scripts/dashboard.py
@@ -159,8 +165,10 @@ install(PROGRAMS
   scripts/preflight.sh
   scripts/encoder_calib.py
   scripts/can_monitor.py
+  scripts/teensy_monitor.py
   scripts/can_control.py
   scripts/can_control_auto.py
+  scripts/pp_check.py
   scripts/can_test.py
   scripts/log_topics.py
   scripts/self_test_ref_server.py

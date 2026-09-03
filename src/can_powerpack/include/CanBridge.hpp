@@ -12,6 +12,7 @@
 #include <thread>
 #include <atomic>
 #include <canlib.h>
+#include "TeensyFrame.hpp"
 
 // CAN FD constants missing from older canlib headers
 #ifndef canOPEN_CAN_FD
@@ -46,6 +47,8 @@ public:
 private:
   canHandle hnd_;
   int channel_num_;
+  bool can_required_{true};   // false = CAN 없이도 뜬다 (벤치 점검 전용)
+  bool can_ok_{false};        // init_can 이 성공했나
 
   // === Command (TX) ===
   struct BoardCmd {
@@ -118,7 +121,73 @@ private:
   int sensor_period_ms_{2};   // board/sensors 발행 주기 = 제어 루프 주기
   // LPF 상태 — rx_loop 만 만진다 (공유 아님).
   std::vector<double>   sensors_filt_;
-  std::set<int> active_encoder_boards_;                     // board IDs to read (empty = all)
+  std::set<int> active_encoder_boards_;                     // board IDs to read (비면 CAN 엔코더 없음)
+  // "teensy" (기본) 또는 "can". board/analog 를 누가 채우는지 정한다.
+  // "teensy" 면 CAN 보드 17~25 는 아예 없는 것으로 취급한다 — 파싱도 진단도 하지 않는다.
+  std::string encoder_source_{"teensy"};
+  bool enc_from_can_{false};
+
+  // ══════════════════════════════════════════════════════════════════════
+  //  Teensy 엔코더 (USB CDC 시리얼)
+  // ══════════════════════════════════════════════════════════════════════
+  // 20260903: 엔코더 6채널을 CAN 에서 떼어 Teensy 4.0 + ADS1115×3 으로 옮겼다.
+  //
+  // **왜 옮겼나.** CAN 실측에서 지령 프레임 1개당 보드 프레임 약 9.5개가 사라진다
+  // (보드가 수신 처리로 ~1.2 ms 멈춘다). 비용은 바이트가 아니라 **프레임당**이라
+  // 페이로드를 줄여도 안 듣는다. 그런데 엔코더 보드는 CAN ID 가 가장 높아
+  // (0x131~0x136) 우선순위가 최하위였고, 지령을 100 Hz 로 보내는 순간 1 Hz 까지
+  // 굶었다. 위치 제어가 눈을 잃는 것이라 가장 위험한 실패였다.
+  //
+  // Teensy 는 USB 로 200 Hz 를 확정 공급한다. CAN 경합과 무관해졌다.
+  //
+  // **프레임 포맷** (24 B, scripts/teensy_monitor.py 와 동일, 실기 검증 완료):
+  //   [0..1]   SYNC 0xAA 0x55
+  //   [2..3]   seq      uint16   (유실 검출)
+  //   [4..7]   t_us     uint32   (Teensy micros())
+  //   [8..19]  ch0~ch5  int16×6  (ADS1115 raw 카운트)
+  //   [20..21] status   uint16   (비트 c = 칩 c I2C 오류)
+  //   [22..23] CRC16-CCITT (poly 0x1021, init 0xFFFF, 바이트 0..21)
+  //
+  // **스트리밍은 자동으로 시작되지 않는다** — 'r' 을 보내야 하고 'x' 로 멈춘다.
+  // 이걸 빠뜨리면 포트는 열리는데 한 바이트도 안 온다 (실기에서 확인함).
+  //
+  // 주의: scripts/arduino/ads1115_6ch/ads1115_6ch.ino 는 **오래된 소스다.**
+  // 그 파일은 ASCII CSV 를 뱉는다고 돼 있지만 실기는 위 바이너리를 보낸다.
+  // 실기 펌웨어 소스를 확보하기 전까지 .ino 를 신뢰하지 말 것.
+  // 프레임 해독은 include/TeensyFrame.hpp 에 있다 (ROS·CAN 비의존 → 단위 테스트 가능).
+  // test/test_teensy_frame.cpp 가 실기 캡처로 그 코드를 그대로 돌린다.
+  static constexpr int TEENSY_FRAME_LEN = teensy::FRAME_LEN;
+  static constexpr int TEENSY_NCH       = teensy::NCH;
+
+  bool        teensy_enable_{true};
+  std::string teensy_port_;                 // 비면 자동탐색
+  std::string teensy_port_used_;            // 실제로 연 포트 (진단 출력용)
+  std::string teensy_open_err_;             // 마지막 열기 실패 사유
+  int         teensy_watchdog_ms_{100};
+  int         teensy_fd_{-1};
+  std::thread teensy_thread_;
+
+  // raw 스냅샷 — teensy_thread_ 만 쓰고 sensor_routine 만 읽는다 (relaxed 로 충분).
+  std::array<std::atomic<int32_t>, TEENSY_NCH> teensy_raw_{};
+  std::atomic<bool>      teensy_seen_{false};     // 한 번이라도 유효 프레임을 받았나
+  std::atomic<bool>      teensy_stale_{true};
+  std::atomic<long long> teensy_last_ns_{0};
+  std::atomic<uint32_t>  teensy_frames_{0};       // 누적 유효 프레임
+  std::atomic<uint32_t>  teensy_lost_{0};         // seq 불연속으로 센 유실
+  std::atomic<uint32_t>  teensy_crc_err_{0};
+  std::atomic<uint32_t>  teensy_status_{0};       // 마지막 status 워드
+  uint32_t               teensy_frames_prev_{0};  // diag_routine 전용
+
+  // 2점 보정. ADS1115 는 센서를 직접 읽으므로 CAN 엔코더의 반전앰프 역산이
+  // **필요 없다** — 단순 선형이다:  deg = (raw - raw_0deg) * 90 / (raw_90deg - raw_0deg)
+  std::array<double, TEENSY_NCH> tenc_raw0_{};
+  std::array<double, TEENSY_NCH> tenc_scale_{};   // deg per raw count
+  std::array<bool,   TEENSY_NCH> tenc_measured_{};
+
+  void teensy_loop();
+  bool teensy_open();
+  void teensy_close();
+  std::string teensy_find_port() const;
   // 보드별 엔코더 캘리브레이션 (index = board_id, [0]은 미사용). 기본값은 encoder_offset/encoder_gain,
   // EncoderCalibration.boards.<id> 로 보드별 override 가능.
   std::array<double, NUM_BOARDS + 1> enc_offset_{};   // orig_mV at 0 degrees
@@ -130,8 +199,12 @@ private:
   rclcpp::Publisher<std_msgs::msg::UInt16MultiArray>::SharedPtr pub_sensors_;
   // board/currents : boards 1..18 currents (18*3 values)
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_currents_;
-  // board/analog   : boards 17..25 encoder angle [deg] (9 values, index 0 = board 17)
+  // board/analog     : 엔코더 각도 [deg]. encoder_source 에 따라 길이가 다르다 —
+  //                    teensy: 6 개 (index = Teensy 채널 = axis 의 actuator_idx)
+  //                    can   : 9 개 (index 0 = board 17)
+  //                    Controller 는 std::min(msg.size(), 9) 로 받으므로 둘 다 안전하다.
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_analog_;
+  // board/analog_raw : 위와 같은 순서의 **보정 전 raw**. 2점 보정을 잡을 때 쓴다.
   rclcpp::Publisher<std_msgs::msg::UInt16MultiArray>::SharedPtr pub_analog_raw_;
   // board/pwm_cmd  : boards 1..18 PWM (18*3 values, index (bid-1)*3 = board bid)
   rclcpp::Subscription<std_msgs::msg::UInt16MultiArray>::SharedPtr sub_pwm_cmd_;

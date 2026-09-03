@@ -83,7 +83,9 @@ def _setup(context, *_a, **_k):
     # num_actuators=1 로 두고 axis0 의 gid 를 N 으로 돌려놓는 것과 같다.
     # 명시적으로 준 num_actuators / overrides 가 있으면 그쪽을 존중한다.
     # 쉼표로 여러 개를 줄 수 있다: axis:=0,1 이면 2 축을 같이 돌린다.
-    # 선택한 순서대로 axis0, axis1, ... 에 배정된다 (엔코더도 board 17+ch 로 따라간다).
+    # 선택한 순서대로 axis0, axis1, ... 에 배정된다.
+    # 20260903: 엔코더는 Teensy 채널이다 — actuator_idx = Teensy ch 번호.
+    # (예전에는 board 17+idx 였다. encoder_source:can 으로 되돌리면 그 규칙이 산다.)
     axis = LaunchConfiguration('axis').perform(context)
     if axis:
         sel = [int(x) for x in axis.replace(' ', '').split(',') if x]
@@ -97,13 +99,18 @@ def _setup(context, *_a, **_k):
     # can_bridge 에도 **자기가 선언한 키만** 넘긴다. overrides 를 통째로 넘기면
     # MPC_parameters.* 처럼 브리지가 선언하지 않은 파라미터가 섞여 노드가 뜨지 않는다.
     #
-    # num_actuators 가 특히 중요하다 — 브리지는 이 값으로 활성 엔코더 보드를
-    # (17 .. 17+N-1) 로 정한다. 넘기지 않으면 `num_actuators:=1` 로 1축 시험을 해도
-    # 브리지는 yaml 의 6 을 그대로 써서 board 17~22 를 기대하고, 20~22 에 대해
-    # 캘리브레이션 경고와 수신 없음 오류를 쏟는다 (그 시험에는 쓰이지도 않는 보드다).
+    # num_actuators 는 encoder_source:can 일 때 활성 엔코더 보드를 (17 .. 17+N-1) 로
+    # 정한다. 20260903 부터 기본은 teensy 라 이 경로는 안 타지만, 되돌릴 때를 위해
+    # 계속 넘긴다. (예전 문제: 넘기지 않으면 `num_actuators:=1` 1축 시험에서도
+    # 브리지가 yaml 의 6 을 써서 board 20~22 에 대해 경고를 쏟았다.)
+    #
+    # ★ 브리지는 **자기가 선언한 키만** 받는다. teensy_* / encoder_source / can_required
+    #   는 여기 없어도 config_path 로 들어간다. CLI 로 덮어쓰려면 이 목록에 넣을 것.
     BRIDGE_KEYS = ('num_actuators', 'can_channel', 'current_mode', 'control_type',
                    'pwm_watchdog_ms', 'can_rx_watchdog_ms',
-                   'can_tx_fallback_ms', 'can_tx_min_interval_ms', 'can_diag_period_s')
+                   'can_tx_fallback_ms', 'can_tx_min_interval_ms', 'can_diag_period_s',
+                   'sensor_period_ms', 'encoder_source', 'teensy_enable',
+                   'teensy_port', 'teensy_watchdog_ms', 'can_required')
     bridge_overrides = {k: v for k, v in overrides.items() if k in BRIDGE_KEYS}
 
     can_bridge = Node(

@@ -35,15 +35,15 @@
     # 10 ms = 100 Hz 를 택했다. 밸브 2차 동특성이 wn≈40 rad/s(τ≈25 ms)라 명령 주기
     # 10 ms 는 밸브보다 2.5배 빠르고, 센서는 보드당 ~390 Hz 로 들어와 500 Hz 제어
     # 루프가 거의 매 틱 새 값을 본다. 더 줄이면 센서는 좋아지지만 명령이 느려진다.
-    can_tx_min_interval_ms: 10   # 컨트롤러 명령 송신 최소 간격 (0 = 명령마다)
-    can_tx_fallback_ms: 10       # 명령이 없을 때 keepalive 주기
+    can_tx_min_interval_ms: 5    # 컨트롤러 명령 송신 최소 간격 (0 = 명령마다)
+    can_tx_fallback_ms: 5        # 명령이 없을 때 keepalive 주기
     can_rx_watchdog_ms: 200      # 이 시간 프레임이 없으면 안전 상태 (0 = 끔)
     can_diag_period_s: 5.0       # 보드별 수신 Hz 진단 주기 (0 = 끔)
 
     # **제어 루프 주기.** 컨트롤러의 제어 틱은 board/sensors 구독 콜백에서 돌기
     # 때문에 이 발행 주기가 곧 제어 주기다. 20260902 에 2 ms(500 Hz) → 10 ms(100 Hz).
     # pp_controller 의 period_ms 와 **반드시 같은 값**이어야 한다 (공칭 dt 로 쓰인다).
-    sensor_period_ms: 10
+    sensor_period_ms: 5
 
     num_actuators: 6    # 6축 전체 구동
     current_mode: 0   # 0=Normal(PID), 1=Debug(PWM direct)  — master 기본값으로 복귀. 밸브 피팅(config/valve_params.yaml)은
@@ -60,6 +60,10 @@
     # (offset 1740.0, gain +0.0757) 으로 돌아 0도가 158도로 읽힌다.
     # raw_0deg/raw_90deg 값만 입력하면 CanBridge가 offset/gain을 자동 계산함
     # (angle = (orig_mV - offset) * gain,  orig_mV = (4125 - raw*3300/4095) / 0.825)
+    #
+    # ※ 아래 EncoderCalibration 은 **CAN 엔코더(보드 17~22) 전용이고 지금은 안 쓰인다.**
+    #   20260903 에 엔코더를 Teensy 로 옮겼다 (encoder_source: teensy).
+    #   encoder_source 를 can 으로 되돌릴 때를 위해 값만 남겨 둔다.
     EncoderCalibration:
       boards:
         "17": { raw_0deg: 907.0, raw_90deg: 2200.0 }   # 20260829 재장착 후 재측정 (이전 1200/2470)
@@ -69,16 +73,63 @@
         "21": { raw_0deg: 907.0, raw_90deg: 2200.0 }
         "22": { raw_0deg: 907.0, raw_90deg: 2200.0 }
 
+    # ══════════════════════════════════════════════════════════════════════
+    #  엔코더 소스 — 20260903 부터 Teensy(USB)
+    # ══════════════════════════════════════════════════════════════════════
+    # **왜 옮겼나.** CAN 실측: 지령 프레임 1개당 보드 프레임 약 9.5 개가 사라진다
+    # (보드가 수신 처리로 ~1.2 ms 멈춘다). 비용은 바이트가 아니라 프레임당이라
+    # 페이로드를 줄여도 안 듣는다. 그런데 엔코더 보드는 CAN ID 가 가장 높아
+    # (0x131~0x136) 우선순위 최하위였고, 지령 100 Hz 에서 1 Hz 까지 굶었다.
+    # 위치 제어가 눈을 잃는 것이라 가장 위험한 실패였다.
+    # 지금 CAN 에는 보드 1~16 (밸브·압력)만 남는다.
+    encoder_source: teensy   # teensy | can
+    teensy_enable: true
+    teensy_port: ""          # 비우면 자동탐색 (/dev/serial/by-id/*Teensy* → /dev/ttyACM*)
+    teensy_watchdog_ms: 100  # 이 시간 프레임이 없으면 board/analog 발행을 멈추고 ERROR
+
+    # ── Teensy 2점 보정 (여기 두 값만 고치면 된다) ─────────────────────────
+    # raw = ADS1115 카운트. 각도 = (raw - raw_0deg) * 90 / (raw_90deg - raw_0deg).
+    # **CAN 엔코더와 달리 반전앰프 역산이 없다** — ADS1115 가 센서를 직접 읽는다.
+    #
+    # 잡는 법:
+    #   1) 축을 0° 자세에 놓고  `ros2 topic echo /pack2/board/analog_raw --once`
+    #      또는 scripts/pp_check.py 의 raw 열을 읽어 raw_0deg 에 넣는다
+    #   2) 90° 자세에서 같은 방법으로 raw_90deg
+    #   3) 다시 띄워 board/analog 각도가 두 자세에서 실제와 맞는지 눈으로 확인
+    #
+    # **반드시 실수로 적을 것** (1200 이 아니라 1200.0) — 위 EncoderCalibration
+    # 주석의 이유와 같다. 정수로 적으면 값이 통째로 무시된다.
+    #
+    # 보정 전에는 각도가 **항상 0°** 로 나가고 기동 시 ERROR 가 뜬다. raw 를 그대로
+    # 도 단위로 흘리면 "0° 에 있다"는 거짓말이 되어 위치 제어가 그걸 믿기 때문이다.
+    #
+    # 채널 번호 = 축의 actuator_idx (ch0 → axis0, ch5 → axis5).
+    # 20260903 무부하 실측 raw (참고용, 보정값 아님):
+    #   ch0 592  ch1 124  ch2 228  ch3 133  ch4 69  ch5 208   (잡음 1σ 1.4~2.4 LSB)
+    TeensyEncoder:
+      channels:
+        "0": { raw_0deg: 0.0, raw_90deg: 0.0 }   # ← 실측 후 채울 것
+        "1": { raw_0deg: 0.0, raw_90deg: 0.0 }
+        "2": { raw_0deg: 0.0, raw_90deg: 0.0 }
+        "3": { raw_0deg: 0.0, raw_90deg: 0.0 }
+        "4": { raw_0deg: 0.0, raw_90deg: 0.0 }
+        "5": { raw_0deg: 0.0, raw_90deg: 0.0 }
+
 
 # ==========================================
 # Node 2: PP Controller (Control Algorithm)
 # ==========================================
 /pack2/pp_controller:
   ros__parameters:
-    # 20260902: 500 Hz(2 ms) → 100 Hz(10 ms).
-    # CAN 실측: 지령 프레임 1개당 보드가 약 1.2 ms 멈춰 센서 수신이 깎인다.
-    # 500 Hz 제어를 해도 can_tx_min_interval_ms 10 ms 가 5 개 중 4 개를 버렸으므로
-    # 실제로 나가던 지령은 이미 100 Hz 였다 — 주기를 맞춰 헛도는 계산을 없앤다.
+    # 20260902: 500 Hz(2 ms) → 100 Hz(10 ms)
+    # 20260903: 100 Hz → **200 Hz(5 ms)**. 엔코더를 Teensy 로 옮겨 200 Hz 가 확정
+    #           공급되므로 제어를 거기에 맞춘다. CAN 지령도 5 ms 로 같이 올렸다
+    #           (can_tx_min_interval_ms/fallback_ms). 실측 외삽으로 보드당 압력
+    #           센서는 약 262 Hz — 제어 200 Hz 보다 빠르니 매 틱 새 값을 본다.
+    #
+    # ★ can_bridge 의 sensor_period_ms 와 **반드시 같은 값**이어야 한다.
+    #   제어 틱은 board/sensors 구독 콜백에서 돌기 때문에 실제 주기는 그쪽이 정하고,
+    #   여기 period_ms 는 공칭 dt 로만 쓰인다. 어긋나면 dt 가 틀린 채로 돈다.
     # **주기를 바꿀 때 같이 봐야 하는 것** (전수 조사함):
     #   · 적분항은 전부 `* dt` 라 무관              ✓
     #   · vel_raw = Δangle/dt 라 무관               ✓
@@ -86,9 +137,11 @@
     #   · MPC_PHASES = 1 이라 채널 데시메이션 없음  ✓
     #   · obs_bridge_alpha 는 mppi_estimator=false 라 안 쓰임 ✓
     #   · PressureRefGen 은 gen_period_ms/period_ms 로 데시메이션해 20 ms 유지 ✓
-    #   · vel_filter_alpha 는 **고정 계수라 아래에서 0.03 → 0.15 로 다시 맞췄다**
+    #   · vel_filter_alpha 는 **고정 계수라 아래에서 다시 맞췄다** (200 Hz → 0.073)
+    #   · sensor_filter_alpha 도 **고정 계수다** — 20260902 에 빠뜨렸다가 20260903 에
+    #     잡았다. τ 가 9.0 → 44.8 ms 로 5 배 늘어 있었다. 아래에서 0.43 으로 복원.
     #   · ZERO_SAMPLES / slew_seed 틱은 시간 기준으로 바꿨다 (Controller.cpp)
-    period_ms: 10
+    period_ms: 5
     cpu_pins: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 
     # ──────────────────────────────────────────
@@ -100,7 +153,16 @@
     num_total_channels: 12
     num_positive_channels: 6
     num_actuators: 6    # 6축 전체 구동
-    sensor_filter_alpha: 0.2   # 1.0→0.2: 액추에이터 미연결 시 라인압 진동 억제용 저역통과 필터
+    # 제어 틱마다 압력에 걸리는 1차 LPF (Controller.cpp: filt_state_).
+    # **dt 보정이 없는 고정 계수라 제어 주기를 바꾸면 τ 가 그대로 따라 바뀐다.**
+    # 20260902 에 500→100 Hz 로 내리면서 이 값을 빠뜨려 τ 가 9.0 → 44.8 ms 로 5 배
+    # 늘어 있었다 (압력 지연 5 배 = 지연 문제에 직접 악영향). 20260903 에 복원.
+    #    dt     alpha    τ
+    #    2 ms   0.20     9.0 ms   ← 원래 설계 (500 Hz)
+    #   10 ms   0.20    44.8 ms   ← 놓쳤던 상태
+    #    5 ms   0.43     9.0 ms   ← 지금 (200 Hz, τ 복원)
+    #    5 ms   0.20    22.4 ms   ← 그냥 뒀을 경우
+    sensor_filter_alpha: 0.43
 
     # 액추에이터 연결 여부
     # false: 고정 탱크 볼륨 사용 (actuator/volumes_ml 토픽 무시)
@@ -712,6 +774,17 @@
         #
         # 지연 67 ms 는 목표 슬루 15 deg/s 에서 1° 라 무시할 만하다.
         #
+        # ── 20260903 제어 200 Hz (dt=5 ms) — 지금 ──
+        # 유한차분 간격이 5 ms 라 원시 잡음 ±63 dps.
+        #   alpha  τ[ms]   vel잡음    kd·vel    중력 대비
+        #    0.075  64.1   ±13 dps   0.50 Nm     17%   ← 지금 (0.073, τ 유지)
+        #    0.15   30.8   ±18 dps   0.72 Nm     24%
+        #    0.30   14.0   ±27 dps   1.06 Nm     36%
+        # 500 Hz 시절 alpha 0.03 이 ±20 dps / 0.78 N·m 였으니, 같은 τ 에서 잡음이
+        # 여전히 낮다. 지연을 더 줄이고 싶으면 0.15 (τ 31 ms) 가 다음 후보다 —
+        # 그때 잡음 0.72 N·m 도 예전 0.78 보다 낮다. 단 D 항은 루프 이득이니
+        # 한 번에 하나만 바꾸고 진동을 볼 것 (S-41/S-42).
+        #
         # ── 20260902 제어 100 Hz (dt=10 ms) 전환 ──
         # alpha 는 dt 보정이 없는 고정 계수라 τ = dt/alpha 가 그대로 5 배가 된다.
         # 0.03 을 그냥 두면 τ 가 67 → 333 ms 로 늘어 D 항이 무력해진다.
@@ -726,7 +799,7 @@
         # 로 반이 되는데 그때 잡음(±13 dps, 0.53 N·m)도 예전 0.03 보다 낮다.
         # 지연 문제를 쫓는다면 다음 실기에서 시험해 볼 값이다 — 다만 D 항은 루프
         # 이득이므로 한 번에 하나만 바꾸고 진동을 볼 것 (S-41/S-42 교훈).
-        vel_filter_alpha: 0.15
+        vel_filter_alpha: 0.073
         default_angle_deg: 0.0   # TCP 미연결 시 기본 목표 각도
         actuator_idx: 0    # 엔코더 인덱스 (board17)
         pos_gid: 0         # 양압 채널 (board5)
@@ -770,7 +843,7 @@
         link_length_m: 0.15
         p_pos_max_kpa: 185.0
         p_neg_min_kpa: 27.0
-        vel_filter_alpha: 0.15   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
+        vel_filter_alpha: 0.073   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
         default_angle_deg: 0.0
         actuator_idx: 1
         pos_gid: 1
@@ -796,7 +869,7 @@
         link_length_m: 0.15
         p_pos_max_kpa: 185.0
         p_neg_min_kpa: 27.0
-        vel_filter_alpha: 0.15   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
+        vel_filter_alpha: 0.073   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
         default_angle_deg: 0.0
         actuator_idx: 2
         pos_gid: 2
@@ -822,7 +895,7 @@
         link_length_m: 0.15
         p_pos_max_kpa: 185.0
         p_neg_min_kpa: 27.0
-        vel_filter_alpha: 0.15   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
+        vel_filter_alpha: 0.073   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
         default_angle_deg: 0.0
         actuator_idx: 3
         pos_gid: 3
@@ -848,7 +921,7 @@
         link_length_m: 0.15
         p_pos_max_kpa: 185.0
         p_neg_min_kpa: 27.0
-        vel_filter_alpha: 0.15   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
+        vel_filter_alpha: 0.073   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
         default_angle_deg: 0.0
         actuator_idx: 4
         pos_gid: 4
@@ -874,7 +947,7 @@
         link_length_m: 0.15
         p_pos_max_kpa: 185.0
         p_neg_min_kpa: 27.0
-        vel_filter_alpha: 0.15   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
+        vel_filter_alpha: 0.073   # axis0 주석 참조 (실기 잡음 1σ 0.224°)
         default_angle_deg: 0.0
         actuator_idx: 5
         pos_gid: 5

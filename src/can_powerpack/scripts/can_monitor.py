@@ -1,3 +1,13 @@
+"""can_monitor.py — CAN 버스 직접 모니터 (보드 1~16 압력·전류·수신율)
+
+★ 20260903: **엔코더는 더 이상 CAN 에 없다.** 6채널을 Teensy(USB)로 옮겼고
+  CAN 보드 17~22 는 물리적으로 떼어냈다. 아래 엔코더 표는 encoder_source 를
+  can 으로 되돌렸을 때를 위해 남겨 둔 것이라, 지금 돌리면 **전부 0 으로 뜬다.**
+
+  압력·엔코더를 한 화면에서 보려면 **scripts/pp_check.py** 를 쓸 것.
+  (CAN + Teensy 통합, 판정까지 찍어 준다. 브리지가 떠 있으면 자동으로 ROS 모드로
+   바뀌어 시리얼·송신 충돌을 피한다.)
+"""
 import time
 import struct
 import sys
@@ -140,6 +150,7 @@ else:
 
 # 공유 데이터
 board_data = {i: [0.0, 0.0, 0.0, 0.0] for i in range(1, 23)} # [I1, I2, I3, Pressure]
+# 20260903 부터 엔코더는 Teensy 로 갔다 — 이 표는 encoder_source:can 일 때만 채워진다.
 encoder_raw = {i: (0, 0, 0, 0) for i in range(17, 23)}       # 엔코더 보드 raw ADC (Raw1~Raw4)
 last_recv_time = {i: 0.0 for i in range(1, 23)}
 
