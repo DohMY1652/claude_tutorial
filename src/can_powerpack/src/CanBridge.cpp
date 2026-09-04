@@ -408,11 +408,20 @@ void CanBridge::diag_routine() {
   // (20260904: 실측 20 s/4000 프레임, seq 유실 0, CRC 0 → 199.997 Hz).
   // 보드 수신율도 같은 이유로 낮게 보였다. 실제 경과 시간으로 나눈다.
   const auto now_tp = std::chrono::steady_clock::now();
-  double span_s = diag_period_s_;
-  if (diag_last_tp_.time_since_epoch().count() != 0) {
-    const double d = std::chrono::duration<double>(now_tp - diag_last_tp_).count();
-    if (d > 1e-3) span_s = d;
+
+  // 첫 호출은 기준선만 잡는다 (rate_routine 과 같은 이유 — rx_count_prev_ 가 0 이라
+  // 기동 이후 전체를 공칭 주기로 나눠 엉뚱한 값이 한 번 찍힌다).
+  if (diag_last_tp_.time_since_epoch().count() == 0) {
+    diag_last_tp_ = now_tp;
+    for (int bid = 1; bid <= NUM_BOARDS; ++bid)
+      rx_count_prev_[(size_t)bid] = rx_count_[(size_t)bid].load(std::memory_order_relaxed);
+    teensy_frames_prev_ = teensy_frames_.load(std::memory_order_relaxed);
+    RCLCPP_INFO(get_logger(), "수신율 측정 시작 (첫 표본은 기준선이라 건너뛴다)");
+    return;
   }
+
+  double span_s = std::chrono::duration<double>(now_tp - diag_last_tp_).count();
+  if (span_s < 1e-3) span_s = diag_period_s_;
   diag_last_tp_ = now_tp;
 
   std::string alive, dead;
@@ -1159,11 +1168,22 @@ void CanBridge::failsafe_tick() {
 // 하향 편차가 되어 200 Hz 가 198 Hz 로 보인다 (20260904 에 그 버그를 잡았다).
 void CanBridge::rate_routine() {
   const auto now_tp = std::chrono::steady_clock::now();
-  double span = 1.0;
-  if (rate_last_tp_.time_since_epoch().count() != 0) {
-    const double d = std::chrono::duration<double>(now_tp - rate_last_tp_).count();
-    if (d > 1e-3) span = d;
+
+  // **첫 호출은 기준선만 잡고 발행하지 않는다.**
+  // rate_prev_ 가 0 이라 delta 가 "노드 기동 이후 전체 프레임"이 되는데, 그걸
+  // 공칭 1 s 로 나누면 기동 직후 한 번 **엉뚱하게 낮은 값**이 나간다.
+  // (Teensy 가 기동 0.4 s 에 붙으면 첫 표본이 120 Hz 로 찍힌다 — 20260904 에
+  //  화면에서 그 120 Hz 를 보고 잡았다. 그 뒤 표본은 정확하다.)
+  if (rate_last_tp_.time_since_epoch().count() == 0) {
+    rate_last_tp_ = now_tp;
+    for (int bid = 1; bid <= PWM_BOARDS; ++bid)
+      rate_prev_[(size_t)bid] = rx_count_[(size_t)bid].load(std::memory_order_relaxed);
+    rate_teensy_prev_ = teensy_frames_.load(std::memory_order_relaxed);
+    return;
   }
+
+  double span = std::chrono::duration<double>(now_tp - rate_last_tp_).count();
+  if (span < 1e-3) span = 1.0;
   rate_last_tp_ = now_tp;
 
   std_msgs::msg::Float64MultiArray m;
