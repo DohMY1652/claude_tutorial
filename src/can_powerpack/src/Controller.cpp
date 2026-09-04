@@ -1040,6 +1040,17 @@ void AcadosMpc::finish(const std::array<float,3>& du3,
       crack_stall_cnt_ = std::max(0, crack_stall_cnt_ - 2);
       crack_latched_ = false;
     } else if (++crack_stall_cnt_ >= need) {
+      // **걸리는 순간을 남긴다.** 이 하한은 MPPI 뒤에서 밸브를 크래킹까지 밀어
+      // 올리므로, 유지 구간에 걸리면 그 자체가 계단 입력이 되어 오버슛 →
+      // 반대편 래치 → 한계진동으로 이어질 수 있다. 20260904_123759 에서 유지
+      // 중 압력오차가 ±12~15 kPa 로 흔들렸는데 이는 문턱 8 kPa 를 넘는다 —
+      // 진동이 하한을 부르고 하한이 진동을 먹이는지 로그로 가른다.
+      if (!crack_latched_)
+        RCLCPP_WARN(rclcpp::get_logger("Mppi"),
+          "[ch%d] 크래킹 하한 걸림 — 오차 %.1f kPa, dP/dt %.1f kPa/s, "
+          "u_crack %.1f/%.1f/%.1f %%. 유지 중이라면 이 하한이 진동을 먹이고 있다.",
+          cfg_.global_id, (double)err_abs_, (double)dpdt_f_,
+          (double)u_crack_[0], (double)u_crack_[1], (double)u_crack_[2]);
       crack_latched_ = true;
     }
     if (crack_latched_) {
