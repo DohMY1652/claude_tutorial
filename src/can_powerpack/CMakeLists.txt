@@ -168,6 +168,7 @@ install(PROGRAMS
   scripts/teensy_monitor.py
   scripts/can_control.py
   scripts/can_control_auto.py
+  scripts/crack_from_log.py
   scripts/pp_check.py
   scripts/can_test.py
   scripts/log_topics.py
