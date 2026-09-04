@@ -1606,9 +1606,11 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   integ_hold_perr_kpa_ = get_param_or<double>(this,
       "PositionController.integ_hold_pressure_err_kpa", 8.0);
   integ_hold_on_band_ = get_param_or<bool>(this,
-      "PositionController.integ_hold_on_band", true);
+      "PositionController.integ_hold_on_band", false);
   integ_flip_tau_s_ = get_param_or<double>(this,
       "PositionController.integ_flip_tau_s", 0.15);
+  angle_runaway_deg_ = get_param_or<double>(this,
+      "PositionController.angle_runaway_deg", 25.0);
   target_slew_rate_.assign(std::max(1, num_actuators_), 0.0);
   band_sat_ticks_.assign(std::max(1, num_actuators_), 0);
 
@@ -3627,6 +3629,39 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
 
     // 이 시스템은 한 방향 힘만 낸다 → 목표는 항상 ≥ 0
     tau_ref[(size_t)a] = std::max(0.0, tau_pid + tau_grav + tau_fric);
+
+    // ── 폭주 보호 ──────────────────────────────────────────────────────
+    //
+    // 실기 20260904_163842: 목표 20° 인데 팔이 **102° 까지 올라가 머물렀다**
+    // (액추에이터 파손 직전). 그때까지 개입하는 것이 아무것도 없었다.
+    //
+    // 기전: 외층 권한이 내층의 정상상태 오차보다 작으면 tau_ref 는 사실상
+    // 중력 FF 뿐이 된다. 중력 FF 는 **측정 각도**로 계산하므로 팔이 올라가면
+    // 더 큰 압력을 요구한다 — 그 자체로는 정확한 상쇄라 중립이지만, 내층에
+    // 남아 있는 잉여 토크(그때 +8 kPa = +0.39 N·m)를 상쇄할 것이 없으면
+    // 팔은 계속 올라간다.
+    //
+    // 목표보다 runaway_deg 이상 위에 있으면서 **아직 올라가고 있으면**, 요구
+    // 토크를 그 자세의 중력보다 낮게 묶는다 → 반드시 감속한다. 0 으로 떨구지는
+    // 않는다 (자유낙하도 위험하다). 정상 추종에서는 오차가 이만큼 벌어지지
+    // 않으므로 이 경로는 안 탄다.
+    if (angle_runaway_deg_ > 0.0 && actuator_connected_) {
+      const double over = angle - angle_ref;
+      if (over > angle_runaway_deg_ && vel > 0.0) {
+        // tau_ff_gain 이 걸린 tau_grav 가 아니라 **실제 중력**을 기준으로 묶는다.
+        const double g_true = cfg.mass_kg * 9.81 * cfg.link_length_m
+                            * std::sin(angle * M_PI / 180.0);
+        const double cap = 0.9 * g_true;
+        if (tau_ref[(size_t)a] > cap) {
+          RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 500,
+            "[axis%d] **폭주 보호**: 목표보다 %.1f° 위(%.1f° vs %.1f°)에서 "
+            "+%.1f deg/s 로 계속 오른다. 요구 토크를 %.2f → %.2f N·m 로 묶는다. "
+            "외층 권한이 내층 오차보다 작다는 뜻이다 — 게인과 내층 추종을 볼 것.",
+            a, over, angle, angle_ref, vel, tau_ref[(size_t)a], cap);
+          tau_ref[(size_t)a] = cap;
+        }
+      }
+    }
     F_ref[(size_t)a]   = tau_ref[(size_t)a] / std::max(1e-6, reel_m);
 
     dbg_tau_pid[(size_t)a] = tau_pid;
