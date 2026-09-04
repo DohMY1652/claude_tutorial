@@ -1660,9 +1660,13 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     reel_radius_mm_     = get_param_or<double>(this, "Geometry.reel_radius_mm",   25.0);
     vol_offset_pos_mm_  = get_param_or<double>(this, "Geometry.vol_offset_pos_mm", 40.0);
     vol_offset_neg_mm_  = get_param_or<double>(this, "Geometry.vol_offset_neg_mm", 90.0);
+    stroke_vol_mult_    = std::max(1e-3,
+        get_param_or<double>(this, "Geometry.stroke_volume_mult", 1.0));
     RCLCPP_INFO(get_logger(),
-      "Geometry: piston Ø%.1f mm (A=%.1f mm²), reel %.1f mm, offsets %.0f/%.0f mm",
-      dia_mm, piston_area_mm2_, reel_radius_mm_, vol_offset_pos_mm_, vol_offset_neg_mm_);
+      "Geometry: piston Ø%.1f mm (A=%.1f mm²), reel %.1f mm, offsets %.0f/%.0f mm, "
+      "스트로크→부피 배수 %.3f",
+      dia_mm, piston_area_mm2_, reel_radius_mm_, vol_offset_pos_mm_, vol_offset_neg_mm_,
+      stroke_vol_mult_);
   }
 
   // ──────────────────────────────────────────
@@ -2900,7 +2904,10 @@ void Controller::on_timer() {
       const double A = piston_area_mm2_;
       for (int i = 0; i < num_positive_channels_; ++i) {
           if (active_channels_.count(i) == 0) continue;
-          const double x_mm    = reel_radius_mm_ * ang[i] * M_PI / 180.0;   // 피스톤 변위
+          // **부피용** 유효 스트로크. stroke_volume_mult 는 "옆면도 같이 좁아진다"를
+          // 담는 배수라 부피식에만 곱한다 — 토크 환산(F = τ/reel)에는 쓰지 않는다.
+          const double x_mm    = reel_radius_mm_ * ang[i] * M_PI / 180.0
+                                 * stroke_vol_mult_;
           const int    neg_gid = num_positive_channels_ + i;
 
           // 기하 모델에 **채널별 배율**을 곱한다.
@@ -3561,7 +3568,9 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
       ax.V_neg = std::max(1e-9, vol_ml_[(size_t)cfg.neg_gid] * 1e-6);
       // V̇ = A · reel · ω  (신장 방향이 양압 챔버를 키운다)
       const double omega_rad = dbg_vel[(size_t)a] * M_PI / 180.0;
-      const double dV = piston_area_mm2_ * reel_radius_mm_ * omega_rad * 1e-9;  // mm³/s → m³/s
+      // V̇ 도 같은 배수를 쓴다 — 안 그러면 부피와 그 미분이 서로 다른 기하가 된다.
+      const double dV = piston_area_mm2_ * reel_radius_mm_ * stroke_vol_mult_
+                        * omega_rad * 1e-9;  // mm³/s → m³/s
       ax.dVdt_pos =  dV;
       ax.dVdt_neg = -dV;
     }

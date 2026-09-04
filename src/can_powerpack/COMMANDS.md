@@ -291,6 +291,30 @@ ls -l /dev/serial/by-id/
 
 ---
 
+## 챔버 부피 곡선 측정 (밸브 닫고 손으로 각도 움직이기)
+
+기록 + 피팅 (1축)
+```bash
+cd ~/claude_tutorial && python3 src/can_powerpack/scripts/volume_probe.py --axes 0
+```
+
+전 축
+```bash
+cd ~/claude_tutorial && python3 src/can_powerpack/scripts/volume_probe.py
+```
+
+기록해 둔 CSV 만 다시 피팅
+```bash
+cd ~/claude_tutorial && python3 src/can_powerpack/scripts/volume_probe.py --fit ~/result/volprobe_<타임스탬프>.csv
+```
+
+라인 릴리프도 닫기 (**펌프 반드시 끌 것**)
+```bash
+cd ~/claude_tutorial && python3 src/can_powerpack/scripts/volume_probe.py --axes 0 --hold-rail-closed
+```
+
+---
+
 ## 보정
 
 압력 센서 대기압 재영점 — 현재 raw 읽기
