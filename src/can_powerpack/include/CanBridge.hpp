@@ -84,6 +84,21 @@ private:
   std::array<uint32_t, NUM_BOARDS + 1> rx_count_prev_{};
   rclcpp::TimerBase::SharedPtr diag_timer_;
   double diag_period_s_{5.0};
+  // 진단 주파수는 **실제 경과 시간**으로 나눈다 (공칭으로 나누면 타이머
+  // 지연이 1 % 하향 편차가 되어 200 Hz 가 198 Hz 로 보인다).
+  std::chrono::steady_clock::time_point diag_last_tp_{};
+
+  // ── 수신율을 토픽으로도 낸다 ───────────────────────────────────────────
+  // 보드별 수신율은 **브리지만 안다** (CAN 프레임을 직접 세는 유일한 곳).
+  // 모니터가 CAN 핸들을 따로 열면 호스트 부하가 늘고 실수로 송신할 위험도 생기니,
+  // 여기서 1 Hz 로 발행해 pp_monitor·pp_check 가 받아 쓰게 한다.
+  //   board/rx_hz : [보드1..보드16 Hz, Teensy Hz]  (길이 17)
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_rx_hz_;
+  rclcpp::TimerBase::SharedPtr rate_timer_;
+  std::array<uint32_t, NUM_BOARDS + 1> rate_prev_{};
+  uint32_t rate_teensy_prev_{0};
+  std::chrono::steady_clock::time_point rate_last_tp_{};
+  void rate_routine();
   void diag_routine();
 
   // TX 중복 억제 — 타이머는 명령이 없을 때만 보내는 폴백이다.

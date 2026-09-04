@@ -215,6 +215,8 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
   // 쓸 수 없다. can_monitor.py 처럼 CAN 을 직접 읽으면 can_bridge_node 와 핸들이 충돌하므로
   // 여기서 토픽으로 낸다 → scripts/encoder_calib.py 가 이것을 받는다.
   pub_analog_raw_ = this->create_publisher<std_msgs::msg::UInt16MultiArray>("board/analog_raw", 10);
+  // 수신율 — 보드별 + Teensy. pp_monitor 가 이걸 받아 화면에 같이 띄운다.
+  pub_rx_hz_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("board/rx_hz", 10);
 
   // Single flat PWM subscriber: board/pwm_cmd
   // Index (bid-1)*3 .. (bid-1)*3+2 = board bid v1/v2/v3
@@ -263,6 +265,10 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
   sensor_timer_ = this->create_wall_timer(
       std::chrono::milliseconds(std::max(1, sensor_period_ms_)),
       std::bind(&CanBridge::sensor_routine, this));
+  // 수신율 발행 (1 Hz). 진단 로그(5 s)보다 빨라야 모니터가 쓸 만하다.
+  rate_timer_ = this->create_wall_timer(
+      1000ms, std::bind(&CanBridge::rate_routine, this));
+
   // 페일세이프 진행 타이머 (두절 → 안전상태 → 종료). 50 ms 면 충분하다.
   failsafe_timer_ = this->create_wall_timer(
       50ms, std::bind(&CanBridge::failsafe_tick, this));
@@ -396,6 +402,19 @@ void CanBridge::on_cmd_pwm(const std_msgs::msg::UInt16MultiArray::SharedPtr msg)
 }
 
 void CanBridge::diag_routine() {
+  // **나눗셈에 공칭 주기를 쓰면 안 된다.** wall timer 는 5.000 s 에 정확히 뜨지 않고
+  // 스케줄러 지연만큼 늦게 뜬다. 공칭 5.0 으로 나누면 그 지연이 그대로 1 % 안팎의
+  // 하향 편차가 되어, 정확히 200.000 Hz 로 오는 Teensy 가 **198 Hz 로 보였다**
+  // (20260904: 실측 20 s/4000 프레임, seq 유실 0, CRC 0 → 199.997 Hz).
+  // 보드 수신율도 같은 이유로 낮게 보였다. 실제 경과 시간으로 나눈다.
+  const auto now_tp = std::chrono::steady_clock::now();
+  double span_s = diag_period_s_;
+  if (diag_last_tp_.time_since_epoch().count() != 0) {
+    const double d = std::chrono::duration<double>(now_tp - diag_last_tp_).count();
+    if (d > 1e-3) span_s = d;
+  }
+  diag_last_tp_ = now_tp;
+
   std::string alive, dead;
   for (int bid = 1; bid <= NUM_BOARDS; ++bid) {
     const uint32_t now = rx_count_[(size_t)bid].load(std::memory_order_relaxed);
@@ -406,7 +425,7 @@ void CanBridge::diag_routine() {
         dead += (dead.empty() ? "" : ", ") + std::to_string(bid);
     } else {
       char buf[32];
-      snprintf(buf, sizeof(buf), "%d:%.0fHz", bid, d / diag_period_s_);
+      snprintf(buf, sizeof(buf), "%d:%.0fHz", bid, d / span_s);
       alive += (alive.empty() ? "" : " ") + std::string(buf);
     }
   }
@@ -416,7 +435,7 @@ void CanBridge::diag_routine() {
   // CAN 줄과 나란히 찍어, "각도가 안 들어온다" 를 한 화면에서 가를 수 있게 한다.
   if (teensy_enable_) {
     const uint32_t f  = teensy_frames_.load(std::memory_order_relaxed);
-    const double   hz = (double)(f - teensy_frames_prev_) / diag_period_s_;
+    const double   hz = (double)(f - teensy_frames_prev_) / span_s;
     teensy_frames_prev_ = f;
     const uint32_t lost = teensy_lost_.load(std::memory_order_relaxed);
     const uint32_t cerr = teensy_crc_err_.load(std::memory_order_relaxed);
@@ -1132,4 +1151,30 @@ void CanBridge::failsafe_tick() {
       "**엔코더(Teensy) 배선·전원을 확인하고 다시 띄울 것.**");
     rclcpp::shutdown();
   }
+}
+
+
+// board/rx_hz : [보드1..보드16 Hz, Teensy Hz]. 1 Hz 로 낸다.
+// **실제 경과 시간으로 나눈다** — 공칭 1.0 s 로 나누면 타이머 지연이 그대로
+// 하향 편차가 되어 200 Hz 가 198 Hz 로 보인다 (20260904 에 그 버그를 잡았다).
+void CanBridge::rate_routine() {
+  const auto now_tp = std::chrono::steady_clock::now();
+  double span = 1.0;
+  if (rate_last_tp_.time_since_epoch().count() != 0) {
+    const double d = std::chrono::duration<double>(now_tp - rate_last_tp_).count();
+    if (d > 1e-3) span = d;
+  }
+  rate_last_tp_ = now_tp;
+
+  std_msgs::msg::Float64MultiArray m;
+  m.data.resize(PWM_BOARDS + 1, 0.0);
+  for (int bid = 1; bid <= PWM_BOARDS; ++bid) {
+    const uint32_t now = rx_count_[(size_t)bid].load(std::memory_order_relaxed);
+    m.data[(size_t)(bid - 1)] = (double)(now - rate_prev_[(size_t)bid]) / span;
+    rate_prev_[(size_t)bid] = now;
+  }
+  const uint32_t tf = teensy_frames_.load(std::memory_order_relaxed);
+  m.data[PWM_BOARDS] = teensy_enable_ ? (double)(tf - rate_teensy_prev_) / span : 0.0;
+  rate_teensy_prev_ = tf;
+  pub_rx_hz_->publish(m);
 }
