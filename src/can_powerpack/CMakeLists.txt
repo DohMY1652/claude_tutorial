@@ -170,6 +170,7 @@ install(PROGRAMS
   scripts/can_control_auto.py
   scripts/crack_from_log.py
   scripts/crack_from_steady.py
+  scripts/inner_id.py
   scripts/volume_probe.py
   scripts/pp_check.py
   scripts/can_test.py
