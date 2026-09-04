@@ -409,6 +409,7 @@ class RosTaps:
         self.lock = threading.Lock()
         self.raw = [0] * T_NCH
         self.ang = [None] * T_NCH
+        self.hist = [deque(maxlen=200) for _ in range(T_NCH)]   # 1s @200Hz
         self.rate = {k: Rate() for k in ("analog", "analog_raw", "sensors", "pwm_cmd")}
         self.hz = {k: 0.0 for k in self.rate}
         self.last_analog = 0.0
@@ -421,6 +422,8 @@ class RosTaps:
         def on_raw(m):
             with self.lock:
                 self.raw = [int(v) for v in m.data[:T_NCH]]
+                for c, v in enumerate(self.raw):
+                    self.hist[c].append(v)
             self.hz["analog_raw"] = self.rate["analog_raw"].tick()
 
         def on_ang(m):
@@ -456,7 +459,15 @@ class RosTaps:
 
     def snap(self):
         with self.lock:
-            return list(self.raw), list(self.ang)
+            sd = []
+            for c in range(T_NCH):
+                h = self.hist[c]
+                if len(h) > 2:
+                    m = sum(h) / len(h)
+                    sd.append((sum((x - m) ** 2 for x in h) / len(h)) ** 0.5)
+                else:
+                    sd.append(0.0)
+            return list(self.raw), list(self.ang), sd
 
     def close(self):
         try:
@@ -619,12 +630,11 @@ def draw(a, can, teensy, ros, tx, tcal, psrc, cfgpath, cal0, cal90, msg, t0):
     # ── Teensy ─────────────────────────────────────────────────────────────
     o.append(f"{CLR}{'─'*96}\n")
     if ros:
-        raws, angs = ros.snap()
+        raws, angs, sd = ros.snap()
         thz = ros.hz["analog_raw"]
         age = time.perf_counter() - ros.last_analog if ros.last_analog else 999
         o.append(f"{CLR} [엔코더] board/analog {ros.hz['analog']:6.1f} Hz   "
                  f"analog_raw {thz:6.1f} Hz   마지막 수신 {age*1000:.0f} ms 전\n")
-        sd = [0.0] * T_NCH
         status = 0
     else:
         raws, sd, status = teensy.snap()
@@ -642,7 +652,13 @@ def draw(a, can, teensy, ros, tx, tcal, psrc, cfgpath, cal0, cal90, msg, t0):
             cs = f"{cal[0]:.0f} → {cal[1]:.0f}"
         else:
             cs = "**미보정**"
-        astr = f"{angs[c]:10.2f}" if angs[c] is not None else pad("--.--", 10)
+        # **수신이 없으면 각도를 아예 안 보여준다.** 지금 보정에서 raw 0 은
+        # 121~127° 로 나오는데 가동범위 120° 안이라 정상처럼 보인다. 프레임이
+        # 없는데 각도를 띄우면 그걸 현재 자세로 오해한다.
+        if thz <= 0:
+            astr = pad("(수신없음)", 10)
+        else:
+            astr = f"{angs[c]:10.2f}" if angs[c] is not None else pad("--.--", 10)
         o.append(f"{CLR}  {c:>4}{raws[c]:8d}{astr}{sd[c]:9.2f}  {pad(cs, 20, False)}\n")
 
     if thz >= 195:
@@ -661,6 +677,16 @@ def draw(a, can, teensy, ros, tx, tcal, psrc, cfgpath, cal0, cal90, msg, t0):
     if ncal < T_NCH:
         verdict.append(("주의", f"엔코더 {T_NCH-ncal}채널 미보정 — 각도가 0° 로 나간다 "
                                 "(--calib 로 잡을 것)"))
+    # **각도만 봐서는 죽은 채널을 못 가린다.** 지금 보정에서 raw=0(전원 없음/단선)은
+    # 121~127° 로 나오는데, 기계적 가동범위 120° 안이라 정상처럼 보인다.
+    # 구별되는 것은 잡음뿐이다 — 살아 있는 채널은 σ 1.4~2.4 LSB, 죽으면 ~0 이다.
+    if thz > 0:
+        dead = [c for c in range(T_NCH) if sd[c] < 0.3]
+        if dead:
+            verdict.append(("실패", f"엔코더 ch{dead} 가 **잡음이 없다**(σ<0.3) — "
+                                    "신호가 안 들어온다. 각도는 그럴싸하게 나오니 "
+                                    "속지 말 것 (raw 0 이면 121~127° 로 보인다). "
+                                    "센서 전원·배선·ADS1115 채널을 확인할 것."))
 
     # ── ROS ────────────────────────────────────────────────────────────────
     if ros:

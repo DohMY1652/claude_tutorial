@@ -184,6 +184,41 @@ private:
   std::array<double, TEENSY_NCH> tenc_scale_{};   // deg per raw count
   std::array<bool,   TEENSY_NCH> tenc_measured_{};
 
+  // ── 엔코더 두절 시 페일세이프 ────────────────────────────────────────
+  // 각도가 없으면 위치 제어는 눈을 잃는다. 그 상태로 유지하면 컨트롤러는
+  // **얼어붙은 각도를 현재 자세로 믿고** 계속 밀거나 당긴다. 그래서:
+  //   1) 정해진 각도를 대신 발행해 컨트롤러가 스스로 감압하게 만들고
+  //      (컨트롤러가 ref_slew 로 천천히 줄인다 — 밸브를 직접 때리는 것보다 부드럽다)
+  //   2) teensy_failsafe_hold_ms 뒤에 하드 안전상태(채널 폐쇄 + 레일 배기)를 걸고
+  //   3) 노드를 내린다.
+  //
+  // **각도 선택**. 요구 토크는
+  //     tau_ref = max(0, kp·err + I + fric·sgn(err) + m·g·L·sin(angle))
+  //     err     = clamp(angle_ref − angle, ±target_follow_band_deg)   (Controller.cpp:3403)
+  //     tau_grav 는 **실측각**을 쓴다 (Controller.cpp:3495, actuator_connected 일 때)
+  // 이라 두 가지가 동시에 걸린다:
+  //   · 각도를 올리면 err 이 음수가 되어 PID 가 압력을 뺀다 — 다만 err 이 밴드(±5°)로
+  //     잘리므로 빼는 힘은 **kp·5 + 적분한계 + 마찰 = 1.62 N·m 에서 포화**한다.
+  //   · 동시에 tau_grav = 2.94·sin(angle) 이 커진다. 90° 에서 최대다.
+  // 그래서 각도별 tau_ref 는 (목표 무관, 각도가 목표+5° 를 넘은 뒤):
+  //     0°→1.62   60°→0.93   90°→1.32   120°→0.93   150°→0.00   180°→0.00
+  //   (0° 는 err 이 **양수**가 되어 오히려 밀어 올린다 — 직관과 반대다)
+  // 기계적 최대 120° 는 0.93 N·m 가 남고, **150° 이상이면 sin 이 충분히 작아져
+  // 모든 목표에서 정확히 0** 이 된다. 그래서 기본값은 180° 다 — 기계 범위 밖의
+  // 값이라 로그에서 "이건 실측이 아니다" 가 바로 보이는 것도 이점이다.
+  //
+  // 참고: actuator_connected:=false 면 tau_pid·tau_fric 가 0 이고 중력 FF 가
+  // **목표각**을 쓰므로, 이 가짜 각도는 아무 효과가 없다. 그때는 2 단계(하드
+  // 안전상태)만이 실제 보호다 — 그래서 hold_ms 를 짧게 두는 편이 낫다.
+  double teensy_failsafe_angle_deg_{180.0};
+  int    teensy_failsafe_hold_ms_{3000};
+  int    teensy_failsafe_vent_ms_{1500};
+  bool   teensy_failsafe_shutdown_{true};
+  std::atomic<bool>      failsafe_latched_{false};   // on_cmd_pwm 을 막는다
+  std::atomic<long long> failsafe_since_ns_{0};
+  rclcpp::TimerBase::SharedPtr failsafe_timer_;
+  void failsafe_tick();
+
   void teensy_loop();
   bool teensy_open();
   void teensy_close();

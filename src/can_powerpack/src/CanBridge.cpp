@@ -87,6 +87,10 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
   teensy_enable_      = this->declare_parameter<bool>("teensy_enable", !enc_from_can_);
   teensy_port_        = this->declare_parameter<std::string>("teensy_port", "");
   teensy_watchdog_ms_ = this->declare_parameter<int>("teensy_watchdog_ms", 100);
+  teensy_failsafe_angle_deg_ = declare_double_flexible(this, "teensy_failsafe_angle_deg", 180.0);
+  teensy_failsafe_hold_ms_   = this->declare_parameter<int>("teensy_failsafe_hold_ms", 3000);
+  teensy_failsafe_vent_ms_   = this->declare_parameter<int>("teensy_failsafe_vent_ms", 1500);
+  teensy_failsafe_shutdown_  = this->declare_parameter<bool>("teensy_failsafe_shutdown", true);
   for (auto& v : teensy_raw_) v.store(0, std::memory_order_relaxed);
 
   // 2점 보정: deg = (raw - raw_0deg) * 90 / (raw_90deg - raw_0deg).
@@ -259,6 +263,10 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
   sensor_timer_ = this->create_wall_timer(
       std::chrono::milliseconds(std::max(1, sensor_period_ms_)),
       std::bind(&CanBridge::sensor_routine, this));
+  // 페일세이프 진행 타이머 (두절 → 안전상태 → 종료). 50 ms 면 충분하다.
+  failsafe_timer_ = this->create_wall_timer(
+      50ms, std::bind(&CanBridge::failsafe_tick, this));
+
   if (diag_period_s_ > 0.0)
     diag_timer_ = this->create_wall_timer(
         std::chrono::milliseconds((int)std::lround(diag_period_s_ * 1000.0)),
@@ -354,6 +362,9 @@ void CanBridge::on_cmd_pwm(const std_msgs::msg::UInt16MultiArray::SharedPtr msg)
   // 판단해 조기 반환하고, 그러면 안전 상태가 실제로 보드에 송신되지 않는다.
   // 갱신하지 않으면 PWM 워치독도 함께 걸리는데, 둘 다 같은 안전 상태를 가리키므로 맞다.
   if (rx_stale_.load(std::memory_order_relaxed)) return;
+  // 페일세이프가 래치된 뒤에는 컨트롤러 지령을 **통째로 버린다.** 안 그러면
+  // apply_safe_state() 가 넣어 둔 밸브 상태를 매 틱 덮어써 무효가 된다.
+  if (failsafe_latched_.load(std::memory_order_relaxed)) return;
   {
     std::lock_guard<std::mutex> lk(cmd_mtx_);
     last_cmd_ = std::chrono::steady_clock::now();
@@ -576,12 +587,19 @@ void CanBridge::sensor_routine() {
   // 어느 쪽인지 몰라도 된다.
   if (!enc_from_can_) {
     // ── Teensy (기본) ──────────────────────────────────────────────────────
-    // 두절 중에는 **발행하지 않는다.** 얼어붙은 각도를 계속 내보내면 위치 제어가
-    // 그걸 현재 자세로 믿는다. 발행을 멈추면 컨트롤러의 encoder_angles_ 가 마지막
-    // 값에 정지하므로 최소한 0° 로 급변하지는 않는다.
+    // ── 두절 중에는 페일세이프 각도를 발행한다 ─────────────────────────
+    // 발행을 멈추면 컨트롤러의 encoder_angles_ 가 **마지막 값에 얼어붙고**,
+    // 컨트롤러는 그걸 현재 자세로 믿은 채 계속 밀거나 당긴다. 그래서 값을
+    // 끊는 대신 **정해진 각도로 갈아끼워** 컨트롤러가 스스로 감압하게 만든다.
+    // 그 뒤 failsafe_tick() 이 하드 안전상태 → 노드 종료로 이어 간다.
     if (!teensy_seen_.load(std::memory_order_relaxed) ||
-        teensy_stale_.load(std::memory_order_relaxed))
+        teensy_stale_.load(std::memory_order_relaxed)) {
+      std_msgs::msg::Float64MultiArray fs;
+      fs.data.assign(TEENSY_NCH, teensy_failsafe_angle_deg_);
+      pub_analog_->publish(fs);
+      // raw 는 내보내지 않는다 — 가짜 각도를 raw 로 역산해 보정에 쓰면 안 된다.
       return;
+    }
 
     std_msgs::msg::Float64MultiArray msg_a;
     std_msgs::msg::UInt16MultiArray  msg_ar;
@@ -983,8 +1001,18 @@ void CanBridge::teensy_loop() {
           std::chrono::steady_clock::now().time_since_epoch()).count(),
           std::memory_order_relaxed);
       teensy_seen_.store(true, std::memory_order_relaxed);
-      if (teensy_stale_.exchange(false, std::memory_order_relaxed))
-        RCLCPP_INFO(get_logger(), "Teensy 엔코더 복구 — 프레임 재개");
+      if (teensy_stale_.exchange(false, std::memory_order_relaxed)) {
+        // 아직 안전상태를 걸기 전이면 되살린다. 이미 래치됐으면 되돌리지 않는다 —
+        // 밸브를 안전상태로 놓은 뒤 슬그머니 제어로 돌아가면 그게 더 위험하다.
+        if (!failsafe_latched_.load(std::memory_order_relaxed)) {
+          failsafe_since_ns_.store(0, std::memory_order_relaxed);
+          RCLCPP_INFO(get_logger(), "Teensy 엔코더 복구 — 프레임 재개 (페일세이프 해제)");
+        } else {
+          RCLCPP_WARN(get_logger(),
+            "Teensy 엔코더가 돌아왔지만 **이미 안전상태로 래치됐다** — 제어로 "
+            "복귀하지 않는다. 노드를 다시 띄울 것.");
+        }
+      }
       if (!announced) {
         announced = true;
         RCLCPP_INFO(get_logger(), "Teensy 첫 프레임 수신 (seq=%u, status=0x%04X)",
@@ -1027,9 +1055,20 @@ void CanBridge::teensy_loop() {
           // 얼어붙은 각도를 계속 내보내면 위치 제어가 그걸 현재 자세로 믿는다.
           // 발행을 멈추면 컨트롤러의 encoder_angles_ 가 마지막 값에서 정지하므로
           // 최소한 0° 로 급변하지는 않는다. CAN 쪽 rx_stale_ 과 같은 사고방식이다.
-          RCLCPP_ERROR(get_logger(),
-            "Teensy 엔코더 두절 — %lld ms 동안 프레임이 없다. board/analog 발행을 멈춘다. "
-            "**위치 제어 중이라면 즉시 멈출 것.**", age_ms);
+        {
+          const long long now2 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count();
+          long long expect = 0;
+          if (failsafe_since_ns_.compare_exchange_strong(expect, now2,
+                                                         std::memory_order_relaxed))
+            RCLCPP_ERROR(get_logger(),
+              "Teensy 엔코더 두절 — %lld ms 동안 프레임이 없다. "
+              "**페일세이프 진입**: board/analog 을 %.1f° 로 고정 발행해 컨트롤러가 "
+              "감압하도록 하고, %d ms 뒤 안전상태(채널 폐쇄 + 레일 배기)를 걸고 "
+              "%d ms 더 유지한 뒤 노드를 내린다.",
+              age_ms, teensy_failsafe_angle_deg_,
+              teensy_failsafe_hold_ms_, teensy_failsafe_vent_ms_);
+        }
 
         // **포트를 닫아 재연결을 강제한다.**
         // 이게 없으면 케이블을 뽑았다 꽂아도 영영 복구되지 않는다. 장치가 사라지면
@@ -1048,4 +1087,49 @@ void CanBridge::teensy_loop() {
     }
   }
   teensy_close();
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  엔코더 두절 페일세이프 — 감압 → 안전상태 → 종료
+// ════════════════════════════════════════════════════════════════════════════
+// 단계:
+//   1) 두절 즉시   sensor_routine 이 board/analog 을 teensy_failsafe_angle_deg 로
+//                  고정 발행한다. 컨트롤러가 **자기 슬루 한계로 천천히** 압력을
+//                  뺀다. 밸브를 여기서 직접 때리는 것보다 부드럽고, 챔버 배기
+//                  밸브가 어느 슬롯인지도 컨트롤러가 안다.
+//   2) +hold_ms    하드 안전상태: 채널 밸브 전부 닫고 레일 배기 밸브를 연다.
+//                  이후 컨트롤러 지령을 **무시한다**(failsafe_latched_).
+//   3) +vent_ms    노드 종료. 마지막으로 보드에 남는 것은 안전상태 프레임이다.
+void CanBridge::failsafe_tick() {
+  const long long since = failsafe_since_ns_.load(std::memory_order_relaxed);
+  if (since == 0) return;                       // 두절 아님
+
+  const long long now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  const long long ms = (now - since) / 1000000LL;
+
+  // ── 2) 하드 안전상태 ──────────────────────────────────────────────────
+  if (ms >= teensy_failsafe_hold_ms_ &&
+      !failsafe_latched_.exchange(true, std::memory_order_relaxed)) {
+    {
+      std::lock_guard<std::mutex> lk(cmd_mtx_);
+      apply_safe_state();
+    }
+    RCLCPP_ERROR(get_logger(),
+      "페일세이프 2단계 — **안전상태 진입**. 채널 밸브를 전부 닫고 레일 배기 밸브를 "
+      "열었다. 이제부터 컨트롤러 지령을 무시한다. %d ms 뒤 노드를 내린다.",
+      teensy_failsafe_vent_ms_);
+    tx_send();                                   // 즉시 한 번 내보낸다
+  }
+
+  // ── 3) 종료 ───────────────────────────────────────────────────────────
+  if (teensy_failsafe_shutdown_ &&
+      failsafe_latched_.load(std::memory_order_relaxed) &&
+      ms >= (long long)teensy_failsafe_hold_ms_ + teensy_failsafe_vent_ms_) {
+    RCLCPP_ERROR(get_logger(),
+      "페일세이프 3단계 — 노드를 내린다. 보드에 마지막으로 남는 지령은 안전상태다. "
+      "**엔코더(Teensy) 배선·전원을 확인하고 다시 띄울 것.**");
+    rclcpp::shutdown();
+  }
 }

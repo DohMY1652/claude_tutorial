@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# ★ 20260903: 엔코더는 CAN 에서 Teensy 로 옮겼다. 이 파일의 ENCODER_* 는
+#   CAN 보드 17~22 전용이라 지금은 값이 안 들어온다.
+#   압력·엔코더를 함께 보려면 scripts/pp_check.py 를 쓸 것.
 """
 CAN 연결 자동 진단 (can_monitor.py + can_control.py 결합)
 

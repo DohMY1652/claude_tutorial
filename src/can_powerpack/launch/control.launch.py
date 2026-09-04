@@ -1,5 +1,5 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction, Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 import os
@@ -110,7 +110,9 @@ def _setup(context, *_a, **_k):
                    'pwm_watchdog_ms', 'can_rx_watchdog_ms',
                    'can_tx_fallback_ms', 'can_tx_min_interval_ms', 'can_diag_period_s',
                    'sensor_period_ms', 'encoder_source', 'teensy_enable',
-                   'teensy_port', 'teensy_watchdog_ms', 'can_required')
+                   'teensy_port', 'teensy_watchdog_ms', 'can_required',
+                   'teensy_failsafe_angle_deg', 'teensy_failsafe_hold_ms',
+                   'teensy_failsafe_vent_ms', 'teensy_failsafe_shutdown')
     bridge_overrides = {k: v for k, v in overrides.items() if k in BRIDGE_KEYS}
 
     can_bridge = Node(
@@ -121,6 +123,11 @@ def _setup(context, *_a, **_k):
         output='screen',   # 'log' 였다 — 엔코더 캘리브레이션 실패 ERROR 가 터미널에
                            # 안 떠서 0도가 158도로 읽히는 것을 며칠 못 봤다,
         parameters=[config_path, *fitted, bridge_overrides],
+        # **브리지가 내려가면 런치 전체를 내린다.** 엔코더 두절 페일세이프가
+        # 안전상태를 걸고 스스로 종료하는데, 그때 컨트롤러만 남으면 아무 데도
+        # 안 가는 지령을 계속 만든다. 브리지가 없으면 CAN 도 없으니 의미가 없다.
+        on_exit=Shutdown(reason='can_bridge_node 가 종료됐다 (엔코더 두절 페일세이프 '
+                                '또는 CAN 초기화 실패). 런치 전체를 내린다.'),
     )
 
     controller = Node(
