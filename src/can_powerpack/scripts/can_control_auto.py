@@ -21,11 +21,15 @@ can_control_auto.py — 원하는 주파수로 각 보드에 PWM 값을 자동 �
 
 **안전**
   · **전 밸브(v1·v2·v3)에 값이 그대로 들어간다.**
-    ★ 20260904 정정: 채널 밸브 순서는 **v1=micro(미세 공급), v2=macro(대유량
-      공급), v3=atm(대기 배기)** 다 (include/Controller.hpp:258 — u_micro,
-      u_macro, u_atm 순으로 zoh_ 에 들어간다). 예전 주석은 v3 를 macro 라고
-      잘못 적었고 `--no-macro` 가 **배기 밸브**를 0 에 묶고 있었다 — 보호가
-      아니라 그 반대였다. 지금은 v2 를 묶는다.
+    ★ 보드의 PWM 슬롯 순서는 **v1=micro(미세 공급), v2=atm(대기 배기),
+      v3=macro(대유량 공급)** 다. 모델 내부 배열 pv[] 는 [micro, macro, atm]
+      순이지만 AcadosMpc::finish 가 슬롯으로 내보낼 때 재배치한다
+      (Controller.cpp: out3[1]=u0[2](atm), out3[2]=u0[1](macro)).
+      실측으로도 확인했다 (20260904_122116, board5 axis0):
+        충전 0→45  v1 29.9 %  v2  7.8 %  v3 0.2 %   ← v1 이 공급
+        배기 90→0  v1 14.2 %  v2 24.3 %  v3 0.0 %   ← v2 가 배기
+      **20260903 에 이걸 반대로 알고 --no-macro 가 v2(배기)를 묶도록 바꿨다가
+      20260904 에 되돌렸다.** 배기를 묶으면 보호가 아니라 그 반대다.
     macro 도 포함이다 —
     macro 배관을 물리적으로 떼고 쓰는 것을 전제한다. 탱크가 충전된 채 macro 가
     연결돼 있으면 챔버가 과압된다 (20260829 에 액추에이터가 그렇게 부서졌다,
@@ -45,7 +49,7 @@ can_control_auto.py — 원하는 주파수로 각 보드에 PWM 값을 자동 �
   # 송신율 쓸어보기
   python3 can_control_auto.py --sweep 0.5,5,25,50,100 --pattern random
 
-  # macro 배관을 못 뗐을 때 (v2 = macro 를 0 에 묶는다)
+  # macro 배관을 못 뗐을 때 (v3 = macro 를 0 에 묶는다)
   python3 can_control_auto.py --hz 20 --pattern random --no-macro
 """
 import argparse
@@ -126,8 +130,7 @@ def make_targets(pattern, vmax, no_macro, tick):
         else:
             raise ValueError(pattern)
         if no_macro:
-            v[1] = 0          # v2 = macro (대유량 공급)를 묶는다.
-                              # v3 는 atm(배기)이라 묶으면 압을 못 빼게 된다.
+            v[2] = 0          # v3 = macro (대유량 공급)를 묶는다.
         t[b] = tuple(min(PWM_MAX, max(0, x)) for x in v)
     return t
 
@@ -271,8 +274,8 @@ def main():
     ap.add_argument('--max', dest='vmax', type=int, default=PWM_MAX,
                     help=f'값 상한 0..{PWM_MAX} (기본 {PWM_MAX})')
     ap.add_argument('--no-macro', action='store_true',
-                    help='v2(macro, 대유량 공급)를 0 에 묶는다. macro 배관을 못 뗐을 때. '
-                         'v3 는 atm(배기)이라 묶지 않는다.')
+                    help='v3(macro, 대유량 공급)를 0 에 묶는다. macro 배관을 못 뗐을 때. '
+                         'v2 는 atm(배기)이라 묶지 않는다.')
     ap.add_argument('--sweep', type=str, default=None,
                     help='주파수 목록을 쉼표로 (예: 0.5,5,25,50,100). --hz 를 무시한다.')
     ap.add_argument('--per-board', action='store_true',
@@ -294,7 +297,7 @@ def main():
         return 1
 
     print(f'[can_control_auto] 패턴 {a.pattern}   상한 {a.vmax}   '
-          f'macro(v2) {"0 고정" if a.no_macro else "랜덤 포함"}')
+          f'macro(v3) {"0 고정" if a.no_macro else "랜덤 포함"}')
     if a.pattern == 'zero':
         print('  (값이 전부 0 이라 밸브는 움직이지 않는다 — 순수 버스 시험)')
     elif not a.no_macro:

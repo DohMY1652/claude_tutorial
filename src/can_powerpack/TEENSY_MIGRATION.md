@@ -248,12 +248,26 @@ MPPI `Ts/NP/du_limit/ref_tau` 는 롤아웃 스텝 기준 ·
 호스트 파서의 기준은 `scripts/teensy_monitor.py` 와 `include/TeensyFrame.hpp` 다.
 **실기 소스를 확보해서 .ino 를 갱신할 것.**
 
-### 20260904 에 정정한 밸브 슬롯
+### 밸브 슬롯 (20260904 실측으로 확정)
 
-채널 밸브 순서는 **v1=micro(미세 공급), v2=macro(대유량 공급), v3=atm(대기 배기)**
-다 (`include/Controller.hpp:258`, `u_micro/u_macro/u_atm` 순으로 `zoh_` 에 들어간다).
-`can_control_auto.py` 의 `--no-macro` 가 v3 를 묶고 있었는데, 그건 **배기 밸브**라
-보호가 아니라 그 반대였다. v2 를 묶도록 고쳤다.
+보드의 PWM 슬롯은 **v1=micro(미세 공급), v2=atm(대기 배기), v3=macro(대유량 공급)**.
+
+모델 내부 배열 `pv[]` 는 `[micro, macro, atm]` 순이지만 `AcadosMpc::finish` 가
+슬롯으로 내보낼 때 재배치한다 (`Controller.cpp`: `out3[1]=u0[2]`(atm),
+`out3[2]=u0[1]`(macro)). `Controller.hpp:258` 의 "(0=micro, 1=macro, 2=atm)" 은
+**모델 배열** 순서지 슬롯 순서가 아니다 — 여기서 헷갈리기 쉽다.
+
+실측 (20260904_122116, board5 axis0):
+
+| 구간 | v1 | v2 | v3 | 판정 |
+|---|---|---|---|---|
+| 충전 0→45 | **29.9 %** | 7.8 % | 0.2 % | v1 = 공급 |
+| 배기 90→0 | 14.2 % | **24.3 %** | 0.0 % | v2 = 배기 |
+| 90° 유지 | 16.8 % | 16.2 % | 0.1 % | v3 는 항상 쉼 |
+
+> 20260903 에 이걸 반대로 알고 `can_control_auto.py` 의 `--no-macro` 가
+> v2(배기)를 묶도록 바꿨다가 20260904 에 되돌렸다. 배기를 묶으면 보호가 아니라
+> 그 반대다.
 
 ---
 
