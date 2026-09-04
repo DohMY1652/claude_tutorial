@@ -931,7 +931,13 @@
 
       axis3:
         # 공용 — enc/pos/neg = board20 / board8  / board14
-        mass_kg: 5.0
+        # 20260904: 5.0 → 2.0. axis0~2 는 2 kg 인데 여기만 5 kg 로 남아 있었다
+        # (6 축 확장 때 안 고친 기본값). 중력 FF 가 2.5 배라 같은 목표각에서
+        # 요구 차압이 60 → 150 kPa 로 벌어졌고, 채널 정격 185 kPa 에 걸려
+        # 포화했다. 실측 20260904_112854: 축0~2 Pref+ 157.2 / Pref− 97.2,
+        # 축3~5 Pref+ 185.0(정격) / Pref− 41.7 — 라인 여유가 46 → 18 kPa 로
+        # 줄어 axis5 가 11 kPa 를 못 따라갔다.
+        mass_kg: 2.0
         link_length_m: 0.15
         p_pos_max_kpa: 185.0
         p_neg_min_kpa: 27.0
@@ -957,7 +963,13 @@
 
       axis4:
         # 공용 — enc/pos/neg = board21 / board9  / board15
-        mass_kg: 5.0
+        # 20260904: 5.0 → 2.0. axis0~2 는 2 kg 인데 여기만 5 kg 로 남아 있었다
+        # (6 축 확장 때 안 고친 기본값). 중력 FF 가 2.5 배라 같은 목표각에서
+        # 요구 차압이 60 → 150 kPa 로 벌어졌고, 채널 정격 185 kPa 에 걸려
+        # 포화했다. 실측 20260904_112854: 축0~2 Pref+ 157.2 / Pref− 97.2,
+        # 축3~5 Pref+ 185.0(정격) / Pref− 41.7 — 라인 여유가 46 → 18 kPa 로
+        # 줄어 axis5 가 11 kPa 를 못 따라갔다.
+        mass_kg: 2.0
         link_length_m: 0.15
         p_pos_max_kpa: 185.0
         p_neg_min_kpa: 27.0
@@ -983,7 +995,13 @@
 
       axis5:
         # 공용 — enc/pos/neg = board22 / board10 / board16
-        mass_kg: 5.0
+        # 20260904: 5.0 → 2.0. axis0~2 는 2 kg 인데 여기만 5 kg 로 남아 있었다
+        # (6 축 확장 때 안 고친 기본값). 중력 FF 가 2.5 배라 같은 목표각에서
+        # 요구 차압이 60 → 150 kPa 로 벌어졌고, 채널 정격 185 kPa 에 걸려
+        # 포화했다. 실측 20260904_112854: 축0~2 Pref+ 157.2 / Pref− 97.2,
+        # 축3~5 Pref+ 185.0(정격) / Pref− 41.7 — 라인 여유가 46 → 18 kPa 로
+        # 줄어 axis5 가 11 kPa 를 못 따라갔다.
+        mass_kg: 2.0
         link_length_m: 0.15
         p_pos_max_kpa: 185.0
         p_neg_min_kpa: 27.0
