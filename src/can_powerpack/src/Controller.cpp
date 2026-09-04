@@ -1709,17 +1709,26 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     tp.friction_vel_band_dps =
         get_param_or<double>(this, pre + "friction_vel_band_dps", 40.0);
 
-    // 속도 기준 마찰 보상은 **운동 방향으로** 붙으므로 밴드 안에서는 음의 감쇠다.
-    // 속도 되먹임 전체가 −kd·vel + friction_nm·vel/band 이므로, 순 감쇠가
-    // 양수이려면 friction_nm/band < kd 여야 한다. 넘으면 조용히 진동한다.
-    if (tp.friction_vel_band_dps > 0.0 && tp.kd > 0.0) {
-      const double slope = tp.friction_nm / tp.friction_vel_band_dps;
-      if (slope >= tp.kd) {
+    // ── 캐스케이드 대역 검사 ──────────────────────────────────────────
+    //
+    // 외층(위치)은 내층(압력)보다 **느려야** 한다. 외층의 교차주파수는
+    // |L|=1 에서 kd 가 지배하므로 ωc ≈ kd/J 다 (kp 는 거의 영향이 없다).
+    // 내층은 cmd_lpf_hz 2 Hz + mppi_ref_tau_s 0.12 s 로 ≈1.33 Hz = 8.4 rad/s 다.
+    //
+    // 실기 20260904_155224: kd 0.02 → ωc 25.8 rad/s = 4.1 Hz 로 내층보다
+    // **3 배 빨랐고**, 내층 지연 160 ms 가 그 주파수에서 위상을 234° 먹어
+    // 0.95 Hz · p-p 11.6° 한계진동이 났다.
+    {
+      const auto& pc = pos_ctrl_cfg_[(size_t)a];   // 위에서 이미 채웠다
+      const double J = std::max(1e-9, pc.mass_kg * pc.link_length_m * pc.link_length_m);
+      const double wc = (tp.kd / (M_PI / 180.0)) / J;      // [rad/s]
+      const double w_inner = 2.0 * M_PI * 1.33;
+      if (wc > w_inner / 2.0) {
         RCLCPP_ERROR(get_logger(),
-          "[axis%d] friction_vel_band_dps=%.1f 이 너무 좁다: 마찰 보상 기울기 "
-          "%.4f ≥ kd %.4f 라 **순 감쇠가 음수**다 (밴드 안에서 진동한다). "
-          "friction_vel_band_dps > friction_nm/kd = %.1f deg/s 로 둘 것.",
-          a, tp.friction_vel_band_dps, slope, tp.kd, tp.friction_nm / tp.kd);
+          "[axis%d] kd=%.4f → 외층 교차 %.1f rad/s (%.2f Hz) 로 내층(≈1.33 Hz)보다 "
+          "빠르다. 캐스케이드가 거꾸로다 — 한계진동한다. kd < %.4f 로 둘 것 "
+          "(내층의 1/3).", a, tp.kd, wc, wc / (2.0 * M_PI),
+          (w_inner / 3.0) * J * (M_PI / 180.0));
       }
     }
   }
@@ -3594,13 +3603,27 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     // 정의되지 않으므로 예전처럼 오차 방향으로 되돌아간다(고착 돌파). 두 영역
     // 사이는 |vel|/friction_vel_band_dps 로 선형 혼합해 연속이다.
     // friction_vel_band_dps 를 0 으로 두면 예전(오차 기준) 동작이다.
+    // **측정 속도가 아니라 목표 속도로 준다 — 피드포워드다.**
+    //
+    // 측정 속도로 주면 밴드 안에서 보상이 운동 방향으로 비례해 붙으므로
+    // 기울기 friction_nm/band 만큼의 **음의 감쇠**가 되고, 순 감쇠가 양수이려면
+    // friction_nm/band < kd 여야 한다. 캐스케이드 대역을 맞추느라 kd 를
+    // 0.02 → 0.0020 으로 내리면 밴드가 240 deg/s 를 넘어야 해서 실용 불가다.
+    //
+    // 목표 속도(target_slew_rate_)는 측정에서 오지 않으므로 루프 위상을 전혀
+    // 먹지 않는다. "지금 이 방향으로 움직이라고 명령했으니 그만큼 마찰을
+    // 이겨야 한다" 는 것이 원래 의도이기도 하다. 하강을 명령하면 −friction_nm,
+    // 상승이면 +friction_nm, 정지 명령이면 0 이다.
+    //
+    // friction_vel_band_dps 를 0 으로 두면 예전의 오차 기준으로 되돌아간다.
+    // 오차 기준은 목표 근처에서 강성을 kp 0.0786 → 0.56 N·m/deg 로 7 배 키워
+    // 감쇠비를 1.27 → 0.48 로 떨어뜨렸다 (실기 20260904_153154).
     const double fb = std::max(1e-6, tp.friction_band_deg);
-    const double f_err = std::clamp(err / fb, -1.0, 1.0);
     const double vb = tp.friction_vel_band_dps;
-    const double w_vel = (vb > 0.0) ? std::clamp(std::abs(vel) / vb, 0.0, 1.0) : 0.0;
-    const double f_vel = (vb > 0.0) ? std::clamp(vel / vb, -1.0, 1.0) : 0.0;
     const double tau_fric = actuator_connected_
-        ? tp.friction_nm * (w_vel * f_vel + (1.0 - w_vel) * f_err) : 0.0;
+        ? tp.friction_nm * ((vb > 0.0) ? std::clamp(vel_ref / vb, -1.0, 1.0)
+                                       : std::clamp(err / fb, -1.0, 1.0))
+        : 0.0;
 
     // 이 시스템은 한 방향 힘만 낸다 → 목표는 항상 ≥ 0
     tau_ref[(size_t)a] = std::max(0.0, tau_pid + tau_grav + tau_fric);
