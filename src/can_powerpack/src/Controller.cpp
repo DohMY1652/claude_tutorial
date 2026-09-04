@@ -1608,6 +1608,14 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   target_slew_rate_.assign(std::max(1, num_actuators_), 0.0);
   band_sat_ticks_.assign(std::max(1, num_actuators_), 0);
 
+  // **실제로 로드된 값을 찍는다.** config 만 바꾸면 colcon 이 설치를 건너뛰는
+  // 일이 있어(20260904 15:04 에 겪음: 소스는 1.0/8.0 인데 설치본은 2.0/0.0),
+  // 옛 설정으로 도는 줄 모르고 실험한다. 기동 로그에서 바로 확인할 수 있게 한다.
+  RCLCPP_INFO(get_logger(),
+    "PositionController: 슬루 %.1f deg/s, 오차밴드 %.1f°, kd_vel_ff %.2f, "
+    "적분정지 압력오차 %.1f kPa (0=끔)",
+    target_slew_dps_, target_follow_band_deg_, kd_vel_ff_, integ_hold_perr_kpa_);
+
   for (int a = 0; a < num_actuators_; ++a) {
     const std::string prefix = "PositionController.axis" + std::to_string(a) + ".";
     auto& c = pos_ctrl_cfg_[(size_t)a];

@@ -7,6 +7,16 @@
 cd ~/claude_tutorial && colcon build --packages-select can_powerpack --cmake-args -DCMAKE_BUILD_TYPE=Release
 ```
 
+**config 만 바꿨을 때** — colcon 이 설치를 건너뛰는 일이 있다. 반드시 확인할 것
+```bash
+cd ~/claude_tutorial && grep -n "바꾼항목" install/can_powerpack/share/can_powerpack/config/powerpack_config.yaml
+```
+
+안 바뀌었으면 강제로
+```bash
+cd ~/claude_tutorial && touch src/can_powerpack/CMakeLists.txt && colcon build --packages-select can_powerpack --cmake-args -DCMAKE_BUILD_TYPE=Release
+```
+
 환경 설정 (새 터미널마다)
 ```bash
 cd ~/claude_tutorial && source install/setup.bash
