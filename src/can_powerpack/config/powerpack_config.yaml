@@ -218,25 +218,38 @@
       macro_neg: 4  # board 4 → P_line_macro_neg sensor + MacroSwitch PWM
 
     # === per-board calibration (board_id 1-based, boards 19~25 제외) ===
+    #
+    # offset 은 **대기압일 때의 orig_mV** 다.  P = (orig_mV − offset)·gain + 101.325,
+    # orig_mV = 5000 − raw·4000/4095  (= (4125 − raw·3300/4095)/0.825, 반전앰프 역산).
+    # 그래서 offset 을 지금 측정값으로 놓는 것이 곧 "지금이 대기압이다" 선언이다.
+    #
+    # ★ 20260904 전 보드 재영점. 계통을 대기압으로 두고 6 초(보드당 3000 표본) 평균.
+    #   드리프트 0.6 raw 이하, 표준오차 0.02 kPa. 이전 값 대비 −3.6 ~ +1.7 kPa 이동.
+    #   가장 크게 움직인 것은 board 6(−3.61), 10(−3.09), 7(−2.25) — 전부 양압 채널이다.
+    #
+    # **잔압이 남은 채로 재영점하면 안 된다.** 그 채널의 영점이 잔압만큼 통째로
+    # 밀리고 **과압 세이프티도 같이 밀린다** (190 kPa 트립이 실제 210 kPa 에서 걸리는 식).
+    # 컨트롤러는 기동 시 0.5 초 평균으로 자동 재영점하며, 여기 값과 zero_tolerance_kpa
+    # 이상 벌어지면 경고한다 — 그 경고가 뜨면 잔압을 의심할 것.
     Sensor_calibration:
       atm_offset: 101.325
       boards:
-        "1":  { offset: 1112.0,  gain: 0.250 }      # P_line_pos      (Board 1)
-        "2":  { offset: 1020.0,  gain: -0.02525 }   # P_line_neg      (Board 2)
-        "3":  { offset: 1064.0,  gain: 0.250 }      # P_line_macro    (Board 3)
-        "4":  { offset: 1020.0,  gain: -0.02525 }   # P_line_macro_neg (Board 4)
-        "5":  { offset: 1076.0,  gain: 0.250 }      # gid 0  (Board 5,  양압 ch0)
-        "6":  { offset: 1077.0,  gain: 0.250 }      # gid 1  (Board 6,  양압 ch1)
-        "7":  { offset: 1054.0,  gain: 0.250 }      # gid 2  (Board 7,  양압 ch2) — 2026-08-24 재영점 (기존 1089.0)
-        "8":  { offset: 1065.0,  gain: 0.250 }      # gid 3  (Board 8,  양압 ch3)
-        "9":  { offset: 1072.0,  gain: 0.250 }      # gid 4  (Board 9,  양압 ch4)
-        "10": { offset: 1070.0,  gain: 0.250 }      # gid 5  (Board 10, 양압 ch5)
-        "11": { offset: 1070.0,  gain: -0.02525 }   # gid 6  (Board 11, 음압 ch6)
-        "12": { offset: 1020.0,  gain: -0.02525 }   # gid 7  (Board 12, 음압 ch7)
-        "13": { offset: 1012.0,  gain: -0.02525 }   # gid 8  (Board 13, 음압 ch8)
-        "14": { offset: 1032.0,  gain: -0.02525 }   # gid 9  (Board 14, 음압 ch9)
-        "15": { offset: 1010.0,  gain: -0.02525 }   # gid 10 (Board 15, 음압 ch10)
-        "16": { offset: 1030.0,  gain: -0.02525 }   # gid 11 (Board 16, 음압 ch11)
+        "1":  { offset: 1109.6,  gain: 0.250 }      # P_line_pos      (Board 1)  ← 20260904 재영점 (이전 1112)
+        "2":  { offset: 1022.4,  gain: -0.02525 }   # P_line_neg      (Board 2)  ← 20260904 재영점 (이전 1020)
+        "3":  { offset: 1057.1,  gain: 0.250 }      # P_line_macro    (Board 3)  ← 20260904 재영점 (이전 1064)
+        "4":  { offset: 1021.0,  gain: -0.02525 }   # P_line_macro_neg (Board 4)  ← 20260904 재영점 (이전 1020)
+        "5":  { offset: 1076.7,  gain: 0.250 }      # gid 0  (Board 5,  양압 ch0)  ← 20260904 재영점 (이전 1076)
+        "6":  { offset: 1091.4,  gain: 0.250 }      # gid 1  (Board 6,  양압 ch1)  ← 20260904 재영점 (이전 1077)
+        "7":  { offset: 1063.0,  gain: 0.250 }      # gid 2  (Board 7,  양압 ch2)  ← 20260904 재영점 (이전 1054)
+        "8":  { offset: 1070.7,  gain: 0.250 }      # gid 3  (Board 8,  양압 ch3)  ← 20260904 재영점 (이전 1065)
+        "9":  { offset: 1069.2,  gain: 0.250 }      # gid 4  (Board 9,  양압 ch4)  ← 20260904 재영점 (이전 1072)
+        "10": { offset: 1082.4,  gain: 0.250 }      # gid 5  (Board 10, 양압 ch5)  ← 20260904 재영점 (이전 1070)
+        "11": { offset: 1065.6,  gain: -0.02525 }   # gid 6  (Board 11, 음압 ch6)  ← 20260904 재영점 (이전 1070)
+        "12": { offset: 1016.3,  gain: -0.02525 }   # gid 7  (Board 12, 음압 ch7)  ← 20260904 재영점 (이전 1020)
+        "13": { offset: 1039.4,  gain: -0.02525 }   # gid 8  (Board 13, 음압 ch8)  ← 20260904 재영점 (이전 1012)
+        "14": { offset: 1013.3,  gain: -0.02525 }   # gid 9  (Board 14, 음압 ch9)  ← 20260904 재영점 (이전 1032)
+        "15": { offset: 1023.7,  gain: -0.02525 }   # gid 10 (Board 15, 음압 ch10)  ← 20260904 재영점 (이전 1010)
+        "16": { offset: 1070.6,  gain: -0.02525 }   # gid 11 (Board 16, 음압 ch11)  ← 20260904 재영점 (이전 1030)
         # Board 17~22 (엔코더) 는 **여기 없다.** 엔코더 보정의 단일 출처는 위쪽
         # can_bridge 의 `EncoderCalibration.boards.N.raw_0deg/raw_90deg` 하나다.
         #
