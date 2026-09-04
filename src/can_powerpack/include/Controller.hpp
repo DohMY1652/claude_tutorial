@@ -892,6 +892,16 @@ private:
   std::vector<int> band_sat_ticks_;
   // 압력 추종 오차가 이보다 크면 외층 적분을 얼린다 [kPa]. 0 이하면 끔.
   double integ_hold_perr_kpa_{8.0};
+  // **추종 오차가 밴드에 포화해 있는 동안 적분을 얼린다.**
+  // 밴드에 붙어 있다는 것은 큰 신호 이동 중이라는 뜻이고, 그때 err 은 상수라
+  // 적분은 오차 정보가 아니라 경과 시간만 쌓는다 — 정의상 와인드업이다.
+  // 실기 20260904_153154: err 이 29.4 % 의 시간 ±5° 에 붙어 있었고 ki·I 가
+  // 18.5 % 의 시간 상한(0.75 N·m)에 포화해 있었다.
+  bool integ_hold_on_band_{true};
+  // 오차 부호가 뒤집힐 때 적분을 **즉시 0 으로 떨구지 않고** 이 시정수로 흘린다 [s].
+  // 즉시 리셋은 ki·I 만큼의 계단이다 (실기에서 0.75 N·m = 중력 최대의 26 %).
+  // 0 이하면 예전처럼 즉시 리셋.
+  double integ_flip_tau_s_{0.15};
   // 슬루 상태를 현재 각도에서 한 번 출발시켰나 (기동 계단 방지).
   bool slew_seeded_{false};
   int  slew_seed_ticks_{0};
@@ -905,6 +915,10 @@ private:
   // 위치 제어 디버그 토픽
   // data: 축마다 8개씩 이어붙임 [angle, angle_ref, p_pos_ref, p_neg_ref, p_pid, p_ff, p_friction, vel_dps] × num_actuators_
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_pos_dbg_;
+  // 토크 항 분해 (mode 2). 축마다 8개:
+  //   [kp·err, ki·I, −kd·vel_err, 중력FF, 마찰, vel, err_raw, 적분동결사유]
+  // mode 2 는 position_dbg 를 안 내므로 이게 없으면 I 항을 로그로 볼 수 없다.
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_tau_dbg_;
 
   // ──────────────────────────────────────────
   // control_mode 2: 최적화 기반 압력 레퍼런스 생성기
@@ -945,6 +959,25 @@ private:
     // 0 에 가까우면 예전의 하드 sign 과 같아져 목표 근처에서 ±friction_nm 이
     // 계단으로 뒤집힌다 (S-29 참조).
     double friction_band_deg{1.0};
+    // 마찰 보상 속도 밴드 [deg/s]. **쿨롱 마찰은 운동을 거스르므로 위치 오차가
+    // 아니라 속도의 함수다.** 이보다 빠르면 순수하게 속도 방향으로 보상하고,
+    // 정지 근처에서는 운동 방향이 정의되지 않으므로 오차 방향으로 되돌아간다
+    // (고착 돌파). 사이는 선형 혼합이라 연속이다. 0 이면 예전의 오차 기준.
+    //
+    // **이 값에는 안정성 하한이 있다.** 밴드 안에서 보상은 속도에 비례해
+    // 운동 방향으로 붙으므로 **음의 감쇠**다. 속도 되먹임 전체는
+    //     −kd·vel + friction_nm·vel/vel_band
+    // 이라 순 감쇠가 양수이려면
+    //     friction_nm / friction_vel_band_dps  <  kd
+    // 여야 한다. 지금 값(0.48, kd 0.02)이면 밴드 > 24 deg/s 다.
+    // 40 으로 두면 기울기 0.012 라 kd 의 60 % — 순 감쇠가 kd 의 40 % 남는다.
+    // 대신 25 deg/s 슬루에서 보상은 0.30 N·m 로 과소보상인데, 과소보상은
+    // 굼뜰 뿐 절대 불안정해지지 않는다. 과보상이 위험한 쪽이다.
+    //
+    // 참고: 예전의 **오차 기준도 같은 이유로 위험했다.** 그쪽 기울기는
+    // friction_nm/friction_band_deg = 0.48 N·m/deg 로 kp(0.0786)의 6 배이고
+    // 부호가 반대라, 목표 ±1° 안에서 순 강성이 −0.40 N·m/deg 였다.
+    double friction_vel_band_dps{40.0};
     // 중력 피드포워드 배율. 액추에이터 미연결 시험에서 목표 압력을 낮추는 데 쓴다.
     // 목표 압력에 거의 선형으로 반영된다. 액추에이터를 붙이면 1.0 으로 되돌릴 것.
     double tau_ff_gain{1.0};

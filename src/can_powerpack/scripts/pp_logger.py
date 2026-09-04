@@ -16,7 +16,10 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray, UInt16MultiArray
 
-SCHEMA_VERSION = 5           # 형식을 바꾸면 올린다. 과거 CSV 구분용(meta.json 에 기록)
+SCHEMA_VERSION = 6           # 형식을 바꾸면 올린다. 과거 CSV 구분용(meta.json 에 기록)
+                             # 6: 토크 항 분해 8열/축 추가 (tau_kp/ki/kd/grav/fric,
+                             #    vel_filt, err_raw, integ_hold) — mode 2 에서 I 항을
+                             #    로그로 볼 수 없던 문제를 고쳤다.
 #   5: refgen 말미 6 개(rail SP·탱크·부스트·이젝터) 열 추가
 NAMESPACE  = '/pack2'
 LOG_HZ     = 100.0
@@ -75,6 +78,9 @@ class PpLogger(Node):
 
         # 데이터 버퍼
         self._pos_dbg  = [0.0] * (8 * NUM_AXES)
+        # 토크 항 분해 (mode 2). 축마다 8개:
+        #   [kp·err, ki·I, -kd·vel_err, 중력FF, 마찰, vel, err_raw, 적분동결사유]
+        self._tau_dbg  = [0.0] * (8 * NUM_AXES)
         self._sensors  = [101.325] * 25
         self._mpc_refs = [101.325] * 12
         self._encoders = [0.0] * 9
@@ -94,6 +100,8 @@ class PpLogger(Node):
         ns = NAMESPACE
         self.create_subscription(Float64MultiArray, f'{ns}/controller/position_dbg',
                                  self._cb_pos_dbg, 10)
+        self.create_subscription(Float64MultiArray, f'{ns}/controller/tau_dbg',
+                                 self._cb_tau_dbg, 10)
         self.create_subscription(Float64MultiArray, f'{ns}/controller/sensors_kpa',
                                  self._cb_sensors, 10)
         self.create_subscription(Float64MultiArray, f'{ns}/controller/mpc_refs_kpa',
@@ -156,6 +164,12 @@ class PpLogger(Node):
         for a in range(NUM_AXES):
             header.append(f'vol_pos_ml_axis{a}')
             header.append(f'vol_neg_ml_axis{a}')
+        # 토크 항 분해 — 왜 그 τ 가 나왔는지 항별로 설명한다.
+        # integ_hold 는 적분이 멈춘 사유: 0=적분중 1=압력내층지연 2=밴드포화 3=둘다
+        for a in range(NUM_AXES):
+            for nm in ('tau_kp_Nm', 'tau_ki_Nm', 'tau_kd_Nm', 'tau_grav_Nm',
+                       'tau_fric_Nm', 'vel_filt_dps', 'err_raw_deg', 'integ_hold'):
+                header.append(f'{nm}_axis{a}')
         # 레퍼런스 생성기 내부 — 왜 그 목표가 나왔는지 설명하는 값들
         for a in range(NUM_AXES):
             header += [f'tau_ref_Nm_axis{a}', f'tau_ach_Nm_axis{a}',
@@ -210,6 +224,11 @@ class PpLogger(Node):
             n = min(len(msg.data), 8 * NUM_AXES)
             self._pos_dbg[:n] = list(msg.data[:n])
 
+    def _cb_tau_dbg(self, msg):
+        with self._lock:
+            n = min(len(msg.data), 8 * NUM_AXES)
+            self._tau_dbg[:n] = list(msg.data[:n])
+
     def _cb_sensors(self, msg):
         with self._lock:
             for i, v in enumerate(msg.data):
@@ -261,6 +280,7 @@ class PpLogger(Node):
             pwm = list(self._pwm)
             cur = list(self._curr)
             vol = list(self._vols)
+            tau = list(self._tau_dbg)
             rg  = list(self._rg); rg_seen = self._rg_seen
             rgt = list(self._rg_tail)
 
@@ -306,6 +326,8 @@ class PpLogger(Node):
         for a in range(NUM_AXES):
             row.append(f'{vol[a]:.4f}')
             row.append(f'{vol[NUM_AXES + a]:.4f}')
+        for a in range(NUM_AXES):
+            row += [f'{v:.4f}' for v in tau[8 * a:8 * a + 8]]
         for a in range(NUM_AXES):
             b = 12 * a
             row += [f'{rg[b + 2]:.4f}', f'{rg[b + 3]:.4f}',

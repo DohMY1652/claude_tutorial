@@ -1605,6 +1605,10 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
       "PositionController.kd_vel_ff", 1.0);
   integ_hold_perr_kpa_ = get_param_or<double>(this,
       "PositionController.integ_hold_pressure_err_kpa", 8.0);
+  integ_hold_on_band_ = get_param_or<bool>(this,
+      "PositionController.integ_hold_on_band", true);
+  integ_flip_tau_s_ = get_param_or<double>(this,
+      "PositionController.integ_flip_tau_s", 0.15);
   target_slew_rate_.assign(std::max(1, num_actuators_), 0.0);
   band_sat_ticks_.assign(std::max(1, num_actuators_), 0);
 
@@ -1613,8 +1617,10 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   // 옛 설정으로 도는 줄 모르고 실험한다. 기동 로그에서 바로 확인할 수 있게 한다.
   RCLCPP_INFO(get_logger(),
     "PositionController: 슬루 %.1f deg/s, 오차밴드 %.1f°, kd_vel_ff %.2f, "
-    "적분정지 압력오차 %.1f kPa (0=끔)",
-    target_slew_dps_, target_follow_band_deg_, kd_vel_ff_, integ_hold_perr_kpa_);
+    "적분정지 압력오차 %.1f kPa (0=끔), 밴드포화중 적분정지 %s, "
+    "부호반전 누설 %.2f s (0=즉시리셋)",
+    target_slew_dps_, target_follow_band_deg_, kd_vel_ff_, integ_hold_perr_kpa_,
+    integ_hold_on_band_ ? "예" : "아니오", integ_flip_tau_s_);
 
   for (int a = 0; a < num_actuators_; ++a) {
     const std::string prefix = "PositionController.axis" + std::to_string(a) + ".";
@@ -1700,6 +1706,22 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     tp.friction_nm    = get_param_or<double>(this, pre + "friction_nm",    0.30);
     tp.tau_ff_gain    = get_param_or<double>(this, pre + "tau_ff_gain",    1.0);
     tp.friction_band_deg = get_param_or<double>(this, pre + "friction_band_deg", 1.0);
+    tp.friction_vel_band_dps =
+        get_param_or<double>(this, pre + "friction_vel_band_dps", 40.0);
+
+    // 속도 기준 마찰 보상은 **운동 방향으로** 붙으므로 밴드 안에서는 음의 감쇠다.
+    // 속도 되먹임 전체가 −kd·vel + friction_nm·vel/band 이므로, 순 감쇠가
+    // 양수이려면 friction_nm/band < kd 여야 한다. 넘으면 조용히 진동한다.
+    if (tp.friction_vel_band_dps > 0.0 && tp.kd > 0.0) {
+      const double slope = tp.friction_nm / tp.friction_vel_band_dps;
+      if (slope >= tp.kd) {
+        RCLCPP_ERROR(get_logger(),
+          "[axis%d] friction_vel_band_dps=%.1f 이 너무 좁다: 마찰 보상 기울기 "
+          "%.4f ≥ kd %.4f 라 **순 감쇠가 음수**다 (밴드 안에서 진동한다). "
+          "friction_vel_band_dps > friction_nm/kd = %.1f deg/s 로 둘 것.",
+          a, tp.friction_vel_band_dps, slope, tp.kd, tp.friction_nm / tp.kd);
+      }
+    }
   }
 
   {
@@ -1823,6 +1845,8 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
 
   pub_refgen_dbg_ = create_publisher<std_msgs::msg::Float64MultiArray>(
       "controller/pressure_ref_dbg", 10);
+  pub_tau_dbg_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+      "controller/tau_dbg", 10);
 
   ref_server_cfg_.enable  = get_param_or<bool>(this, "RefTcpServer.enable",  false);
   ref_server_cfg_.port    = get_param_or<int> (this, "RefTcpServer.port",    2293);
@@ -3391,6 +3415,12 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
   }
   std::vector<double> F_ref((size_t)N, 0.0), tau_ref((size_t)N, 0.0);
   std::vector<double> dbg_tau_pid((size_t)N, 0.0), dbg_tau_ff((size_t)N, 0.0);
+  // 항 분해 — 이게 없어서 "I 항이 도는지" 를 로그로 확인할 수 없었다.
+  // mode 2 는 position_dbg 를 안 내므로 pp_logger 의 pid/ff/fric/vel 열이
+  // 항상 0 이었다 (실기 20260904_153154 에서 확인).
+  std::vector<double> dbg_kp((size_t)N, 0.0), dbg_ki((size_t)N, 0.0),
+                      dbg_kd((size_t)N, 0.0), dbg_fric((size_t)N, 0.0),
+                      dbg_err_raw((size_t)N, 0.0), dbg_integ_state((size_t)N, 0.0);
   std::vector<double> dbg_angle((size_t)N, 0.0), dbg_angle_ref((size_t)N, 0.0);
   std::vector<double> dbg_vel((size_t)N, 0.0);
 
@@ -3485,10 +3515,32 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
       inner_behind = (std::max(ep, en) > integ_hold_perr_kpa_);
     }
 
-    // 적분 (부호 반전 시 리셋 + 클램프)
+    // ── 추종 오차가 밴드에 포화해 있으면 적분을 얼린다 ──────────────────
+    //
+    // 밴드에 붙어 있다는 것은 **큰 신호 이동 중**이라는 뜻이다. 그동안 err 은
+    // ±band 상수라 적분이 쌓는 것은 오차 정보가 아니라 경과 시간뿐이다.
+    // 20°→70° 같은 계단에서 적분은 매번 상한까지 차고, 팔이 목표에 닿는 순간
+    // 그 전부가 추가 밀어냄이 되어 오버슛이 된다.
+    //
+    // 실기 20260904_153154 (axis0): err_raw 가 **29.4 % 의 시간** ±5° 에 붙어
+    // 있었고 ki·I 가 **18.5 % 의 시간** 상한 0.75 N·m 에 포화해 있었다.
+    // 20° 에서 중력 토크가 1.01 N·m 이므로 적분만으로 그 74 % 를 더 밀었다.
+    const bool err_saturated =
+        (target_follow_band_deg_ > 0.0 &&
+         std::abs(err_raw) >= target_follow_band_deg_ - 1e-9);
+
+    // 적분 (부호 반전 시 누설 + 클램프)
     double& I = tau_integ_[(size_t)a];
-    if ((err > 0.0 && I < 0.0) || (err < 0.0 && I > 0.0)) I = 0.0;
-    if (actuator_connected_ && !inner_behind) I += err * dt_sec;
+    if ((err > 0.0 && I < 0.0) || (err < 0.0 && I > 0.0)) {
+      // 즉시 0 으로 떨구면 ki·I 만큼의 **계단**이 생긴다. 실기 20260904_153154
+      // t=43.51: 팔이 −79 dps 로 목표를 지나가는 순간 ki·I 가 −0.75 → 0 으로
+      // 뛰었고, 같은 틱에 마찰(+0.96)·kp(+0.78) 까지 겹쳐 τ 가 1.68 → 4.19 N·m
+      // 로 튀었다. micro 가 열리며 하강 중인 팔을 51.8 → 55.8° 로 **다시 들었다**.
+      if (integ_flip_tau_s_ > 0.0) I *= std::exp(-dt_sec / integ_flip_tau_s_);
+      else                         I = 0.0;
+    }
+    if (actuator_connected_ && !inner_behind &&
+        !(integ_hold_on_band_ && err_saturated)) I += err * dt_sec;
     const double I_lim = (std::abs(tp.ki) > 1e-12) ? tp.integ_limit_nm / tp.ki : 0.0;
     I = std::clamp(I, -I_lim, I_lim);
 
@@ -3530,9 +3582,25 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     // 뒤집는다** — friction_nm 0.48 이면 0.96 N·m 계단이고, 이는 2 kg·150 mm 의
     // 중력 최대치(2.94 N·m)의 33% 다. 목표 근처에서 이게 매 틱 진동한다.
     // 밴드 안에서 선형으로 준다 (밴드 밖에서는 예전과 같은 ±friction_nm).
+    //
+    // **더 근본적인 문제: 쿨롱 마찰은 위치 오차가 아니라 운동을 거스른다.**
+    // err 기준으로 주면, 팔이 목표를 지나가는 순간(아직 같은 방향으로 빠르게
+    // 움직이는 중) 보상이 통째로 뒤집혀 실제 마찰과 **반대 방향**이 된다.
+    // 실기 20260904_153154 (axis0): 팔이 움직이던 12.0 s 중 **43.9 %** 에서
+    // 마찰 보상 부호가 실제 운동 방향과 반대였다. 크기는 0.96 N·m —
+    // 2 kg·150 mm 중력 최대(2.94 N·m)의 33 % 다.
+    //
+    // 그래서 움직일 때는 **속도 방향**으로 준다. 정지 근처에서는 운동 방향이
+    // 정의되지 않으므로 예전처럼 오차 방향으로 되돌아간다(고착 돌파). 두 영역
+    // 사이는 |vel|/friction_vel_band_dps 로 선형 혼합해 연속이다.
+    // friction_vel_band_dps 를 0 으로 두면 예전(오차 기준) 동작이다.
     const double fb = std::max(1e-6, tp.friction_band_deg);
+    const double f_err = std::clamp(err / fb, -1.0, 1.0);
+    const double vb = tp.friction_vel_band_dps;
+    const double w_vel = (vb > 0.0) ? std::clamp(std::abs(vel) / vb, 0.0, 1.0) : 0.0;
+    const double f_vel = (vb > 0.0) ? std::clamp(vel / vb, -1.0, 1.0) : 0.0;
     const double tau_fric = actuator_connected_
-        ? tp.friction_nm * std::clamp(err / fb, -1.0, 1.0) : 0.0;
+        ? tp.friction_nm * (w_vel * f_vel + (1.0 - w_vel) * f_err) : 0.0;
 
     // 이 시스템은 한 방향 힘만 낸다 → 목표는 항상 ≥ 0
     tau_ref[(size_t)a] = std::max(0.0, tau_pid + tau_grav + tau_fric);
@@ -3540,6 +3608,15 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
 
     dbg_tau_pid[(size_t)a] = tau_pid;
     dbg_tau_ff[(size_t)a]  = tau_grav;
+    dbg_kp[(size_t)a]      = tp.kp * err;
+    dbg_ki[(size_t)a]      = tp.ki * I;
+    dbg_kd[(size_t)a]      = -tp.kd * vel_err;
+    dbg_fric[(size_t)a]    = tau_fric;
+    dbg_err_raw[(size_t)a] = err_raw;
+    // 적분이 왜 안 도는지 구분한다: 0=적분중, 1=압력내층지연, 2=밴드포화, 3=둘다
+    dbg_integ_state[(size_t)a] =
+        (inner_behind ? 1.0 : 0.0) +
+        ((integ_hold_on_band_ && err_saturated) ? 2.0 : 0.0);
     dbg_angle[(size_t)a]   = angle;
     dbg_angle_ref[(size_t)a] = angle_ref;
     dbg_vel[(size_t)a]     = vel;
@@ -3675,6 +3752,23 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
       m.data.push_back(r.m_boost * 1e3);                        // 부스트 [g/s]
       m.data.push_back(r.m_eject * 1e3);                        // 이젝터 [g/s]
       pub_refgen_dbg_->publish(m);
+    }
+
+    // 토크 항 분해 — 축마다 8개
+    if (pub_tau_dbg_) {
+      std_msgs::msg::Float64MultiArray m;
+      m.data.reserve((size_t)N * 8);
+      for (int a = 0; a < N; ++a) {
+        m.data.push_back(dbg_kp[(size_t)a]);          // kp·err        [N·m]
+        m.data.push_back(dbg_ki[(size_t)a]);          // ki·I          [N·m]
+        m.data.push_back(dbg_kd[(size_t)a]);          // −kd·vel_err   [N·m]
+        m.data.push_back(dbg_tau_ff[(size_t)a]);      // 중력 FF       [N·m]
+        m.data.push_back(dbg_fric[(size_t)a]);        // 마찰 보상     [N·m]
+        m.data.push_back(dbg_vel[(size_t)a]);         // 필터 각속도   [deg/s]
+        m.data.push_back(dbg_err_raw[(size_t)a]);     // 자르기 전 오차 [deg]
+        m.data.push_back(dbg_integ_state[(size_t)a]); // 적분 동결 사유
+      }
+      pub_tau_dbg_->publish(m);
     }
 
     // ── 공급 부족 경고 ────────────────────────────────────────────────
