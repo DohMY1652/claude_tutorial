@@ -351,28 +351,98 @@ def polyfit(xs, ys, deg):
     return c
 
 
-def fit_axis(th, P, off_mm, tank_ml, sign, label):
-    """P·V=const 를 이용해 V(θ) 를 피팅하고 스트로크 배수 m 을 낸다.
+def _lsq(X, y):
+    """정규방정식 최소자승. X 는 열 리스트들의 리스트."""
+    n = len(X)
+    M = [[sum(X[i][k] * X[j][k] for k in range(len(y))) for j in range(n)]
+         for i in range(n)]
+    b = [sum(X[i][k] * y[k] for k in range(len(y))) for i in range(n)]
+    for i in range(n):
+        pv = max(range(i, n), key=lambda r: abs(M[r][i]))
+        if abs(M[pv][i]) < 1e-18:
+            return None
+        M[i], M[pv] = M[pv], M[i]
+        b[i], b[pv] = b[pv], b[i]
+        for r in range(i + 1, n):
+            f = M[r][i] / M[i][i]
+            for c in range(i, n):
+                M[r][c] -= f * M[i][c]
+            b[r] -= f * b[i]
+    c = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        c[i] = (b[i] - sum(M[i][j] * c[j] for j in range(i + 1, n))) / M[i][i]
+    return c
 
-    P·V = C  →  1/P(θ) = V(θ)/C.  기하 모델은
-        V(θ) = V_off ± m·g·θ_rad ,   V_off = tank + A·off/1000 [mL],
-                                     g     = A·reel/1000       [mL/rad]
-    이므로 **1/P 를 θ_rad 에 직접 피팅**하면
-        1/P = a + b·θ_rad  →  a = V_off/C,  b = ±m·g/C
-        →  m = ±(b/a)·V_off/g          ← C 가 소거된다
-    기준 각도·기준 압력을 고를 필요가 없다. 이게 핵심이다.
 
-    sign = +1 : 각도가 커지면 부피가 커진다 (양압 챔버)
-    sign = -1 : 각도가 커지면 부피가 작아진다 (음압 챔버)
+def _fit_window(tt, th_rad, P, V_off, g, sign):
+    """1/P = a + b·θ_rad + c·t  로 **누설을 분리**하고 배수 m 을 낸다.
+
+    누설이 있으면 P·V = C 의 C 가 시간에 따라 줄어든다. 그 성분이 각도 성분과
+    섞이면 기울기가 통째로 망가진다 (실측 20260904_145704: 같은 각도에서 7 초에
+    10 kPa 가 빠져 R² 가 0.014 였다). t 항을 같이 넣으면 분리된다.
     """
-    good = [(a, p) for a, p in zip(th, P) if p == p and p > 20.0 and a == a]
-    if len(good) < 200:
-        print(f'    {label}: 표본 부족 ({len(good)})')
+    y = [1.0 / v for v in P]
+    t0 = tt[0]
+    X = [[1.0] * len(y), list(th_rad), [v - t0 for v in tt]]
+    c = _lsq(X, y)
+    if c is None or abs(c[0]) < 1e-15:
         return None
-    th2 = [g[0] for g in good]
-    P2 = [g[1] for g in good]
-    span = max(th2) - min(th2)
-    dP = max(P2) - min(P2)
+    a, b, leak = c
+    pred = [a + b * th_rad[k] + leak * (tt[k] - t0) for k in range(len(y))]
+    ss = sum((y[k] - pred[k]) ** 2 for k in range(len(y)))
+    ym = sum(y) / len(y)
+    st = sum((v - ym) ** 2 for v in y)
+    r2 = 1.0 - ss / st if st > 1e-18 else 0.0
+    m = sign * (b / a) * V_off / g
+    # 누설률을 kPa/s 로 환산 (평균 압력 기준)
+    Pm = sum(P) / len(P)
+    leak_kpas = -leak * Pm * Pm
+    return m, r2, leak_kpas, a, b
+
+
+def _strokes(th, min_span=8.0):
+    """각도가 단조로 움직이는 구간으로 자른다."""
+    out = []
+    i = 0
+    while i < len(th) - 1:
+        d = 0
+        j = i
+        while j < len(th) - 1:
+            step = th[j + 1] - th[j]
+            if abs(step) < 1e-9:
+                j += 1
+                continue
+            sgn = 1 if step > 0 else -1
+            if d == 0:
+                d = sgn
+            elif sgn != d:
+                break
+            j += 1
+        if abs(th[j] - th[i]) >= min_span:
+            out.append((i, j))
+        i = max(j, i + 1)
+    return out
+
+
+def fit_axis(th, P, off_mm, tank_ml, sign, label, tt=None):
+    """P·V=C(t) 로 V(θ) 를 피팅하고 스트로크 배수 m 을 낸다.
+
+        1/P = a + b·θ_rad + c·t
+        a = V_off/C,  b = ±m·g/C,  c = 누설
+        →  m = ±(b/a)·V_off/g          ← C 가 소거된다
+
+    누설이 크면 전 구간 일괄 피팅은 못 믿는다. **스트로크(단조 구간)마다** 따로
+    풀어 중앙값을 쓴다 — 짧을수록 누설이 선형에 가깝다.
+    """
+    idx = [k for k in range(len(th))
+           if P[k] == P[k] and P[k] > 20.0 and th[k] == th[k]]
+    if len(idx) < 200:
+        print(f'    {label}: 표본 부족 ({len(idx)})')
+        return None
+    th2 = [th[k] for k in idx]
+    P2 = [P[k] for k in idx]
+    tt2 = [tt[k] for k in idx] if tt else [0.02 * k for k in range(len(idx))]
+    span, dP = max(th2) - min(th2), max(P2) - min(P2)
     if span < 5.0:
         print(f'    {label}: 각도 범위가 {span:.1f}° 뿐이다 — 더 크게 움직일 것')
         return None
@@ -381,65 +451,66 @@ def fit_axis(th, P, off_mm, tank_ml, sign, label):
               f'챔버에 압력을 담고(≥130 kPa) 다시 할 것')
         return None
 
-    V_off = tank_ml + A_MM2 * max(1.0, off_mm) / 1000.0    # mL, m 과 무관
-    g = A_MM2 * REEL_MM / 1000.0                           # mL/rad (단순 피스톤)
-
-    x = [a * math.pi / 180.0 for a in th2]                 # rad
-    y = [1.0 / p for p in P2]
-
-    res = {}
-    for deg in (1, 2):
-        c = polyfit(x, y, deg)
-        if c is None:
-            continue
-        pred = [sum(c[i] * xx ** i for i in range(len(c))) for xx in x]
-        ss = sum((y[k] - pred[k]) ** 2 for k in range(len(y)))
-        ym = sum(y) / len(y)
-        st = sum((v - ym) ** 2 for v in y)
-        res[deg] = (c, 1.0 - ss / st if st > 1e-18 else 0.0, (ss / len(y)) ** 0.5)
-
-    if 1 not in res:
-        return None
-    c1, r2_1, rms1 = res[1]
-    a1, b1 = c1[0], c1[1]
-    if abs(a1) < 1e-12:
-        return None
-    m = sign * (b1 / a1) * V_off / g
+    V_off = tank_ml + A_MM2 * max(1.0, off_mm) / 1000.0
+    g = A_MM2 * REEL_MM / 1000.0
+    rad = [a * math.pi / 180.0 for a in th2]
 
     print(f'    {label}')
     print(f'      각도 {min(th2):6.1f} ~ {max(th2):6.1f}°   압력 {min(P2):6.1f} ~ {max(P2):6.1f} kPa'
           f'   표본 {len(th2)}')
-    print(f'      1차 (1/P = a + b·θ_rad):  a {a1:.6e}  b {b1:.6e}   R² {r2_1:.4f}')
-    print(f'            dV/dθ = {sign*m*g:+8.2f} mL/rad   (단순 피스톤 {sign*g:+.2f})'
-          f'   **배수 m = {m:.2f}**')
 
-    if 2 in res:
-        c2, r2_2, rms2 = res[2]
-        a2, b2, cc2 = c2
-        # 구간 양 끝에서의 국소 배수 — 비선형성을 눈으로 보여 준다
-        def m_at(th_deg):
-            xx = th_deg * math.pi / 180.0
-            return sign * ((b2 + 2 * cc2 * xx) / a2) * V_off / g
-        lo, hi = min(th2), max(th2)
-        print(f'      2차:  R² {r2_2:.4f}  (RMS {rms1:.3e} → {rms2:.3e})'
-              f'   국소 배수  {lo:.0f}° {m_at(lo):.2f}  /  {hi:.0f}° {m_at(hi):.2f}')
-        if rms2 < rms1 * 0.7:
-            print(f'      → **2 차항이 유의하다.** 부피가 각도에 1 차가 아니다 — '
-                  f'국소 배수가 {m_at(lo):.2f} → {m_at(hi):.2f} 로 변한다.')
-            print(f'         지금 코드는 1 차(상수 배수)만 지원한다. 상용 구간의 '
-                  f'평균값 {m:.2f} 를 쓰거나, 곡선을 넣으려면 알려줄 것.')
-        else:
-            print(f'      → 2 차항 이득이 작다 — 1 차(상수 배수 {m:.2f})로 충분하다.')
+    whole = _fit_window(tt2, rad, P2, V_off, g, sign)
+    if whole:
+        m, r2, lk, _, _ = whole
+        print(f'      전 구간 (누설항 포함):  m = {m:6.2f}   R² {r2:.4f}   '
+              f'누설 {lk:+.2f} kPa/s')
 
-    # 누설 점검: 같은 각도를 두 번 지날 때 압력이 얼마나 달라졌나
-    mid = 0.5 * (min(th2) + max(th2))
-    first = [P2[k] for k in range(len(th2) // 3) if abs(th2[k] - mid) < span * 0.05]
-    last = [P2[k] for k in range(2 * len(th2) // 3, len(th2)) if abs(th2[k] - mid) < span * 0.05]
-    if len(first) > 5 and len(last) > 5:
-        d = sum(last) / len(last) - sum(first) / len(first)
-        tag = '  ← 누설 의심, 더 빨리 움직일 것' if abs(d) > 0.05 * dP else ''
-        print(f'      누설 점검: 같은 각도({mid:.0f}°) 전·후 압력 차 {d:+.2f} kPa{tag}')
-    return m
+    # 스트로크 선별 기준. 짧거나 좁은 창은 누설항과 각도항이 분리되지 않아
+    # 터무니없는 값을 낸다 (실측에서 1.0 s·9.8° 창이 m 13.07 / 누설 −13.7 kPa/s
+    # 를 냈다 — 둘이 서로를 상쇄하는 해다). 셋을 다 만족해야 쓴다.
+    MIN_SPAN, MIN_DUR, MIN_R2 = 10.0, 1.5, 0.90
+    st = _strokes(th2)
+    ms = []
+    print(f'      스트로크 {len(st)} 개  (기준: ≥{MIN_SPAN:.0f}° · ≥{MIN_DUR:.1f}s · R²≥{MIN_R2:.2f})')
+    for (i0, i1) in st:
+        w = _fit_window(tt2[i0:i1 + 1], rad[i0:i1 + 1], P2[i0:i1 + 1], V_off, g, sign)
+        if not w:
+            continue
+        m, r2, lk, _, _ = w
+        sp = abs(th2[i1] - th2[i0])
+        du = tt2[i1] - tt2[i0]
+        why = []
+        if sp < MIN_SPAN:
+            why.append('좁음')
+        if du < MIN_DUR:
+            why.append('짧음')
+        if r2 < MIN_R2:
+            why.append('R²')
+        if not why:
+            ms.append(m)
+        print(f'        {tt2[i0]:5.1f}~{tt2[i1]:5.1f}s  {th2[i0]:6.1f}→{th2[i1]:6.1f}°'
+              f'   m {m:6.2f}   R² {r2:.4f}   누설 {lk:+6.2f} kPa/s'
+              f'   {"" if not why else "  ← 제외 (" + ",".join(why) + ")"}')
+    # 압력이 대기압에 가까우면 신호가 잡음에 묻힌다 — 숫자를 내되 못 믿는다고 말한다
+    Pm = sum(P2) / len(P2)
+    weak = (dP < 10.0) or (abs(Pm - 101.325) < 15.0)
+
+    if not ms:
+        print(f'      → 기준을 통과한 스트로크가 없다. '
+              f'**한 번에 {MIN_SPAN:.0f}° 이상을 {MIN_DUR:.0f}~4 초에** 움직일 것 '
+              f'(멈칫하면 스트로크가 잘게 쪼개진다).')
+        if weak:
+            print(f'         그리고 이 챔버는 평균 {Pm:.1f} kPa 다 — 대기압에 너무 가깝다.')
+        return None
+    ms.sort()
+    med = ms[len(ms) // 2] if len(ms) % 2 else 0.5 * (ms[len(ms)//2 - 1] + ms[len(ms)//2])
+    print(f'      → **배수 m = {med:.2f}**  (유효 스트로크 {len(ms)} 개, '
+          f'범위 {min(ms):.2f}~{max(ms):.2f})')
+    print(f'         dV/dθ = {sign*med*g:+.1f} mL/rad  (단순 피스톤 {sign*g:+.1f})')
+    if weak:
+        print(f'         ⚠ 평균 압력 {Pm:.1f} kPa, 변화 {dP:.1f} kPa — 대기압에 가까워'
+              f' 신호 대 잡음이 나쁘다. 이 값은 참고만 할 것.')
+    return med
 
 
 def do_fit(path):
@@ -467,7 +538,7 @@ def do_fit(path):
             if col not in rows[0]:
                 continue
             P = [float(r[col]) for r in rows]
-            fit_axis(th, P, off, tank, sign, lbl)
+            fit_axis(th, P, off, tank, sign, lbl, tt=t)
         print()
     print('  배수를 config 에 넣는 곳:  Geometry.stroke_volume_mult')
     print('  (부피는 dP/dt 의 분모라 그대로 내층 이득이다 — 한 번에 하나씩 바꿀 것)')
