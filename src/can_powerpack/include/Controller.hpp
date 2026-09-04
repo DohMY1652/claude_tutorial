@@ -297,6 +297,7 @@ public:
     // 음수면 Q_value / R_value 를 그대로 쓴다 (기존 튜닝 의미를 잇는다).
     float mppi_w_track{-1.0f};
     float mppi_w_effort{-1.0f};
+    float mppi_w_coact{0.0f};   // 동시 개방(micro+atm) 벌점. 0 = 끔
     float mppi_w_du{0.05f};
     float mppi_track_scale_kpa{10.0f};
     float mppi_terminal_mult{5.0f};
@@ -772,6 +773,7 @@ private:
     double mppi_noise_beta{0.70};
     double mppi_w_track{-1.0};
     double mppi_w_effort{-1.0};
+    double mppi_w_coact{0.0};   // 동시 개방(micro+atm) 벌점. 0 = 끔
     double mppi_w_du{0.05};
     double mppi_track_scale_kpa{10.0};
     double mppi_terminal_mult{5.0};

@@ -179,6 +179,9 @@ struct SysMppiParams {
   float w_rail{0.5f};              // 레일 밴드 유지 (라인 PID 역할)
   float w_effort{0.10f};
   float w_du{0.05f};
+  // 동시 개방(공급 micro + 배기 atm) 벌점. 0 = 끔.
+  // 자세한 근거는 include/Mppi.hpp 의 같은 이름 필드 주석 참조.
+  float w_coact{0.0f};
   float track_scale_kpa{10.0f};
   float rail_scale_kpa{20.0f};
   float terminal_mult{0.0f};

@@ -260,6 +260,7 @@ AcadosMpc::AcadosMpc(const Config& cfg) : cfg_(cfg) {
     pr.noise_beta = cfg_.mppi_noise_beta;
     pr.w_track  = (cfg_.mppi_w_track  >= 0.f) ? cfg_.mppi_w_track  : cfg_.Q_value;
     pr.w_effort = (cfg_.mppi_w_effort >= 0.f) ? cfg_.mppi_w_effort : cfg_.R_value;
+    pr.w_coact  = cfg_.mppi_w_coact;
     pr.w_du     = cfg_.mppi_w_du;
     pr.track_scale_kpa = cfg_.mppi_track_scale_kpa;
     pr.terminal_mult   = cfg_.mppi_terminal_mult;
@@ -1330,6 +1331,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   mpc_.mppi_noise_beta = get_param_or<double>(this, "MPC_parameters.mppi_noise_beta", 0.70);
   mpc_.mppi_w_track    = get_param_or<double>(this, "MPC_parameters.mppi_w_track",   -1.0);
   mpc_.mppi_w_effort   = get_param_or<double>(this, "MPC_parameters.mppi_w_effort",  -1.0);
+  mpc_.mppi_w_coact    = get_param_or<double>(this, "MPC_parameters.mppi_w_coact",    0.0);
   mpc_.mppi_w_du       = get_param_or<double>(this, "MPC_parameters.mppi_w_du",       0.05);
   mpc_.mppi_track_scale_kpa = get_param_or<double>(this, "MPC_parameters.mppi_track_scale_kpa", 10.0);
   mpc_.mppi_terminal_mult   = get_param_or<double>(this, "MPC_parameters.mppi_terminal_mult",    5.0);
@@ -2149,6 +2151,7 @@ void Controller::build_mpcs() {
       cfg.mppi_noise_beta      = (float)mpc_.mppi_noise_beta;
       cfg.mppi_w_track         = (float)mpc_.mppi_w_track;
       cfg.mppi_w_effort        = (float)mpc_.mppi_w_effort;
+      cfg.mppi_w_coact         = (float)mpc_.mppi_w_coact;
       cfg.mppi_w_du            = (float)mpc_.mppi_w_du;
       cfg.mppi_track_scale_kpa = (float)mpc_.mppi_track_scale_kpa;
       cfg.mppi_terminal_mult   = (float)mpc_.mppi_terminal_mult;
@@ -2367,6 +2370,7 @@ void Controller::build_system_mppi()
   mp.noise_beta        = (float)mpc_.mppi_noise_beta;
   mp.w_track   = (float)((mpc_.mppi_w_track >= 0.0) ? mpc_.mppi_w_track : mpc_.Q_value);
   mp.w_effort  = (float)((mpc_.mppi_w_effort >= 0.0) ? mpc_.mppi_w_effort : mpc_.R_value);
+  mp.w_coact   = (float)mpc_.mppi_w_coact;
   mp.w_du      = (float)mpc_.mppi_w_du;
   mp.w_rail    = (float)get_param_or<double>(this, "MPC_parameters.sys_w_rail", 0.5);
   mp.rail_scale_kpa = (float)get_param_or<double>(this, "MPC_parameters.sys_rail_scale_kpa", 20.0);

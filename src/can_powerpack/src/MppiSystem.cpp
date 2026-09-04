@@ -265,6 +265,17 @@ float SystemSolver::rollout(const SysState& x0, const SysExo& ex,
       u_prev[(size_t)j] = u_raw;
     }
 
+    // 동시 개방 벌점 — 채널 g 의 micro 는 인덱스 g, atm 은 n+g 다.
+    // 한쪽만 열려 있으면 min 이 0 이라 비용이 붙지 않는다.
+    if (mp_.w_coact > 0.0f) {
+      for (int g = 0; g < n; ++g) {
+        const float co = std::min(u_app[(size_t)g], u_app[(size_t)(n + g)]) * 0.01f;
+        const float cc = mp_.w_coact * co * co;
+        J += (double)(cc / (float)nu_);
+        jg[(size_t)g] += cc;
+      }
+    }
+
     // 라인 밸브를 제어하지 않으면 LinePID 의 현재 출력을 지평 동안 상수로 둔다.
     // (레일은 여전히 예측된다 — 그것이 중앙집중의 핵심이다.)
     if (!mp_.control_lines) {

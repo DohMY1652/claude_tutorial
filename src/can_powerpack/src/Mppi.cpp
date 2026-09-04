@@ -447,6 +447,13 @@ float Solver::rollout_cost(const ChannelState& x0, const Exogenous& ex,
       u_prev[j] = u_raw;
     }
 
+    // 동시 개방 벌점 — u_app[0]=micro(공급), u_app[2]=atm(배기).
+    // 한쪽만 열려 있으면 min 이 0 이라 비용이 붙지 않는다.
+    if (pr_.w_coact > 0.0f) {
+      const float co = std::min(u_app[0], u_app[2]) * 0.01f;
+      J += (double)(pr_.w_coact * co * co);
+    }
+
     const float V = std::max(1e-12f, ex.V0 + ex.Vdot * (float)k * pr_.Ts);
     // 레일 궤적 — 명목 기반 1차 예측. 상수 가정이 만드는 ≈5~34 kPa 오차를 없앤다.
     exk.P_micro = ex.P_micro + ex.dP_micro_dt * (float)k * pr_.Ts;
