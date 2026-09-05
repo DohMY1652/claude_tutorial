@@ -5,6 +5,7 @@
 #include <cmath>
 #include <set>
 #include <fstream>
+#include <limits>
 
 #ifdef __linux__
   #include <pthread.h>
@@ -729,21 +730,24 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
   want_sign_ = cfg_.is_positive ? (via_atm ? -1.0f : +1.0f)
                                 : (via_atm ? +1.0f : -1.0f);
 
-  // Anti-windup Logic
-  float u_mi_req_clamped =  std::clamp(u_mi_req + u_trim_[0], 0.0f, 100.0f);
-  float u_ma_req_clamped =  std::clamp(u_ma_req + u_trim_[1], 0.0f, 100.0f);
-  float u_at_req_clamped =  std::clamp(u_at_req + u_trim_[2], 0.0f, 100.0f);
+  // Anti-windup 판정에는 최종에 한 번 더해질 trim 까지 포함한 요구치를 쓴다.
+  // 다만 uref 로는 **trim 없는 역모델 명령**을 반환해야 한다. uref 에 trim 을
+  // 넣고 finish() 에서 다시 더하면 동일한 적분 보정이 두 번 적용되고, 두 번째
+  // 보정은 MPPI 와 command LPF 뒤에서 계단처럼 들어가 밸브를 릴레이로 만든다.
+  const float u_mi_aw = std::clamp(u_mi_req + u_trim_[0], 0.0f, 100.0f);
+  const float u_ma_aw = std::clamp(u_ma_req + u_trim_[1], 0.0f, 100.0f);
+  const float u_at_aw = std::clamp(u_at_req + u_trim_[2], 0.0f, 100.0f);
   
   bool pos_stop_integration = false;
   bool neg_stop_integration = false;
 
   if (cfg_.is_positive) {
       if (err > 0.0f) {
-          if (u_mi_req_clamped >= 100.0f && u_ma_req_clamped >= 100.0f) {
+          if (u_mi_aw >= 100.0f && u_ma_aw >= 100.0f) {
               pos_stop_integration = true;
           }
       } else {
-          if (u_at_req_clamped >= 100.0f) {
+          if (u_at_aw >= 100.0f) {
               pos_stop_integration = true;
           }
       }
@@ -752,11 +756,11 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
       }
   } else {
       if (err < 0.0f) {
-          if (u_mi_req_clamped >= 100.0f && u_ma_req_clamped >= 100.0f) {
+          if (u_mi_aw >= 100.0f && u_ma_aw >= 100.0f) {
               neg_stop_integration = true;
           }
       } else {
-          if (u_at_req_clamped >= 100.0f) {
+          if (u_at_aw >= 100.0f) {
               neg_stop_integration = true;
           }
       }
@@ -770,7 +774,10 @@ std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micr
     neg_error_integral_ = 0.0;
   }
 
-  return {u_mi_req_clamped, u_ma_req_clamped, u_at_req_clamped};
+  // trim 은 finish() 의 마지막 단계에서 정확히 한 번만 더한다.
+  return {std::clamp(u_mi_req, 0.0f, 100.0f),
+          std::clamp(u_ma_req, 0.0f, 100.0f),
+          std::clamp(u_at_req, 0.0f, 100.0f)};
 }
 
 void AcadosMpc::build_mpc_qp(const std::vector<float>& A_seq,
@@ -1306,10 +1313,10 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   RCLCPP_INFO(this->get_logger(), "=====================================================");
 
 
-  mpc_.NP             = get_param_or<int>(this,    "MPC_parameters.NP", 5);
+  mpc_.NP             = get_param_or<int>(this,    "MPC_parameters.NP", 8);
   mpc_.n_x            = get_param_or<int>(this,    "MPC_parameters.n_x", 1);
   mpc_.n_u            = get_param_or<int>(this,    "MPC_parameters.n_u", 3);
-  mpc_.Ts             = get_param_or<double>(this, "MPC_parameters.Ts",  0.01);
+  mpc_.Ts             = get_param_or<double>(this, "MPC_parameters.Ts",  0.005);
   mpc_.Q_value        = get_param_or<double>(this, "MPC_parameters.Q_values", 10.0);
   mpc_.R_value        = get_param_or<double>(this, "MPC_parameters.R_values",  1.0);
   mpc_.ejector_k       = get_param_or<double>(this, "MPC_parameters.ejector_k", 0.005);
@@ -1588,8 +1595,12 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   // 제어 모드 (0: 압력, 1: 위치)
   // ──────────────────────────────────────────
   control_mode_ = get_param_or<int>(this, "control_mode", 0);
+  const char* control_mode_name = control_mode_ == 0 ? "PRESSURE"
+                                : control_mode_ == 1 ? "POSITION_HEURISTIC"
+                                : control_mode_ == 2 ? "POSITION_REFGEN"
+                                                     : "UNKNOWN";
   RCLCPP_INFO(get_logger(), "Control mode: %d (%s)",
-              control_mode_, control_mode_ == 1 ? "POSITION" : "PRESSURE");
+              control_mode_, control_mode_name);
 
   // ──────────────────────────────────────────
   // 위치 제어기 파라미터 로드 (축마다 PositionController.axis<i>.* , 크기 = num_actuators_)
@@ -1599,30 +1610,54 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   target_angle_deg_.assign(num_actuators_, 0.0);
   target_angle_slewed_.assign(num_actuators_, 0.0);
   target_slew_dps_ = get_param_or<double>(this, "PositionController.target_slew_deg_per_s", 0.0);
+  target_accel_dps2_ = get_param_or<double>(this,
+      "PositionController.target_accel_deg_per_s2", 0.0);
+  target_jerk_dps3_ = get_param_or<double>(this,
+      "PositionController.target_jerk_deg_per_s3", 0.0);
   target_follow_band_deg_ = get_param_or<double>(this,
       "PositionController.target_follow_band_deg", 5.0);
   kd_vel_ff_ = get_param_or<double>(this,
       "PositionController.kd_vel_ff", 1.0);
+  inertia_ff_gain_ = get_param_or<double>(this,
+      "PositionController.inertia_ff_gain", 1.0);
+  large_error_kp_ = get_param_or<double>(this,
+      "PositionController.large_error_kp", 0.0);
+  large_error_band_deg_ = get_param_or<double>(this,
+      "PositionController.large_error_band_deg", 1.0);
+  large_error_limit_nm_ = get_param_or<double>(this,
+      "PositionController.large_error_limit_nm", 0.0);
   integ_hold_perr_kpa_ = get_param_or<double>(this,
       "PositionController.integ_hold_pressure_err_kpa", 8.0);
   integ_hold_on_band_ = get_param_or<bool>(this,
       "PositionController.integ_hold_on_band", false);
   integ_flip_tau_s_ = get_param_or<double>(this,
       "PositionController.integ_flip_tau_s", 0.15);
+  integ_backcalc_tau_s_ = get_param_or<double>(this,
+      "PositionController.integ_backcalc_tau_s", 0.30);
   angle_runaway_deg_ = get_param_or<double>(this,
       "PositionController.angle_runaway_deg", 25.0);
   target_slew_rate_.assign(std::max(1, num_actuators_), 0.0);
+  target_slew_accel_.assign(std::max(1, num_actuators_), 0.0);
+  target_traj_goal_.assign(std::max(1, num_actuators_),
+                           std::numeric_limits<double>::quiet_NaN());
+  target_traj_elapsed_.assign(std::max(1, num_actuators_), 0.0);
+  target_traj_duration_.assign(std::max(1, num_actuators_), 0.0);
+  target_traj_coeff_.assign(std::max(1, num_actuators_), std::array<double,6>{});
   band_sat_ticks_.assign(std::max(1, num_actuators_), 0);
 
   // **실제로 로드된 값을 찍는다.** config 만 바꾸면 colcon 이 설치를 건너뛰는
   // 일이 있어(20260904 15:04 에 겪음: 소스는 1.0/8.0 인데 설치본은 2.0/0.0),
   // 옛 설정으로 도는 줄 모르고 실험한다. 기동 로그에서 바로 확인할 수 있게 한다.
   RCLCPP_INFO(get_logger(),
-    "PositionController: 슬루 %.1f deg/s, 오차밴드 %.1f°, kd_vel_ff %.2f, "
+    "PositionController: S-curve %.1f deg/s, %.1f deg/s², %.1f deg/s³, "
+    "오차밴드 %.1f°, kd_vel_ff %.2f, inertia_ff %.2f, large-P %.4f@%.1f°≤%.2f Nm, "
     "적분정지 압력오차 %.1f kPa (0=끔), 밴드포화중 적분정지 %s, "
-    "부호반전 누설 %.2f s (0=즉시리셋)",
-    target_slew_dps_, target_follow_band_deg_, kd_vel_ff_, integ_hold_perr_kpa_,
-    integ_hold_on_band_ ? "예" : "아니오", integ_flip_tau_s_);
+    "부호반전 누설 %.2f s, 적용토크 back-calc %.2f s",
+    target_slew_dps_, target_accel_dps2_, target_jerk_dps3_,
+    target_follow_band_deg_, kd_vel_ff_, inertia_ff_gain_, large_error_kp_,
+    large_error_band_deg_, large_error_limit_nm_, integ_hold_perr_kpa_,
+    integ_hold_on_band_ ? "예" : "아니오", integ_flip_tau_s_,
+    integ_backcalc_tau_s_);
 
   for (int a = 0; a < num_actuators_; ++a) {
     const std::string prefix = "PositionController.axis" + std::to_string(a) + ".";
@@ -1711,26 +1746,47 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     tp.friction_vel_band_dps =
         get_param_or<double>(this, pre + "friction_vel_band_dps", 40.0);
 
-    // ── 캐스케이드 대역 검사 ──────────────────────────────────────────
-    //
-    // 외층(위치)은 내층(압력)보다 **느려야** 한다. 외층의 교차주파수는
-    // |L|=1 에서 kd 가 지배하므로 ωc ≈ kd/J 다 (kp 는 거의 영향이 없다).
-    // 내층은 cmd_lpf_hz 2 Hz + mppi_ref_tau_s 0.12 s 로 ≈1.33 Hz = 8.4 rad/s 다.
-    //
-    // 실기 20260904_155224: kd 0.02 → ωc 25.8 rad/s = 4.1 Hz 로 내층보다
-    // **3 배 빨랐고**, 내층 지연 160 ms 가 그 주파수에서 위상을 234° 먹어
-    // 0.95 Hz · p-p 11.6° 한계진동이 났다.
+    // ── 캐스케이드 대역/위상여유 검사 ─────────────────────────────────
+    // 실측 최악 내층을 exp(-Ls)/(1+Ts), T=260 ms, L=55 ms 로 놓고
+    // C(s)=kp+ki/s+kd*s 및 관성 1/(J*s²)을 모두 포함해 unity crossover를 찾는다.
+    // 예전 검사는 kd/J만 봐서 ki=0.20의 -90° 위상을 놓쳤고, 불안정한 설정을
+    // 안전하다고 표시했다. 여기서는 kp/ki/kd 세 항을 빠짐없이 검사한다.
     {
       const auto& pc = pos_ctrl_cfg_[(size_t)a];   // 위에서 이미 채웠다
       const double J = std::max(1e-9, pc.mass_kg * pc.link_length_m * pc.link_length_m);
-      const double wc = (tp.kd / (M_PI / 180.0)) / J;      // [rad/s]
-      const double w_inner = 2.0 * M_PI * 1.33;
-      if (wc > w_inner / 2.0) {
+      constexpr double inner_T = 0.260;
+      constexpr double inner_L = 0.055;
+      const double w_inner = 2.0 * M_PI * 0.61;
+      double wc = 0.0, pm_deg = -999.0;
+      double prev_mag = 1e300;
+      for (int k = 0; k < 2400; ++k) {
+        const double w = 0.01 * std::pow(10000.0, (double)k / 2399.0);
+        const double c_re = tp.kp;
+        const double c_im = tp.kd * w - tp.ki / w;
+        // TorquePID 게인은 N·m/deg 이므로 radian plant 앞에서 180/pi를 곱한다.
+        const double mag = std::hypot(c_re, c_im) * (180.0 / M_PI)
+                         / (J * w * w * std::hypot(1.0, inner_T * w));
+        if (prev_mag >= 1.0 && mag < 1.0) {
+          wc = w;
+          pm_deg = std::atan2(c_im, c_re) * 180.0 / M_PI
+                 - std::atan(inner_T * w) * 180.0 / M_PI
+                 - inner_L * w * 180.0 / M_PI;
+        }
+        prev_mag = mag;
+      }
+      if (wc <= 0.0) {
+        RCLCPP_WARN(get_logger(),
+          "[axis%d] 외층 unity crossover를 찾지 못했다 (kp=%.5f ki=%.5f kd=%.5f).",
+          a, tp.kp, tp.ki, tp.kd);
+      } else if (wc > w_inner / 3.0 || pm_deg < 35.0) {
         RCLCPP_ERROR(get_logger(),
-          "[axis%d] kd=%.4f → 외층 교차 %.1f rad/s (%.2f Hz) 로 내층(≈1.33 Hz)보다 "
-          "빠르다. 캐스케이드가 거꾸로다 — 한계진동한다. kd < %.4f 로 둘 것 "
-          "(내층의 1/3).", a, tp.kd, wc, wc / (2.0 * M_PI),
-          (w_inner / 3.0) * J * (M_PI / 180.0));
+          "[axis%d] 외층 wc=%.2f rad/s(%.2f Hz), PM=%.1f° — 최악 내층 0.61 Hz의 "
+          "1/3 또는 PM 35° 조건을 위반한다 (kp=%.5f ki=%.5f kd=%.5f).",
+          a, wc, wc / (2.0 * M_PI), pm_deg, tp.kp, tp.ki, tp.kd);
+      } else {
+        RCLCPP_INFO(get_logger(),
+          "[axis%d] 외층 검증: wc=%.2f rad/s(%.2f Hz), PM=%.1f° "
+          "(최악 내층 T/L=260/55 ms).", a, wc, wc / (2.0 * M_PI), pm_deg);
       }
     }
   }
@@ -2284,11 +2340,12 @@ void Controller::on_sensor(const std_msgs::msg::UInt16MultiArray::SharedPtr m) {
   on_timer();
 }
 
-// 각도 목표를 슬루 제한으로 램프시킨다.
+// 각도 목표를 속도·가속도·jerk 제한 S-curve 로 이동시킨다.
 //
 // TCP 로 들어온 목표를 계단으로 주면 레퍼런스 생성기가 즉시 큰 힘을 요구하고
 // 액추에이터가 그만큼 세게 튄다. 목표를 램프시키면 압력 레퍼런스도 따라서
 // 완만해진다 — 액추에이터를 보수적으로 움직일 때 여기부터 조인다.
+// 가속도/jerk 제한을 0 이하로 두면 호환성을 위해 예전의 정속 램프로 동작한다.
 // target_slew_deg_per_s <= 0 이면 계단 그대로다.
 void Controller::slew_targets(double dt_sec) {
   // ── 기동 시: 슬루 상태를 **현재 각도에서 한 번만** 출발시킨다 ────────────
@@ -2320,6 +2377,7 @@ void Controller::slew_targets(double dt_sec) {
       target_angle_slewed_[i] = ang[(size_t)enc];
     }
     target_slew_rate_.assign(target_angle_slewed_.size(), 0.0);
+    target_slew_accel_.assign(target_angle_slewed_.size(), 0.0);
     if (have || slew_seed_ticks_++ > slew_seed_limit_) {  // 1 s 지나면 0 으로 확정
       slew_seeded_ = true;
       std::string vs;
@@ -2336,23 +2394,120 @@ void Controller::slew_targets(double dt_sec) {
   if (target_slew_dps_ <= 0.0 || dt_sec <= 0.0) {
     target_angle_slewed_ = target_angle_deg_;
     target_slew_rate_.assign(target_angle_slewed_.size(), 0.0);   // 계단이면 속도 FF 없음
+    target_slew_accel_.assign(target_angle_slewed_.size(), 0.0);
     return;
   }
   if (target_angle_slewed_.size() != target_angle_deg_.size())
     target_angle_slewed_ = target_angle_deg_;
   if (target_slew_rate_.size() != target_angle_slewed_.size())
     target_slew_rate_.assign(target_angle_slewed_.size(), 0.0);
-  const std::vector<double> prev = target_angle_slewed_;
-  const double step = target_slew_dps_ * dt_sec;
-  for (size_t i = 0; i < target_angle_deg_.size(); ++i) {
-    const double d = target_angle_deg_[i] - target_angle_slewed_[i];
-    target_angle_slewed_[i] += std::clamp(d, -step, step);
+  if (target_slew_accel_.size() != target_angle_slewed_.size())
+    target_slew_accel_.assign(target_angle_slewed_.size(), 0.0);
+
+  // 설정을 명시적으로 끄면 기존 정속 램프를 그대로 보존한다.
+  if (target_accel_dps2_ <= 0.0 || target_jerk_dps3_ <= 0.0) {
+    const std::vector<double> prev = target_angle_slewed_;
+    const double step = target_slew_dps_ * dt_sec;
+    for (size_t i = 0; i < target_angle_deg_.size(); ++i) {
+      const double d = target_angle_deg_[i] - target_angle_slewed_[i];
+      target_angle_slewed_[i] += std::clamp(d, -step, step);
+      target_slew_rate_[i] = (target_angle_slewed_[i] - prev[i]) / dt_sec;
+      target_slew_accel_[i] = 0.0;
+    }
+    return;
   }
 
-  // 목표 슬루 **속도** 를 남긴다. 제어기의 D 항이 이 값을 피드포워드로 쓴다 —
-  // 그래야 D 가 "명령한 움직임" 이 아니라 "명령에서 벗어난 만큼" 만 억제한다.
-  for (size_t i = 0; i < target_angle_slewed_.size(); ++i)
-    target_slew_rate_[i] = (target_angle_slewed_[i] - prev[i]) / dt_sec;
+  const size_t n = target_angle_slewed_.size();
+  if (target_traj_goal_.size() != n) {
+    target_traj_goal_.assign(n, std::numeric_limits<double>::quiet_NaN());
+    target_traj_elapsed_.assign(n, 0.0);
+    target_traj_duration_.assign(n, 0.0);
+    target_traj_coeff_.assign(n, std::array<double,6>{});
+  }
+
+  const double vmax = target_slew_dps_;
+  const double amax = target_accel_dps2_;
+  const double jmax = target_jerk_dps3_;
+
+  auto coefficients = [](double x0, double v0, double a0, double xf, double T) {
+    const double T2 = T*T, T3 = T2*T, T4 = T3*T, T5 = T4*T;
+    const double d = xf - x0;
+    return std::array<double,6>{
+      x0, v0, 0.5*a0,
+      10.0*d/T3 - 6.0*v0/T2 - 1.5*a0/T,
+     -15.0*d/T4 + 8.0*v0/T3 + 1.5*a0/T2,
+       6.0*d/T5 - 3.0*v0/T4 - 0.5*a0/T3
+    };
+  };
+  auto eval = [](const std::array<double,6>& c, double t,
+                 double& x, double& v, double& a, double& j) {
+    const double t2=t*t, t3=t2*t, t4=t3*t, t5=t4*t;
+    x = c[0] + c[1]*t + c[2]*t2 + c[3]*t3 + c[4]*t4 + c[5]*t5;
+    v = c[1] + 2.0*c[2]*t + 3.0*c[3]*t2 + 4.0*c[4]*t3 + 5.0*c[5]*t4;
+    a = 2.0*c[2] + 6.0*c[3]*t + 12.0*c[4]*t2 + 20.0*c[5]*t3;
+    j = 6.0*c[3] + 24.0*c[4]*t + 60.0*c[5]*t2;
+  };
+
+  for (size_t i = 0; i < target_angle_deg_.size(); ++i) {
+    const double goal = target_angle_deg_[i];
+    if (!std::isfinite(target_traj_goal_[i]) ||
+        std::abs(goal - target_traj_goal_[i]) > 1e-9) {
+      const double x0 = target_angle_slewed_[i];
+      const double v0 = target_slew_rate_[i];
+      const double a0 = target_slew_accel_[i];
+      const double d = std::abs(goal - x0);
+
+      if (d < 1e-9 && std::abs(v0) < 1e-6 && std::abs(a0) < 1e-6) {
+        target_traj_goal_[i] = goal;
+        target_traj_elapsed_[i] = target_traj_duration_[i] = 0.0;
+        target_angle_slewed_[i] = goal;
+        target_slew_rate_[i] = target_slew_accel_[i] = 0.0;
+        continue;
+      }
+
+      // zero-boundary quintic의 알려진 첨두(1.875, 5.774, 60)를 초기 시간으로
+      // 쓰고, 현재 v/a가 0이 아닌 목표 변경도 처리하도록 표본 검사로 늘린다.
+      double T = std::max({4.0*dt_sec,
+                           1.875*d/vmax,
+                           std::sqrt(5.774*d/amax),
+                           std::cbrt(60.0*d/jmax),
+                           2.0*std::abs(v0)/amax,
+                           std::sqrt(2.0*std::abs(a0)/jmax)});
+      std::array<double,6> c{};
+      for (int attempt = 0; attempt < 24; ++attempt) {
+        c = coefficients(x0, v0, a0, goal, T);
+        double mv=0.0, ma=0.0, mj=0.0;
+        for (int s = 0; s <= 128; ++s) {
+          double x, v, a, j;
+          eval(c, T*(double)s/128.0, x, v, a, j);
+          mv=std::max(mv,std::abs(v)); ma=std::max(ma,std::abs(a));
+          mj=std::max(mj,std::abs(j));
+        }
+        if (mv <= vmax*1.001 && ma <= amax*1.001 && mj <= jmax*1.001) break;
+        if (attempt < 23) T *= 1.20;
+      }
+      target_traj_goal_[i] = goal;
+      target_traj_elapsed_[i] = 0.0;
+      target_traj_duration_[i] = T;
+      target_traj_coeff_[i] = c;
+    }
+
+    const double T = target_traj_duration_[i];
+    if (T <= 0.0) continue;
+    const double t = std::min(T, target_traj_elapsed_[i] + dt_sec);
+    double x, v, a, j;
+    eval(target_traj_coeff_[i], t, x, v, a, j);
+    (void)j;
+    target_angle_slewed_[i] = x;
+    target_slew_rate_[i] = v;
+    target_slew_accel_[i] = a;
+    target_traj_elapsed_[i] = t;
+    if (t >= T) {
+      target_angle_slewed_[i] = target_traj_goal_[i];
+      target_slew_rate_[i] = target_slew_accel_[i] = 0.0;
+      target_traj_duration_[i] = 0.0;
+    }
+  }
 }
 
 // 토픽: actuator/volumes_ml  (Float64MultiArray, num_total_channels_ 개, 단위 mL)
@@ -3287,7 +3442,7 @@ void Controller::run_position_control(double dt_sec)
         ? std::clamp(error_raw, -target_follow_band_deg_, target_follow_band_deg_)
         : error_raw;
     // D 항은 목표 속도를 빼고 본다 (명령한 움직임은 억제하지 않는다).
-    const double vel_ref_m1 = (a < (int)target_slew_rate_.size() && pos_tcp_received_)
+    const double vel_ref_m1 = (a < (int)target_slew_rate_.size())
         ? target_slew_rate_[(size_t)a] : 0.0;
     const double vel_err_m1 = vel - kd_vel_ff_ * vel_ref_m1;
     double p_pid = 0.0;
@@ -3425,6 +3580,8 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     ang = encoder_angles_;
   }
   std::vector<double> F_ref((size_t)N, 0.0), tau_ref((size_t)N, 0.0);
+  // 포화/슬루 전 토크와 실제 post-slew 압력 지령이 만드는 토크를 분리한다.
+  std::vector<double> tau_unsat((size_t)N, 0.0), tau_applied((size_t)N, 0.0);
   std::vector<double> dbg_tau_pid((size_t)N, 0.0), dbg_tau_ff((size_t)N, 0.0);
   // 항 분해 — 이게 없어서 "I 항이 도는지" 를 로그로 확인할 수 없었다.
   // mode 2 는 position_dbg 를 안 내므로 pp_logger 의 pid/ff/fric/vel 열이
@@ -3552,7 +3709,8 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     }
     if (actuator_connected_ && !inner_behind &&
         !(integ_hold_on_band_ && err_saturated)) I += err * dt_sec;
-    const double I_lim = (std::abs(tp.ki) > 1e-12) ? tp.integ_limit_nm / tp.ki : 0.0;
+    const double I_lim = (std::abs(tp.ki) > 1e-12)
+        ? tp.integ_limit_nm / std::abs(tp.ki) : 0.0;
     I = std::clamp(I, -I_lim, I_lim);
 
     // ── D 항: 목표 속도 피드포워드 ────────────────────────────────────
@@ -3570,12 +3728,19 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     // vel 대신 (vel − 목표속도) 를 쓰면 D 는 **명령에서 벗어난 만큼만** 억제한다.
     // 명령한 속도로 내려가는 동안은 0 이고, −45 로 미끄러지면 그 초과분만 잡는다.
     // kd_vel_ff_ 0 이면 예전 동작, 1 이면 완전 피드포워드.
-    const double vel_ref = (a < (int)target_slew_rate_.size() && pos_tcp_received_)
+    const double vel_ref = (a < (int)target_slew_rate_.size())
         ? target_slew_rate_[(size_t)a] : 0.0;
     const double vel_err = vel - kd_vel_ff_ * vel_ref;
 
+    // 큰 오차에서만 쓰는 제한 P: 목표 근처 선형화에는 나타나지 않으므로
+    // 저대역 local kp의 위상여유를 보존하면서 정지마찰/내층 지연만 넘어선다.
+    const double err_excess = std::max(0.0, std::abs(err) - large_error_band_deg_);
+    const double tau_large_p = (large_error_limit_nm_ > 0.0)
+        ? std::copysign(std::min(large_error_limit_nm_, large_error_kp_ * err_excess), err)
+        : 0.0;
+
     const double tau_pid = actuator_connected_
-        ? (tp.kp * err + tp.ki * I - tp.kd * vel_err) : 0.0;
+        ? (tp.kp * err + tau_large_p + tp.ki * I - tp.kd * vel_err) : 0.0;
 
     // 중력 피드포워드. tau_ff_gain 으로 크기를 줄일 수 있다.
     //
@@ -3588,6 +3753,13 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     const double ff_angle = actuator_connected_ ? angle : angle_ref;
     const double tau_grav = tp.tau_ff_gain * cfg.mass_kg * 9.81 * cfg.link_length_m
                           * std::sin(ff_angle * M_PI / 180.0);
+    // S-curve가 요구하는 각가속도에 필요한 관성 토크. 이전 정속 램프에는
+    // 가속도 상태가 없어 시작 토크를 P/D/마찰이 대신 만들면서 충격이 생겼다.
+    const double accel_ref = (a < (int)target_slew_accel_.size())
+        ? target_slew_accel_[(size_t)a] : 0.0;
+    const double inertia = cfg.mass_kg * cfg.link_length_m * cfg.link_length_m;
+    const double tau_inertia = actuator_connected_
+        ? inertia_ff_gain_ * inertia * accel_ref * M_PI / 180.0 : 0.0;
 
     // 마찰 보상. **하드 sign 은 err 이 0 을 지날 때마다 ±friction_nm 를 통째로
     // 뒤집는다** — friction_nm 0.48 이면 0.96 N·m 계단이고, 이는 2 kg·150 mm 의
@@ -3613,22 +3785,27 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     // 0.02 → 0.0020 으로 내리면 밴드가 240 deg/s 를 넘어야 해서 실용 불가다.
     //
     // 목표 속도(target_slew_rate_)는 측정에서 오지 않으므로 루프 위상을 전혀
-    // 먹지 않는다. "지금 이 방향으로 움직이라고 명령했으니 그만큼 마찰을
-    // 이겨야 한다" 는 것이 원래 의도이기도 하다. 하강을 명령하면 −friction_nm,
-    // 상승이면 +friction_nm, 정지 명령이면 0 이다.
+    // 먹지 않는다. 이동 중에는 목표속도 방향, 궤적이 끝났는데 실제 축이
+    // 뒤처져 정지해 있으면 오차 방향으로 연속 전환해 정지마찰을 넘는다.
     //
     // friction_vel_band_dps 를 0 으로 두면 예전의 오차 기준으로 되돌아간다.
     // 오차 기준은 목표 근처에서 강성을 kp 0.0786 → 0.56 N·m/deg 로 7 배 키워
     // 감쇠비를 1.27 → 0.48 로 떨어뜨렸다 (실기 20260904_153154).
     const double fb = std::max(1e-6, tp.friction_band_deg);
     const double vb = tp.friction_vel_band_dps;
-    const double tau_fric = actuator_connected_
-        ? tp.friction_nm * ((vb > 0.0) ? std::clamp(vel_ref / vb, -1.0, 1.0)
-                                       : std::clamp(err / fb, -1.0, 1.0))
-        : 0.0;
+    double friction_dir = std::clamp(err / fb, -1.0, 1.0);
+    if (vb > 0.0) {
+      const double motion = std::clamp(vel_ref / vb, -1.0, 1.0);
+      const double moving_weight = std::clamp(std::abs(vel_ref) / vb, 0.0, 1.0);
+      friction_dir = motion + (1.0 - moving_weight) * friction_dir;
+      friction_dir = std::clamp(friction_dir, -1.0, 1.0);
+    }
+    const double tau_fric = actuator_connected_ ? tp.friction_nm * friction_dir : 0.0;
 
-    // 이 시스템은 한 방향 힘만 낸다 → 목표는 항상 ≥ 0
-    tau_ref[(size_t)a] = std::max(0.0, tau_pid + tau_grav + tau_fric);
+    // 이 시스템은 한 방향 힘만 낸다 → 목표는 항상 ≥ 0. anti-windup 은
+    // 이 클램프 전 값과 최종 pressure-reference 가 만드는 토크를 비교한다.
+    tau_unsat[(size_t)a] = tau_pid + tau_grav + tau_inertia + tau_fric;
+    tau_ref[(size_t)a] = std::max(0.0, tau_unsat[(size_t)a]);
 
     // ── 폭주 보호 ──────────────────────────────────────────────────────
     //
@@ -3665,8 +3842,9 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     F_ref[(size_t)a]   = tau_ref[(size_t)a] / std::max(1e-6, reel_m);
 
     dbg_tau_pid[(size_t)a] = tau_pid;
+    // 기존 tau_debug/CSV 스키마의 이 필드는 이름 그대로 중력 FF만 유지한다.
     dbg_tau_ff[(size_t)a]  = tau_grav;
-    dbg_kp[(size_t)a]      = tp.kp * err;
+    dbg_kp[(size_t)a]      = tp.kp * err + tau_large_p;
     dbg_ki[(size_t)a]      = tp.ki * I;
     dbg_kd[(size_t)a]      = -tp.kd * vel_err;
     dbg_fric[(size_t)a]    = tau_fric;
@@ -3744,6 +3922,37 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
         gen_neg_ref_kpa_[(size_t)a] = want_n;
       }
     }
+
+    // ── 최종 적용 pressure-reference 기반 외층 anti-windup ─────────────
+    // PressureRefGen::F_achieved 는 위의 외부 ref slew **전** 최적화 결과다.
+    // 실제 내층으로 전달되는 gen_*_ref 로 힘/토크를 다시 계산해야 saturation과
+    // rate limit을 모두 본다. Back-calculation 은 기존 적분의 절댓값을 줄이는
+    // 방향으로만 허용해, 공급 부족 중 반대 부호 적분을 새로 만들지는 않는다.
+    const double area_m2 = piston_area_mm2_ * 1e-6;
+    for (int a = 0; a < N; ++a) {
+      const double force_applied =
+          ((gen_pos_ref_kpa_[(size_t)a] - atm) * 1000.0 * area_m2)
+        - ((gen_neg_ref_kpa_[(size_t)a] - atm) * 1000.0 * area_m2);
+      tau_applied[(size_t)a] = force_applied * reel_m;
+
+      auto& tp = tau_pid_[(size_t)a];
+      double& I = tau_integ_[(size_t)a];
+      if (!actuator_connected_ || integ_backcalc_tau_s_ <= 0.0 ||
+          std::abs(tp.ki) <= 1e-12 || std::abs(I) <= 1e-12) continue;
+
+      const double tracking = tau_applied[(size_t)a] - tau_unsat[(size_t)a];
+      const double dI = (tracking / tp.ki)
+                      * std::min(1.0, gen_dt / integ_backcalc_tau_s_);
+      // 오차 적분이 감긴 방향과 반대로 갈 때만 풀어 준다.
+      if (I * dI < 0.0) {
+        const double old_I = I;
+        I += dI;
+        if (old_I * I < 0.0) I = 0.0;  // back-calc 로 반대 부호까지 만들지 않는다
+        const double I_lim = tp.integ_limit_nm / std::abs(tp.ki);
+        I = std::clamp(I, -I_lim, I_lim);
+        dbg_integ_state[(size_t)a] += 4.0;
+      }
+    }
     // ── 공급이 없어 레퍼런스를 못 만드는 상태를 **직접** 알린다 ──────────
     //
     // 힘은 요구되는데 챔버 상한(ub⁺)이 대기압에 붙어 있으면 레퍼런스가 대기압에서
@@ -3793,7 +4002,7 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
         m.data.push_back(dbg_angle[(size_t)a]);
         m.data.push_back(dbg_angle_ref[(size_t)a]);
         m.data.push_back(tau_ref[(size_t)a]);
-        m.data.push_back(r.F_achieved[(size_t)a] * reel_m);      // 달성 토크 [N·m]
+        m.data.push_back(tau_applied[(size_t)a]);                // post-slew 적용 토크 [N·m]
         m.data.push_back(gen_pos_ref_kpa_[(size_t)a]);
         m.data.push_back(gen_neg_ref_kpa_[(size_t)a]);
         m.data.push_back(to_abs_kpa(r.ub_pos[(size_t)a]));       // 슬루 상한 P⁺
@@ -3824,7 +4033,7 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
         m.data.push_back(dbg_fric[(size_t)a]);        // 마찰 보상     [N·m]
         m.data.push_back(dbg_vel[(size_t)a]);         // 필터 각속도   [deg/s]
         m.data.push_back(dbg_err_raw[(size_t)a]);     // 자르기 전 오차 [deg]
-        m.data.push_back(dbg_integ_state[(size_t)a]); // 적분 동결 사유
+        m.data.push_back(dbg_integ_state[(size_t)a]); // bitmask: 1=내층, 2=밴드, 4=back-calc
       }
       pub_tau_dbg_->publish(m);
     }
@@ -3877,7 +4086,7 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
         "[RefGen] θ=%.2f→%.2f°  τ=%.2f/%.2f N·m (pid %.2f ff %.2f) | "
         "P⁺=%.1f[%.1f~%.1f] P⁻=%.1f[%.1f~%.1f] | rail SP %.1f/%.1f | "
         "tank %.0f%s starve %.0f/%.0f%% [%s%s] it=%d",
-        dbg_angle[0], dbg_angle_ref[0], r.F_achieved[0] * reel_m, tau_ref[0],
+        dbg_angle[0], dbg_angle_ref[0], tau_applied[0], tau_ref[0],
         dbg_tau_pid[0], dbg_tau_ff[0],
         gen_pos_ref_kpa_[0], to_abs_kpa(r.lb_pos[0]), to_abs_kpa(r.ub_pos[0]),
         gen_neg_ref_kpa_[0], to_abs_kpa(r.lb_neg[0]), to_abs_kpa(r.ub_neg[0]),

@@ -204,10 +204,10 @@ public:
   struct Config {
     int can_board_id{4};   // physical CAN board ID (1-based); sensor = filt_out_[can_board_id-1]
     int global_id{0};
-    int   NP{10};
+    int   NP{8};
     int   n_x{1};
     int   n_u{3};
-    float Ts{0.004f};
+    float Ts{0.005f};
     float Q_value{1.0f};
     float R_value{1.0f};
     float A_lin{1.0f};
@@ -743,7 +743,7 @@ private:
   SensorCalib sensor_;
 
   struct MpcYaml {
-    int   NP{5}; int n_x{1}; int n_u{3}; double Ts{0.01}; double Q_value{10.0}; double R_value{1.0};
+    int   NP{8}; int n_x{1}; int n_u{3}; double Ts{0.005}; double Q_value{10.0}; double R_value{1.0};
     double ejector_k{0.005};
     double ejector_p_limit{11.325};
     double leakage_u_pos{0.0};
@@ -880,14 +880,28 @@ private:
   std::vector<double> target_angle_deg_;
   std::vector<double> target_angle_slewed_;   // 슬루 제한을 지난 목표 (제어가 쓰는 값)
   double target_slew_dps_{0.0};               // 각도 목표 슬루 [deg/s], 0=끔
+  double target_accel_dps2_{0.0};              // 목표 궤적 가속도 제한 [deg/s²], 0=기존 램프
+  double target_jerk_dps3_{0.0};               // 목표 궤적 jerk 제한 [deg/s³], 0=기존 램프
   // 목표가 측정각보다 앞설 수 있는 최대 오차 [deg]. 0 이하면 끔.
   // 한 방향 힘 시스템이라 하강은 중력에 맡길 수밖에 없다 — 목표가
   // 달아나면 τ_ref 가 0 으로 떨어져 자유낙하한다 (S-30 참조).
   double target_follow_band_deg_{5.0};
   // 목표 슬루 속도 [deg/s] — D 항의 피드포워드. slew_targets() 가 매 틱 채운다.
   std::vector<double> target_slew_rate_;
+  // S-curve 생성기의 가속도 상태 [deg/s²]. 속도를 한 틱에 0↔최대값으로 바꾸지 않는다.
+  std::vector<double> target_slew_accel_;
+  // 목표가 바뀔 때 현재 x/v/a에서 새 목표의 0/0 경계조건까지 잇는 quintic 궤적.
+  std::vector<double> target_traj_goal_, target_traj_elapsed_, target_traj_duration_;
+  std::vector<std::array<double,6>> target_traj_coeff_;
   // D 항이 목표 속도를 얼마나 빼고 볼지 (0=예전 −kd·vel, 1=완전 피드포워드).
   double kd_vel_ff_{1.0};
+  // S-curve 목표 가속도의 관성 토크 J*theta_ref_ddot feedforward 배율.
+  double inertia_ff_gain_{1.0};
+  // 작은 오차에서는 안정한 저대역 kp만 쓰고, 큰 오차에서만 제한적으로 보태는 P.
+  // 내층 지연 때문에 생기는 "안정성 gain vs 정지마찰 돌파 권한" 충돌을 분리한다.
+  double large_error_kp_{0.0};
+  double large_error_band_deg_{1.0};
+  double large_error_limit_nm_{0.0};
   // 추종 오차가 밴드에 붙어 있는 연속 틱 수 (축별). 오래 붙으면 경고한다.
   std::vector<int> band_sat_ticks_;
   // 압력 추종 오차가 이보다 크면 외층 적분을 얼린다 [kPa]. 0 이하면 끔.
@@ -907,6 +921,9 @@ private:
   // 즉시 리셋은 ki·I 만큼의 계단이다 (실기에서 0.75 N·m = 중력 최대의 26 %).
   // 0 이하면 예전처럼 즉시 리셋.
   double integ_flip_tau_s_{0.15};
+  // 최종 post-slew 압력 레퍼런스로 환산한 토크와 포화 전 요구 토크의 차이를
+  // 적분기에 되먹이는 back-calculation 시정수 [s]. 0 이하면 끔.
+  double integ_backcalc_tau_s_{0.30};
   // 슬루 상태를 현재 각도에서 한 번 출발시켰나 (기동 계단 방지).
   bool slew_seeded_{false};
   int  slew_seed_ticks_{0};
