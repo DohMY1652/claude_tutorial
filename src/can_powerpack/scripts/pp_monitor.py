@@ -28,6 +28,21 @@ CHANNEL_BOARD_OFFSET = 5
 # (board/analog 의 index = Teensy ch = 축의 actuator_idx)
 NUM_AXES_SHOWN = 6
 
+
+def _physical_axes_from_env():
+    """논리 제어기 axis0..N을 실제 Teensy/공압 축 번호로 매핑한다."""
+    try:
+        axes = [int(x) for x in os.environ.get(
+            'PP_PHYSICAL_AXES', '0,1,2,3,4,5').split(',') if x.strip()]
+        if axes and len(set(axes)) == len(axes) and all(0 <= x < NUM_AXES_SHOWN for x in axes):
+            return axes
+    except ValueError:
+        pass
+    return list(range(NUM_AXES_SHOWN))
+
+
+PHYSICAL_AXES = _physical_axes_from_env()
+
 SEP  = '-' * 96
 SEP2 = '=' * 96
 
@@ -126,6 +141,8 @@ def build_display(kpa, currents, refs, encoders, pos_dbg, rail_sp, tank_low,
     o = '\033[H'
     o += f'========== Powerpack Monitor ({NAMESPACE}) ==========\n'
     o += f' [t] toggle display   [q] quit\n'
+    o += ' 제어 매핑: ' + ', '.join(
+        f'logical axis{i} -> physical axis{p}' for i, p in enumerate(PHYSICAL_AXES)) + '\n'
     # ── 수신율 요약 ─────────────────────────────────────────────────────
     # 통신이 죽으면 아래 압력·각도는 **얼어붙은 값**이다. 그걸 모르고 보면
     # 값이 멀쩡해 보인다 — 그래서 맨 위에 둔다.
@@ -195,16 +212,18 @@ def build_display(kpa, currents, refs, encoders, pos_dbg, rail_sp, tank_low,
     enc_hz = rx_hz[16] if (rx_hz and len(rx_hz) >= 17) else None
     hz_note = f'   [Teensy {enc_hz:.0f} Hz]' if enc_hz is not None else ''
     o += f'  엔코더 (Teensy USB){hz_note}\n'
-    o += '|  ch  | Axis |  Angle(deg) | Target(deg) |   Err(deg) |\n'
+    o += '| Phys | Ctrl |  Angle(deg) | Target(deg) |   Err(deg) |\n'
     o += '|------|------|-------------|-------------|------------|\n'
 
     tgt = {}
-    for a, (_ang, ref) in enumerate(axis_ang or []):
-        tgt[a] = ref
+    for logical, (_ang, ref) in enumerate(axis_ang or []):
+        if logical < len(PHYSICAL_AXES):
+            tgt[PHYSICAL_AXES[logical]] = ref
     if not tgt and pos_dbg and len(pos_dbg) >= 8:
-        for a in range(len(pos_dbg) // 8):
-            tgt[a] = pos_dbg[8 * a + 1]
+        for logical in range(min(len(pos_dbg) // 8, len(PHYSICAL_AXES))):
+            tgt[PHYSICAL_AXES[logical]] = pos_dbg[8 * logical + 1]
 
+    logical_for_physical = {p: i for i, p in enumerate(PHYSICAL_AXES)}
     for a in range(NUM_AXES_SHOWN):
         now = encoders[a] if a < len(encoders) else float('nan')
         ref = tgt.get(a, float('nan'))
@@ -215,14 +234,18 @@ def build_display(kpa, currents, refs, encoders, pos_dbg, rail_sp, tank_low,
             ref_s, err_s = f'{ref:11.2f}', ' ' * 10
         else:
             ref_s, err_s = ' ' * 11, ' ' * 10
-        o += f'|  {a:>2}  |  {a}   | {now_s} | {ref_s} | {err_s} |\n'
+        ctrl_s = f'L{logical_for_physical[a]}' if a in logical_for_physical else '-'
+        o += f'|  {a:>2}  | {ctrl_s:^4} | {now_s} | {ref_s} | {err_s} |\n'
 
     # 위치 제어 세부 (mode 1 에서만 나온다)
     if pos_dbg and len(pos_dbg) >= 8:
         o += SEP + '\n'
-        for a in range(len(pos_dbg) // 8):
-            _ang, _ref, p_pos, p_neg, p_pid, p_ff, p_fric, vel = pos_dbg[8 * a:8 * a + 8]
-            o += (f' [Axis {a}] vel={vel:+6.1f} dps   P+={p_pos:6.1f}  P-={p_neg:6.1f} kPa'
+        for logical in range(min(len(pos_dbg) // 8, len(PHYSICAL_AXES))):
+            physical = PHYSICAL_AXES[logical]
+            b = 8 * logical
+            _ang, _ref, p_pos, p_neg, p_pid, p_ff, p_fric, vel = pos_dbg[b:b + 8]
+            o += (f' [L{logical}->physical {physical}] vel={vel:+6.1f} dps   '
+                  f'P+={p_pos:6.1f}  P-={p_neg:6.1f} kPa'
                   f'   (pid={p_pid:+5.1f} ff={p_ff:+5.1f} fric={p_fric:+5.1f})\n')
 
     o += SEP2 + '\n'

@@ -16,7 +16,8 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray, UInt16MultiArray
 
-SCHEMA_VERSION = 6           # 형식을 바꾸면 올린다. 과거 CSV 구분용(meta.json 에 기록)
+SCHEMA_VERSION = 7           # 형식을 바꾸면 올린다. 과거 CSV 구분용(meta.json 에 기록)
+                             # 7: 단축 운전 논리축 진단을 물리축 CSV 열로 scatter
                              # 6: 토크 항 분해 8열/축 추가 (tau_kp/ki/kd/grav/fric,
                              #    vel_filt, err_raw, integ_hold) — mode 2 에서 I 항을
                              #    로그로 볼 수 없던 문제를 고쳤다.
@@ -34,6 +35,24 @@ PWM_BOARDS = 18              # board/pwm_cmd·board/currents 배열 크기 = PWM
 VALVE_NAMES = ['v1micro', 'v2atm', 'v3macro']   # 보드 위 v1/v2/v3 순서
 # 라인 밸브 pwm 인덱스 (Controller.cpp 기본값)
 LINE_PWM_IDX = [('line_pos', 0), ('line_neg', 3), ('macro_sw', 9)]
+
+
+def _physical_axes_from_env():
+    """launch가 넘긴 logical axis0..N -> physical axis 번호."""
+    try:
+        axes = [int(x) for x in os.environ.get(
+            'PP_PHYSICAL_AXES', '0,1,2,3,4,5').split(',') if x.strip()]
+        if axes and len(set(axes)) == len(axes) and all(0 <= x < NUM_AXES for x in axes):
+            return axes
+    except ValueError:
+        pass
+    return list(range(NUM_AXES))
+
+
+ACTIVE_PHYSICAL_AXES = _physical_axes_from_env()
+LOGICAL_FOR_PHYSICAL = {
+    physical: logical for logical, physical in enumerate(ACTIVE_PHYSICAL_AXES)
+}
 
 
 def _pwm_base(gid):
@@ -96,6 +115,7 @@ class PpLogger(Node):
         # 말미 공용 6 개: [rail_pos_sp, rail_neg_sp, tank, tank_low, boost g/s, eject g/s]
         self._rg_tail  = [0.0] * 6
         self._rg_seen  = False
+        self._diag_axis = ACTIVE_PHYSICAL_AXES[0]
 
         ns = NAMESPACE
         self.create_subscription(Float64MultiArray, f'{ns}/controller/position_dbg',
@@ -199,6 +219,10 @@ class PpLogger(Node):
             'timestamp': self._ts,
             'log_hz': LOG_HZ,
             'num_axes': NUM_AXES,
+            'active_physical_axes': ACTIVE_PHYSICAL_AXES,
+            'logical_to_physical': {
+                str(i): p for i, p in enumerate(ACTIVE_PHYSICAL_AXES)
+            },
             'pos_gids': POS_GIDS,
             'neg_gids': NEG_GIDS,
             'valve_names': VALVE_NAMES,
@@ -289,10 +313,20 @@ class PpLogger(Node):
         row = [f'{elapsed:.4f}']
         axis_angles = []
         for a in range(NUM_AXES):
-            angle, target, p_pos, p_neg, p_pid, p_ff, p_fric, vel = pos[a*8:(a+1)*8]
-            if rg_seen:                      # control_mode=2 는 position_dbg 를 안 낸다
-                angle, target = rg[12*a], rg[12*a + 1]
-                p_pos, p_neg  = rg[12*a + 4], rg[12*a + 5]
+            # 열 이름은 물리축 기준이다. axis:=1 단축 운전이면 controller의
+            # logical axis0 블록을 physical axis1 열로 옮겨 기록한다.
+            logical = LOGICAL_FOR_PHYSICAL.get(a)
+            angle = enc[a] if a < len(enc) else 0.0
+            target = angle
+            p_pid = p_ff = p_fric = vel = 0.0
+            p_pos, p_neg = ref[POS_GIDS[a]], ref[NEG_GIDS[a]]
+            if logical is not None:
+                b = 8 * logical
+                angle, target, p_pos, p_neg, p_pid, p_ff, p_fric, vel = pos[b:b + 8]
+                if rg_seen:                  # control_mode=2 는 position_dbg 를 안 낸다
+                    b = 12 * logical
+                    angle, target = rg[b], rg[b + 1]
+                    p_pos, p_neg  = rg[b + 4], rg[b + 5]
             pos_board_idx = POS_GIDS[a] + CHANNEL_BOARD_OFFSET - 1
             neg_board_idx = NEG_GIDS[a] + CHANNEL_BOARD_OFFSET - 1
             row += [
@@ -318,7 +352,7 @@ class PpLogger(Node):
                 pcts = [pwm[b + k] / 40.95 for k in range(3)]
                 row += [f'{x:.2f}' for x in pcts]
                 row += [f'{cur[b + k] / 10.0:.2f}' for k in range(3)]
-                if a == 0 and sign == 'pos':
+                if a == self._diag_axis and sign == 'pos':
                     pwm_trace = pcts
         for _name, idx in LINE_PWM_IDX:
             row.append(f'{pwm[idx] / 40.95:.2f}')
@@ -327,20 +361,23 @@ class PpLogger(Node):
             row.append(f'{vol[a]:.4f}')
             row.append(f'{vol[NUM_AXES + a]:.4f}')
         for a in range(NUM_AXES):
-            row += [f'{v:.4f}' for v in tau[8 * a:8 * a + 8]]
+            logical = LOGICAL_FOR_PHYSICAL.get(a)
+            vals = tau[8 * logical:8 * logical + 8] if logical is not None else [0.0] * 8
+            row += [f'{v:.4f}' for v in vals]
         for a in range(NUM_AXES):
-            b = 12 * a
-            row += [f'{rg[b + 2]:.4f}', f'{rg[b + 3]:.4f}',
-                    f'{rg[b + 6]:.4f}', f'{rg[b + 7]:.4f}',
-                    f'{rg[b + 8]:.4f}', f'{rg[b + 9]:.4f}',
-                    f'{rg[b + 10]:.2f}', f'{rg[b + 11]:.2f}']
+            logical = LOGICAL_FOR_PHYSICAL.get(a)
+            vals = rg[12 * logical:12 * logical + 12] if logical is not None else [0.0] * 12
+            row += [f'{vals[2]:.4f}', f'{vals[3]:.4f}',
+                    f'{vals[6]:.4f}', f'{vals[7]:.4f}',
+                    f'{vals[8]:.4f}', f'{vals[9]:.4f}',
+                    f'{vals[10]:.2f}', f'{vals[11]:.2f}']
         row += [f'{rgt[0]:.4f}', f'{rgt[1]:.4f}', f'{rgt[2]:.4f}',
                 f'{rgt[3]:.0f}', f'{rgt[4]:.4f}', f'{rgt[5]:.4f}']
 
         self._writer.writerow(row)
-        b0 = _pwm_base(POS_GIDS[0])
-        self._rows.append((elapsed, axis_angles, ref[POS_GIDS[0]],
-                           sen[POS_GIDS[0] + CHANNEL_BOARD_OFFSET - 1],
+        b0 = _pwm_base(POS_GIDS[self._diag_axis])
+        self._rows.append((elapsed, axis_angles, ref[POS_GIDS[self._diag_axis]],
+                           sen[POS_GIDS[self._diag_axis] + CHANNEL_BOARD_OFFSET - 1],
                            pwm_trace or [0.0, 0.0, 0.0],
                            [cur[b0 + k] / 10.0 for k in range(3)]))
 
@@ -408,7 +445,7 @@ class PpLogger(Node):
             self.get_logger().error(f'[pp_logger] PNG 저장 실패: {e}')
 
     def _save_diag_png(self):
-        """axis0 양압 채널: 레퍼런스/실측 압력 · 밸브 지령 · 실측 전류를 겹쳐 본다.
+        """선택한 첫 물리축의 양압 레퍼런스·실측·밸브 지령·전류를 겹쳐 본다.
 
         지령이 0 인데 압력이 오르면 밸브가 새는 것이고, 지령이 0 이 아니면
         컨트롤러가 여는 것이다. 두 경우를 한 장에서 구분하려고 만든 그림이다.
@@ -445,8 +482,8 @@ class PpLogger(Node):
             errs = [abs(a - b) for a, b in zip(pact, pref)]
             mx   = [max(p[k] for p in pwm) for k in range(3)]
             axes[0].set_title(
-                f'{self._ts}  axis0 ' + _L('양압', 'pos')
-                + f' (board{POS_GIDS[0] + CHANNEL_BOARD_OFFSET})   '
+                f'{self._ts}  axis{self._diag_axis} ' + _L('양압', 'pos')
+                + f' (board{POS_GIDS[self._diag_axis] + CHANNEL_BOARD_OFFSET})   '
                 + _L('추종오차 평균 ', 'err mean ')
                 + f'{sum(errs)/len(errs):.2f} ' + _L('최대 ', 'max ')
                 + f'{max(errs):.2f} kPa   |   '

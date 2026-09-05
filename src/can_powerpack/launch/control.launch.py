@@ -87,6 +87,7 @@ def _setup(context, *_a, **_k):
     # 20260903: 엔코더는 Teensy 채널이다 — actuator_idx = Teensy ch 번호.
     # (예전에는 board 17+idx 였다. encoder_source:can 으로 되돌리면 그 규칙이 산다.)
     axis = LaunchConfiguration('axis').perform(context)
+    axis_map_env = axis if axis else '0,1,2,3,4,5'
     if axis:
         sel = [int(x) for x in axis.replace(' ', '').split(',') if x]
         npos = int(overrides.get('num_positive_channels', 6))
@@ -142,6 +143,7 @@ def _setup(context, *_a, **_k):
     logger = ExecuteProcess(
         cmd=['python3', logger_path],
         output='log',
+        additional_env={'PP_PHYSICAL_AXES': axis_map_env},
     )
 
     monitor = ExecuteProcess(
@@ -152,6 +154,7 @@ def _setup(context, *_a, **_k):
             f'echo "monitor exited — press Enter to close"; read',
         ],
         output='screen',
+        additional_env={'PP_PHYSICAL_AXES': axis_map_env},
     )
 
     return [can_bridge, controller, logger, monitor]

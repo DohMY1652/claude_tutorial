@@ -109,6 +109,7 @@ def _launch_setup(context, *_args, **_kwargs):
     # num_actuators=1 로 두고 axis0 의 gid 를 N 으로 돌려놓는 것과 같다.
     # 명시적으로 준 num_actuators / ctrl_overrides 가 있으면 그쪽을 존중한다.
     axis = LaunchConfiguration('axis').perform(context)
+    axis_map_env = axis if axis else '0,1,2,3,4,5'
     if axis:
         a = int(axis)
         npos = int(ctrl_overrides.get('num_positive_channels', 6))
@@ -139,7 +140,8 @@ def _launch_setup(context, *_args, **_kwargs):
     pkg_prefix = get_package_prefix('can_powerpack')
     logger_path = os.path.join(pkg_prefix, 'lib', 'can_powerpack', 'pp_logger.py')
     actions = [virtual_system, controller,
-               ExecuteProcess(cmd=['python3', logger_path], output='log')]
+               ExecuteProcess(cmd=['python3', logger_path], output='log',
+                              additional_env={'PP_PHYSICAL_AXES': axis_map_env})]
 
     if show_monitor:
         monitor_path = os.path.join(pkg_prefix, 'lib', 'can_powerpack', 'pp_monitor.py')
@@ -148,6 +150,7 @@ def _launch_setup(context, *_args, **_kwargs):
             cmd=['gnome-terminal', '--maximize', '--', 'bash', '-c',
                  f'source {setup_bash} && python3 {monitor_path}; '
                  f'echo "monitor exited — press Enter to close"; read'],
+            additional_env={'PP_PHYSICAL_AXES': axis_map_env},
             output='screen',
         ))
 
