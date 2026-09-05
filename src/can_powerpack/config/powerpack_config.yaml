@@ -1087,10 +1087,9 @@
       angle_runaway_deg: 25.0
       axis0:
         # ── 공용 (mode 1 / 2) ──
-        # codex-mppi 1축 실기: 150 mm 링크 끝에 장착한 실제 payload와 맞춘다.
-        # 5 kg이면 중력토크가 90°에서 7.36 N·m이고 정격 최대 7.76 N·m 대비
-        # 여유가 약 5%뿐이므로 첫 검증은 5~20° 범위에서만 한다.
-        mass_kg: 5.0
+        # 단일축 실기: 150 mm 링크 끝의 2 kg payload 기준.
+        # launch의 axis:=N은 이 axis0 제어 설정을 물리축 N에 매핑한다.
+        mass_kg: 2.0
         link_length_m: 0.15
         p_pos_max_kpa: 185.0  # 양압 정격 [kPa abs]  180→185 (고각도 도달 허용)
         p_neg_min_kpa: 27.0   # 음압 정격 [kPa abs] — 이젝터 한계 실측값

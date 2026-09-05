@@ -12,10 +12,10 @@
 
 ## 0. 안전 전제
 
-기계식 스토퍼와 독립 릴리프를 준비하고, 첫 시험은 반드시 `axis:=0` 한 축만 한다.
+기계식 스토퍼와 독립 릴리프를 준비하고, 첫 시험은 반드시 `axis:=N`으로 지정한 한 축만 한다.
 엔코더 방향, 0점, 양/음압 채널 매핑이 맞지 않으면 시작하지 않는다.
-axis0 설정은 150 mm 링크의 **5 kg payload** 기준이다. 90° 중력토크가 약
-7.36 N·m로 액추에이터 정격 최대 7.76 N·m의 약 95%이므로 첫 시험은 5~20°로 제한한다.
+단일축 설정은 150 mm 링크의 **2 kg payload** 기준이다. 물리축을 바꿔 시험할
+때도 `axis:=N`으로 선택된 축에 이 axis0 설정이 매핑된다.
 
 ```bash
 cd ~/claude_tutorial
@@ -72,17 +72,27 @@ cd ~/claude_tutorial && source install/setup.bash
 ros2 launch can_powerpack control.launch.py control_mode:=2 solver:=mppi axis:=0 actuator_connected:=true
 ```
 
-목표는 작은 범위부터 한 번씩 보낸다.
+첫 번째 물리축을 교체하는 동안 두 번째 물리축만 시험하려면 위 `axis:=0` 명령을
+실행하지 말고, 그 대신 `axis:=1`을 사용한다.
+이때 논리 제어기와 로그 열 이름은 axis0이고, 실제 매핑은 양압 gid1 / 음압 gid7 /
+엔코더 1이다.
 
 ```bash
+ros2 launch can_powerpack control.launch.py control_mode:=2 solver:=mppi axis:=1 actuator_connected:=true
+```
+
+목표는 파손 전 로그의 15° 명령을 재현하지 말고 작은 범위부터 한 번씩 보낸다.
+
+```bash
+python3 src/can_powerpack/scripts/position_ref_client.py --axes 1 --once 2
 python3 src/can_powerpack/scripts/position_ref_client.py --axes 1 --once 5
-python3 src/can_powerpack/scripts/position_ref_client.py --axes 1 --once 10
-python3 src/can_powerpack/scripts/position_ref_client.py --axes 1 --once 5
+python3 src/can_powerpack/scripts/position_ref_client.py --axes 1 --once 2
 ```
 
 다음 조건이면 즉시 중지한다.
 
 - 각도 또는 압력 진폭이 연속해서 증가
+- 목표보다 3° 이상 넘어가거나 목표 통과 속도가 10 deg/s 이상
 - 유지 중 반대 밸브가 번갈아 crack point를 넘음
 - startup 로그에 캐스케이드/PM 오류가 표시됨
 - pressure reference와 실제 압력 차이가 8 kPa 이상인 상태가 지속
