@@ -1634,6 +1634,10 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
       "PositionController.approach_coast_min_vel_dps", 0.0));
   approach_coast_gravity_ratio_ = std::clamp(get_param_or<double>(this,
       "PositionController.approach_coast_gravity_ratio", 0.0), 0.0, 0.95);
+  approach_drive_margin_nm_ = get_param_or<double>(this,
+      "PositionController.approach_drive_margin_nm", -1.0);
+  rising_torque_slew_nm_per_s_ = std::max(0.0, get_param_or<double>(this,
+      "PositionController.rising_torque_slew_nm_per_s", 0.0));
   integ_hold_perr_kpa_ = get_param_or<double>(this,
       "PositionController.integ_hold_pressure_err_kpa", 8.0);
   integ_hold_on_band_ = get_param_or<bool>(this,
@@ -1663,12 +1667,14 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     "오차밴드 %.1f°, kd_vel_ff %.2f, inertia_ff %.2f, large-P %.4f@%.1f°≤%.2f Nm, "
     "적분정지 압력오차 %.1f kPa (0=끔), 밴드포화중 적분정지 %s, "
     "부호반전 누설 %.2f s, 적용토크 back-calc %.2f s, "
-    "접근 coast %.1f°+v×%.2fs (v>%.1f, 중력×%.2f), 폭주 +%.1f°/중력×%.2f",
+    "접근 구동여유 %.2f Nm/상승토크슬루 %.2f Nm/s, "
+    "coast %.1f°+v×%.2fs (v>%.1f, 중력×%.2f), 폭주 +%.1f°/중력×%.2f",
     target_slew_dps_, target_accel_dps2_, target_jerk_dps3_,
     target_follow_band_deg_, kd_vel_ff_, inertia_ff_gain_, large_error_kp_,
     large_error_band_deg_, large_error_limit_nm_, integ_hold_perr_kpa_,
     integ_hold_on_band_ ? "예" : "아니오", integ_flip_tau_s_,
-    integ_backcalc_tau_s_, approach_coast_margin_deg_, approach_coast_time_s_,
+    integ_backcalc_tau_s_, approach_drive_margin_nm_, rising_torque_slew_nm_per_s_,
+    approach_coast_margin_deg_, approach_coast_time_s_,
     approach_coast_min_vel_dps_, approach_coast_gravity_ratio_,
     angle_runaway_deg_, runaway_gravity_ratio_);
 
@@ -3627,6 +3633,12 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
       state.prev_angle = angle; state.vel_filt = 0.0; state.initialized = true;
       tau_integ_[(size_t)a] = 0.0;
     }
+    if (!state.approach_soft_goal_initialized ||
+        std::abs(angle_goal - state.approach_soft_goal) > 1e-6) {
+      state.approach_soft_goal = angle_goal;
+      state.approach_soft_goal_initialized = true;
+      state.approach_soft_latched = false;
+    }
     const double vel_raw = (angle - state.prev_angle) / dt_sec;
     state.vel_filt = cfg.vel_filter_alpha * vel_raw + (1.0 - cfg.vel_filter_alpha) * state.vel_filt;
     state.prev_angle = angle;
@@ -3834,6 +3846,43 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     tau_unsat[(size_t)a] = tau_pid + tau_grav + tau_inertia + tau_fric;
     tau_ref[(size_t)a] = std::max(0.0, tau_unsat[(size_t)a]);
 
+    // ── 상승 구동 압력 제한 ────────────────────────────────────────────
+    // 20260905_224759 axis1, 10→20°: 약 24 s부터 실제 축이 슬루 목표를 앞질렀다가
+    // 떨어질 때 friction이 -0.48→+0.48 N·m로 뒤집혔다. 그 결과 요구 토크가
+    // 0→1.16 N·m, P+ 목표가 101→125 kPa로 되튀고, 다음 반주기에 다시 0이 되어
+    // 8.6↔37.3° 릴레이 진동으로 커졌다. 목표각 램프만 느려서는 이 재가압을 못 막는다.
+    //
+    // 중력 FF 자체를 줄이면 도착 후 하중을 못 버틴다. 첫 coast 뒤 저압 접근만
+    // (중력 FF + 관성 FF + 작은 구동 여유)로 묶어, 정상 상승 권한과 유지 압력은
+    // 남기고 마찰/P가 한 번에 얹는 가속용 차압만 제한한다.
+    bool approach_drive_limited = false;
+    if (actuator_connected_ && state.approach_soft_latched &&
+        approach_drive_margin_nm_ >= 0.0 &&
+        angle_goal > angle) {
+      const double cap = std::max(0.0, tau_grav + tau_inertia
+                                       + approach_drive_margin_nm_);
+      if (tau_ref[(size_t)a] > cap) {
+        tau_ref[(size_t)a] = cap;
+        approach_drive_limited = true;
+      }
+    }
+
+    // 최종 상승 목표 아래에서는 coast 뒤 힘을 완전히 잃고 자유낙하하지 않게
+    // 실측 유지 수준의 중력 지지 토크를 하한으로 남긴다. 이 값은 실제 중력보다
+    // 작으므로 이론상 위로 가속하지 않으며, 압력 0↔재가압 사이클만 끊는다.
+    bool approach_support_active = false;
+    if (actuator_connected_ && state.approach_soft_latched &&
+        approach_coast_gravity_ratio_ > 0.0 &&
+        angle_goal > angle) {
+      const double g_true = cfg.mass_kg * 9.81 * cfg.link_length_m
+                          * std::sin(angle * M_PI / 180.0);
+      const double support = std::max(0.0, approach_coast_gravity_ratio_ * g_true);
+      if (tau_ref[(size_t)a] < support) {
+        tau_ref[(size_t)a] = support;
+        approach_support_active = true;
+      }
+    }
+
     // ── 무오버슛 우선 접근 coast ──────────────────────────────────────
     // 압력 내층은 힘을 빼라고 한 뒤에도 저장된 챔버 압력을 늦게 배출한다.
     // 목표 바로 앞에서 끄면 이미 늦으므로, 현재 속도로 approach_coast_time_s
@@ -3846,16 +3895,18 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
       const double coast_window = approach_coast_margin_deg_
                                 + vel * approach_coast_time_s_;
       if (remaining <= coast_window) {
+        state.approach_soft_latched = true;
         const double g_true = cfg.mass_kg * 9.81 * cfg.link_length_m
                             * std::sin(angle * M_PI / 180.0);
-        const double cap = std::max(0.0, approach_coast_gravity_ratio_ * g_true);
-        if (tau_ref[(size_t)a] > cap) {
-          tau_ref[(size_t)a] = cap;
+        const double coast_target = std::max(
+            0.0, approach_coast_gravity_ratio_ * g_true);
+        if (std::abs(tau_ref[(size_t)a] - coast_target) > 1e-9) {
+          tau_ref[(size_t)a] = coast_target;
           approach_coasting = true;
           RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 500,
             "[axis%d] 접근 coast: 목표 %.1f°, 현재 %.1f°, 속도 +%.1f deg/s, "
-            "남은 %.1f° <= 예측 %.1f° — 토크를 %.2f N·m로 제한",
-            a, angle_goal, angle, vel, remaining, coast_window, cap);
+            "남은 %.1f° <= 예측 %.1f° — 토크를 %.2f N·m 지지점으로 설정",
+            a, angle_goal, angle, vel, remaining, coast_window, coast_target);
         }
       }
     }
@@ -3890,6 +3941,23 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
         }
       }
     }
+
+    // coast가 한 틱 풀린 직후 0→중력+마찰 토크를 다시 요구하면 저장 압력과
+    // 합쳐져 반대편 오버슛을 만든다. 상승 방향의 재가압만 천천히 허용한다.
+    // 토크 감소와 하강 명령은 지연시키지 않아 보호 동작과 감압 응답을 보존한다.
+    bool rising_torque_limited = false;
+    if (actuator_connected_ && state.approach_soft_latched &&
+        rising_torque_slew_nm_per_s_ > 0.0 &&
+        angle_goal > angle) {
+      const double max_rise = state.tau_ref_rise_limited
+                            + rising_torque_slew_nm_per_s_ * dt_sec;
+      if (tau_ref[(size_t)a] > max_rise) {
+        tau_ref[(size_t)a] = std::max(0.0, max_rise);
+        rising_torque_limited = true;
+      }
+    }
+    state.tau_ref_rise_limited = tau_ref[(size_t)a];
+
     F_ref[(size_t)a]   = tau_ref[(size_t)a] / std::max(1e-6, reel_m);
 
     dbg_tau_pid[(size_t)a] = tau_pid;
@@ -3900,11 +3968,14 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     dbg_kd[(size_t)a]      = -tp.kd * vel_err;
     dbg_fric[(size_t)a]    = tau_fric;
     dbg_err_raw[(size_t)a] = err_raw;
-    // 상태 비트: 1=압력내층지연, 2=밴드포화, 4=back-calc, 8=접근 coast
+    // 상태 비트: 1=압력내층지연, 2=밴드포화, 4=back-calc, 8=접근 coast,
+    // 16=상승 구동압력/토크상승 제한
     dbg_integ_state[(size_t)a] =
         (inner_behind ? 1.0 : 0.0) +
         ((integ_hold_on_band_ && err_saturated) ? 2.0 : 0.0) +
-        (approach_coasting ? 8.0 : 0.0);
+        (approach_coasting ? 8.0 : 0.0) +
+        ((approach_drive_limited || approach_support_active || rising_torque_limited)
+            ? 16.0 : 0.0);
     dbg_angle[(size_t)a]   = angle;
     dbg_angle_ref[(size_t)a] = angle_ref;
     dbg_vel[(size_t)a]     = vel;

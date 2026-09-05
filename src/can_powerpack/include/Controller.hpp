@@ -870,6 +870,13 @@ private:
     bool   initialized{false};
     double p_pos_ref_filt{101.325};   // 슬루레이트 제한 후 마지막 P+ 레퍼런스 [kPa]
     double p_neg_ref_filt{101.325};   // 슬루레이트 제한 후 마지막 P- 레퍼런스 [kPa]
+    // 상승 접근 중 coast가 풀릴 때 토크가 0 → 중력+마찰로 되튀지 않도록 하는
+    // 비대칭(상승만) 슬루 상태. 하강은 안전을 위해 즉시 허용한다.
+    double tau_ref_rise_limited{0.0};
+    // 첫 접근 coast 뒤에만 저압 접근을 유지한다. 새 최종 목표가 들어오면 해제한다.
+    double approach_soft_goal{0.0};
+    bool   approach_soft_goal_initialized{false};
+    bool   approach_soft_latched{false};
   };
 
   // 축(actuator)별 위치 제어기 설정/상태. 크기 = num_actuators_
@@ -904,11 +911,18 @@ private:
   double large_error_limit_nm_{0.0};
   // 상승 목표에 접근할 때 현재 속도와 내층 지연만큼 미리 힘을 빼는
   // 무오버슛 우선 coast 보호. remaining <= margin + vel*time 이면
-  // 요구 토크를 실제 자세 중력의 ratio 배 이하로 제한한다.
+  // 요구 토크를 실제 자세 중력의 ratio 배 지지점으로 옮긴다. 상승 목표 아래에서는
+  // 같은 값을 하한으로도 써 자유낙하→재가압 반동을 막는다.
   double approach_coast_margin_deg_{0.0};
   double approach_coast_time_s_{0.0};
   double approach_coast_min_vel_dps_{0.0};
   double approach_coast_gravity_ratio_{0.0};
+  // 첫 coast 이후 상승 접근 동안 중력 FF 위에 허용하는 최대 구동 토크. 음수면 끔.
+  // 유지에 필요한 중력 압력은 보존하고 마찰/P 보상이 만드는 압력 점프만 자른다.
+  double approach_drive_margin_nm_{-1.0};
+  // 첫 coast 이후 상승 중 최종 토크 레퍼런스의 증가율 제한 [N·m/s]. 0 이하면 끔.
+  // coast/폭주 보호처럼 토크를 낮추는 방향은 제한하지 않는다.
+  double rising_torque_slew_nm_per_s_{0.0};
   // 추종 오차가 밴드에 붙어 있는 연속 틱 수 (축별). 오래 붙으면 경고한다.
   std::vector<int> band_sat_ticks_;
   // 압력 추종 오차가 이보다 크면 외층 적분을 얼린다 [kPa]. 0 이하면 끔.
