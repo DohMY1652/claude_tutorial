@@ -49,12 +49,12 @@ python3 src/can_powerpack/scripts/position_ref_client.py --axes 1 --once 10
 ```text
 Control mode: 2 (POSITION_REFGEN)
 NP=8, Ts=5.0 ms (지평 40 ms)
-S-curve 25.0 deg/s, 60.0 deg/s², 300.0 deg/s³
+S-curve 10.0 deg/s, 20.0 deg/s², 80.0 deg/s³
 외층 검증 로그에 PM 35° 이상
 ```
 
 5° 이동의 목표 레퍼런스가 약 0.2초 만에 끝나면 예전 정속 램프 실행본이다.
-현재 S-curve에서는 jerk 제한 때문에 약 1초가 걸려야 한다.
+현재 S-curve에서는 jerk 제한 때문에 약 1.5초가 걸려야 한다.
 
 ## 2. 실기 1축, I=0
 
@@ -81,18 +81,21 @@ ros2 launch can_powerpack control.launch.py control_mode:=2 solver:=mppi axis:=0
 ros2 launch can_powerpack control.launch.py control_mode:=2 solver:=mppi axis:=1 actuator_connected:=true
 ```
 
-목표는 파손 전 로그의 15° 명령을 재현하지 말고 작은 범위부터 한 번씩 보낸다.
+30° 운전범위는 한 번에 뛰지 않고 10°씩 올린다. 각 명령마다 완전히 정착한 것을
+확인한 뒤 다음 목표를 보낸다.
 
 ```bash
-python3 src/can_powerpack/scripts/position_ref_client.py --axes 1 --once 2
-python3 src/can_powerpack/scripts/position_ref_client.py --axes 1 --once 5
-python3 src/can_powerpack/scripts/position_ref_client.py --axes 1 --once 2
+python3 src/can_powerpack/scripts/position_ref_client.py --axes 1 --once 10
+python3 src/can_powerpack/scripts/position_ref_client.py --axes 1 --once 20
+python3 src/can_powerpack/scripts/position_ref_client.py --axes 1 --once 30
+python3 src/can_powerpack/scripts/position_ref_client.py --axes 1 --once 20
+python3 src/can_powerpack/scripts/position_ref_client.py --axes 1 --once 10
 ```
 
 다음 조건이면 즉시 중지한다.
 
 - 각도 또는 압력 진폭이 연속해서 증가
-- 목표보다 3° 이상 넘어가거나 목표 통과 속도가 10 deg/s 이상
+- 목표보다 3° 이상 넘어가거나 목표 통과 속도가 15 deg/s 이상
 - 유지 중 반대 밸브가 번갈아 crack point를 넘음
 - startup 로그에 캐스케이드/PM 오류가 표시됨
 - pressure reference와 실제 압력 차이가 8 kPa 이상인 상태가 지속

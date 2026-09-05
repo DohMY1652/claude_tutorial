@@ -1635,7 +1635,9 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   integ_backcalc_tau_s_ = get_param_or<double>(this,
       "PositionController.integ_backcalc_tau_s", 0.30);
   angle_runaway_deg_ = get_param_or<double>(this,
-      "PositionController.angle_runaway_deg", 25.0);
+      "PositionController.angle_runaway_deg", 5.0);
+  runaway_gravity_ratio_ = std::clamp(get_param_or<double>(this,
+      "PositionController.runaway_gravity_ratio", 0.5), 0.0, 0.95);
   target_slew_rate_.assign(std::max(1, num_actuators_), 0.0);
   target_slew_accel_.assign(std::max(1, num_actuators_), 0.0);
   target_traj_goal_.assign(std::max(1, num_actuators_),
@@ -1652,12 +1654,12 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     "PositionController: S-curve %.1f deg/s, %.1f deg/s², %.1f deg/s³, "
     "오차밴드 %.1f°, kd_vel_ff %.2f, inertia_ff %.2f, large-P %.4f@%.1f°≤%.2f Nm, "
     "적분정지 압력오차 %.1f kPa (0=끔), 밴드포화중 적분정지 %s, "
-    "부호반전 누설 %.2f s, 적용토크 back-calc %.2f s",
+    "부호반전 누설 %.2f s, 적용토크 back-calc %.2f s, 폭주 +%.1f°/중력×%.2f",
     target_slew_dps_, target_accel_dps2_, target_jerk_dps3_,
     target_follow_band_deg_, kd_vel_ff_, inertia_ff_gain_, large_error_kp_,
     large_error_band_deg_, large_error_limit_nm_, integ_hold_perr_kpa_,
     integ_hold_on_band_ ? "예" : "아니오", integ_flip_tau_s_,
-    integ_backcalc_tau_s_);
+    integ_backcalc_tau_s_, angle_runaway_deg_, runaway_gravity_ratio_);
 
   for (int a = 0; a < num_actuators_; ++a) {
     const std::string prefix = "PositionController.axis" + std::to_string(a) + ".";
@@ -3749,8 +3751,12 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     // 그 힘은 양압 정격(185 kPa abs) 단독으로 못 내므로 생성기가 음압까지 30 kPa
     // 까지 끌어내린다. 시험용으로는 과하다.
     // 게인은 **목표 압력에 거의 선형**으로 반영된다 (F = P⁺·A − P⁻·A).
-    // 액추에이터를 붙이면 반드시 1.0 으로 되돌릴 것 — 그때는 중력을 실제로 들어야 한다.
-    const double ff_angle = actuator_connected_ ? angle : angle_ref;
+    // 중력 FF는 **측정각이 아니라 목표 궤적각**에서 계산한다. 측정각을 쓰면
+    // 오버슛으로 팔이 올라갈수록 FF도 같이 커져 그 자세를 계속 떠받친다.
+    // 20260905_210229에서는 목표 15°를 지나 52.4°까지 올라가는 동안 FF가
+    // 1.90→5.83 N·m로 증가해 복귀 토크를 없앴다. 목표각 FF를 쓰면 실제각이
+    // 목표보다 높을수록 실제 중력이 더 커져 수동적인 복원/감속 여유가 생긴다.
+    const double ff_angle = angle_ref;
     const double tau_grav = tp.tau_ff_gain * cfg.mass_kg * 9.81 * cfg.link_length_m
                           * std::sin(ff_angle * M_PI / 180.0);
     // S-curve가 요구하는 각가속도에 필요한 관성 토크. 이전 정속 램프에는
@@ -3812,11 +3818,9 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     // 실기 20260904_163842: 목표 20° 인데 팔이 **102° 까지 올라가 머물렀다**
     // (액추에이터 파손 직전). 그때까지 개입하는 것이 아무것도 없었다.
     //
-    // 기전: 외층 권한이 내층의 정상상태 오차보다 작으면 tau_ref 는 사실상
-    // 중력 FF 뿐이 된다. 중력 FF 는 **측정 각도**로 계산하므로 팔이 올라가면
-    // 더 큰 압력을 요구한다 — 그 자체로는 정확한 상쇄라 중립이지만, 내층에
-    // 남아 있는 잉여 토크(그때 +8 kPa = +0.39 N·m)를 상쇄할 것이 없으면
-    // 팔은 계속 올라간다.
+    // 20260905_210229에서는 5 kg 설정으로 목표 15°를 지나 52.4°까지 상승한 뒤
+    // 액추에이터가 파손됐다. 기존 +25°/중력 90% 보호는 너무 늦었고, 평상시
+    // 요구가 이미 90% 아래라 실제로는 한 번도 토크를 낮추지 못했다.
     //
     // 목표보다 runaway_deg 이상 위에 있으면서 **아직 올라가고 있으면**, 요구
     // 토크를 그 자세의 중력보다 낮게 묶는다 → 반드시 감속한다. 0 으로 떨구지는
@@ -3828,12 +3832,12 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
         // tau_ff_gain 이 걸린 tau_grav 가 아니라 **실제 중력**을 기준으로 묶는다.
         const double g_true = cfg.mass_kg * 9.81 * cfg.link_length_m
                             * std::sin(angle * M_PI / 180.0);
-        const double cap = 0.9 * g_true;
+        const double cap = std::max(0.0, runaway_gravity_ratio_ * g_true);
         if (tau_ref[(size_t)a] > cap) {
           RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 500,
             "[axis%d] **폭주 보호**: 목표보다 %.1f° 위(%.1f° vs %.1f°)에서 "
             "+%.1f deg/s 로 계속 오른다. 요구 토크를 %.2f → %.2f N·m 로 묶는다. "
-            "외층 권한이 내층 오차보다 작다는 뜻이다 — 게인과 내층 추종을 볼 것.",
+            "압력 해제 지연 또는 추종 이탈이다 — 즉시 시험을 중지할 것.",
             a, over, angle, angle_ref, vel, tau_ref[(size_t)a], cap);
           tau_ref[(size_t)a] = cap;
         }
