@@ -14,10 +14,13 @@
 
 기계식 스토퍼와 독립 릴리프를 준비하고, 첫 시험은 반드시 `axis:=0` 한 축만 한다.
 엔코더 방향, 0점, 양/음압 채널 매핑이 맞지 않으면 시작하지 않는다.
+axis0 설정은 150 mm 링크의 **5 kg payload** 기준이다. 90° 중력토크가 약
+7.36 N·m로 액추에이터 정격 최대 7.76 N·m의 약 95%이므로 첫 시험은 5~20°로 제한한다.
 
 ```bash
 cd ~/claude_tutorial
 git switch codex-mppi
+git branch --show-current       # 반드시 codex-mppi
 src/can_powerpack/scripts/preflight.sh
 colcon build --packages-select can_powerpack --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
@@ -47,8 +50,11 @@ python3 src/can_powerpack/scripts/position_ref_client.py --axes 1 --once 10
 Control mode: 2 (POSITION_REFGEN)
 NP=8, Ts=5.0 ms (지평 40 ms)
 S-curve 25.0 deg/s, 60.0 deg/s², 300.0 deg/s³
-외층 wc≈1.20 rad/s (0.19 Hz), PM≈44°
+외층 검증 로그에 PM 35° 이상
 ```
+
+5° 이동의 목표 레퍼런스가 약 0.2초 만에 끝나면 예전 정속 램프 실행본이다.
+현재 S-curve에서는 jerk 제한 때문에 약 1초가 걸려야 한다.
 
 ## 2. 실기 1축, I=0
 

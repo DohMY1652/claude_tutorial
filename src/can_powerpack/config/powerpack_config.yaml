@@ -1087,8 +1087,11 @@
       angle_runaway_deg: 25.0
       axis0:
         # ── 공용 (mode 1 / 2) ──
-        mass_kg: 2.0   # 실기: 150 mm 링크에 2 kg 로드
-        link_length_m: 0.15   # 0.2→0.15: 실측 링크 150 mm (중력토크 9.81→7.36 N·m)
+        # codex-mppi 1축 실기: 150 mm 링크 끝에 장착한 실제 payload와 맞춘다.
+        # 5 kg이면 중력토크가 90°에서 7.36 N·m이고 정격 최대 7.76 N·m 대비
+        # 여유가 약 5%뿐이므로 첫 검증은 5~20° 범위에서만 한다.
+        mass_kg: 5.0
+        link_length_m: 0.15
         p_pos_max_kpa: 185.0  # 양압 정격 [kPa abs]  180→185 (고각도 도달 허용)
         p_neg_min_kpa: 27.0   # 음압 정격 [kPa abs] — 이젝터 한계 실측값
         # 속도 추정 LPF (작을수록 강한 필터, 0 < α ≤ 1).
