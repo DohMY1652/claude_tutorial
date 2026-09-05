@@ -902,6 +902,13 @@ private:
   double large_error_kp_{0.0};
   double large_error_band_deg_{1.0};
   double large_error_limit_nm_{0.0};
+  // 상승 목표에 접근할 때 현재 속도와 내층 지연만큼 미리 힘을 빼는
+  // 무오버슛 우선 coast 보호. remaining <= margin + vel*time 이면
+  // 요구 토크를 실제 자세 중력의 ratio 배 이하로 제한한다.
+  double approach_coast_margin_deg_{0.0};
+  double approach_coast_time_s_{0.0};
+  double approach_coast_min_vel_dps_{0.0};
+  double approach_coast_gravity_ratio_{0.0};
   // 추종 오차가 밴드에 붙어 있는 연속 틱 수 (축별). 오래 붙으면 경고한다.
   std::vector<int> band_sat_ticks_;
   // 압력 추종 오차가 이보다 크면 외층 적분을 얼린다 [kPa]. 0 이하면 끔.
@@ -983,25 +990,9 @@ private:
     // 0 에 가까우면 예전의 하드 sign 과 같아져 목표 근처에서 ±friction_nm 이
     // 계단으로 뒤집힌다 (S-29 참조).
     double friction_band_deg{1.0};
-    // 마찰 보상 속도 밴드 [deg/s]. **쿨롱 마찰은 운동을 거스르므로 위치 오차가
-    // 아니라 속도의 함수다.** 이보다 빠르면 순수하게 속도 방향으로 보상하고,
-    // 정지 근처에서는 운동 방향이 정의되지 않으므로 오차 방향으로 되돌아간다
-    // (고착 돌파). 사이는 선형 혼합이라 연속이다. 0 이면 예전의 오차 기준.
-    //
-    // **이 값에는 안정성 하한이 있다.** 밴드 안에서 보상은 속도에 비례해
-    // 운동 방향으로 붙으므로 **음의 감쇠**다. 속도 되먹임 전체는
-    //     −kd·vel + friction_nm·vel/vel_band
-    // 이라 순 감쇠가 양수이려면
-    //     friction_nm / friction_vel_band_dps  <  kd
-    // 여야 한다. 지금 값(0.48, kd 0.02)이면 밴드 > 24 deg/s 다.
-    // 40 으로 두면 기울기 0.012 라 kd 의 60 % — 순 감쇠가 kd 의 40 % 남는다.
-    // 대신 25 deg/s 슬루에서 보상은 0.30 N·m 로 과소보상인데, 과소보상은
-    // 굼뜰 뿐 절대 불안정해지지 않는다. 과보상이 위험한 쪽이다.
-    //
-    // 참고: 예전의 **오차 기준도 같은 이유로 위험했다.** 그쪽 기울기는
-    // friction_nm/friction_band_deg = 0.48 N·m/deg 로 kp(0.0786)의 6 배이고
-    // 부호가 반대라, 목표 ±1° 안에서 순 강성이 −0.40 N·m/deg 였다.
-    double friction_vel_band_dps{40.0};
+    // 목표 궤적 속도가 이 값에 닿을 때 이동 마찰보상을 전량 준다 [deg/s].
+    // 목표 궤적이 멎으면 넓은 friction_band 안의 오차 비례 보상으로 돌아간다.
+    double friction_vel_band_dps{2.0};
     // 중력 피드포워드 배율. 액추에이터 미연결 시험에서 목표 압력을 낮추는 데 쓴다.
     // 목표 압력에 거의 선형으로 반영된다. 액추에이터를 붙이면 1.0 으로 되돌릴 것.
     double tau_ff_gain{1.0};

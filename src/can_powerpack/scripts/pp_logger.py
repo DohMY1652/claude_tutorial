@@ -16,7 +16,8 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray, UInt16MultiArray
 
-SCHEMA_VERSION = 7           # 형식을 바꾸면 올린다. 과거 CSV 구분용(meta.json 에 기록)
+SCHEMA_VERSION = 8           # 형식을 바꾸면 올린다. 과거 CSV 구분용(meta.json 에 기록)
+                             # 8: integ_hold 상태값에 bit 8(접근 coast) 추가
                              # 7: 단축 운전 논리축 진단을 물리축 CSV 열로 scatter
                              # 6: 토크 항 분해 8열/축 추가 (tau_kp/ki/kd/grav/fric,
                              #    vel_filt, err_raw, integ_hold) — mode 2 에서 I 항을

@@ -1626,6 +1626,14 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
       "PositionController.large_error_band_deg", 1.0);
   large_error_limit_nm_ = get_param_or<double>(this,
       "PositionController.large_error_limit_nm", 0.0);
+  approach_coast_margin_deg_ = std::max(0.0, get_param_or<double>(this,
+      "PositionController.approach_coast_margin_deg", 0.0));
+  approach_coast_time_s_ = std::max(0.0, get_param_or<double>(this,
+      "PositionController.approach_coast_time_s", 0.0));
+  approach_coast_min_vel_dps_ = std::max(0.0, get_param_or<double>(this,
+      "PositionController.approach_coast_min_vel_dps", 0.0));
+  approach_coast_gravity_ratio_ = std::clamp(get_param_or<double>(this,
+      "PositionController.approach_coast_gravity_ratio", 0.0), 0.0, 0.95);
   integ_hold_perr_kpa_ = get_param_or<double>(this,
       "PositionController.integ_hold_pressure_err_kpa", 8.0);
   integ_hold_on_band_ = get_param_or<bool>(this,
@@ -1654,12 +1662,15 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
     "PositionController: S-curve %.1f deg/s, %.1f deg/s², %.1f deg/s³, "
     "오차밴드 %.1f°, kd_vel_ff %.2f, inertia_ff %.2f, large-P %.4f@%.1f°≤%.2f Nm, "
     "적분정지 압력오차 %.1f kPa (0=끔), 밴드포화중 적분정지 %s, "
-    "부호반전 누설 %.2f s, 적용토크 back-calc %.2f s, 폭주 +%.1f°/중력×%.2f",
+    "부호반전 누설 %.2f s, 적용토크 back-calc %.2f s, "
+    "접근 coast %.1f°+v×%.2fs (v>%.1f, 중력×%.2f), 폭주 +%.1f°/중력×%.2f",
     target_slew_dps_, target_accel_dps2_, target_jerk_dps3_,
     target_follow_band_deg_, kd_vel_ff_, inertia_ff_gain_, large_error_kp_,
     large_error_band_deg_, large_error_limit_nm_, integ_hold_perr_kpa_,
     integ_hold_on_band_ ? "예" : "아니오", integ_flip_tau_s_,
-    integ_backcalc_tau_s_, angle_runaway_deg_, runaway_gravity_ratio_);
+    integ_backcalc_tau_s_, approach_coast_margin_deg_, approach_coast_time_s_,
+    approach_coast_min_vel_dps_, approach_coast_gravity_ratio_,
+    angle_runaway_deg_, runaway_gravity_ratio_);
 
   for (int a = 0; a < num_actuators_; ++a) {
     const std::string prefix = "PositionController.axis" + std::to_string(a) + ".";
@@ -3603,12 +3614,13 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
 
     const int enc = std::clamp(cfg.actuator_idx, 0, (int)ang.size() - 1);
     const double angle = ang[(size_t)enc];
-    double angle_ref;
+    double angle_ref, angle_goal;
     {
       std::lock_guard<std::mutex> lk(mpc_ref_mtx_);
       // 항상 슬루된 목표를 쓴다. 예전에는 TCP 수신 전에 측정각을 그대로 넣어
       // 오차를 0 으로 두었는데, 그러면 기동 목표(0°)가 적용되지 않았다.
       angle_ref = target_angle_slewed_[(size_t)a];
+      angle_goal = target_angle_deg_[(size_t)a];
     }
 
     if (!state.initialized) {
@@ -3797,12 +3809,21 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     // friction_vel_band_dps 를 0 으로 두면 예전의 오차 기준으로 되돌아간다.
     // 오차 기준은 목표 근처에서 강성을 kp 0.0786 → 0.56 N·m/deg 로 7 배 키워
     // 감쇠비를 1.27 → 0.48 로 떨어뜨렸다 (실기 20260904_153154).
+    // 20260905_222754에서는 10 deg/s 궤적에 0.48 N·m를 계속 더해 목표 부근
+    // 요구가 중력의 약 2배가 됐다. 지금은 궤적을 2 deg/s로 낮추고,
+    // 목표 접근 시 아래 coast 보호가 이 합을 0으로
+    // 덮어써 저장 압력이 빠질 시간을 먼저 확보한다.
     const double fb = std::max(1e-6, tp.friction_band_deg);
     const double vb = tp.friction_vel_band_dps;
     double friction_dir = std::clamp(err / fb, -1.0, 1.0);
     if (vb > 0.0) {
-      const double motion = std::clamp(vel_ref / vb, -1.0, 1.0);
-      const double moving_weight = std::clamp(std::abs(vel_ref) / vb, 0.0, 1.0);
+      // 실제 축이 슬루 목표보다 앞서 있는데도 목표속도 방향 힘을 더하면
+      // 압력만 미리 쌓인다. 목표를 뒤따르는 동안에만 이동마찰을 보상한다.
+      const bool following_slew = vel_ref * err > 0.0;
+      const double motion = following_slew
+          ? std::clamp(vel_ref / vb, -1.0, 1.0) : 0.0;
+      const double moving_weight = following_slew
+          ? std::clamp(std::abs(vel_ref) / vb, 0.0, 1.0) : 0.0;
       friction_dir = motion + (1.0 - moving_weight) * friction_dir;
       friction_dir = std::clamp(friction_dir, -1.0, 1.0);
     }
@@ -3812,6 +3833,32 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     // 이 클램프 전 값과 최종 pressure-reference 가 만드는 토크를 비교한다.
     tau_unsat[(size_t)a] = tau_pid + tau_grav + tau_inertia + tau_fric;
     tau_ref[(size_t)a] = std::max(0.0, tau_unsat[(size_t)a]);
+
+    // ── 무오버슛 우선 접근 coast ──────────────────────────────────────
+    // 압력 내층은 힘을 빼라고 한 뒤에도 저장된 챔버 압력을 늦게 배출한다.
+    // 목표 바로 앞에서 끄면 이미 늦으므로, 현재 속도로 approach_coast_time_s
+    // 동안 더 갈 거리까지 포함해 상승 힘을 미리 뺀다. 속도가 멎어 목표 아래에
+    // 남으면 제어기가 다시 천천히 힘을 만들므로 정확도 대신 시간만 희생한다.
+    bool approach_coasting = false;
+    if (actuator_connected_ && approach_coast_time_s_ > 0.0 &&
+        angle_goal > angle && vel > approach_coast_min_vel_dps_) {
+      const double remaining = angle_goal - angle;
+      const double coast_window = approach_coast_margin_deg_
+                                + vel * approach_coast_time_s_;
+      if (remaining <= coast_window) {
+        const double g_true = cfg.mass_kg * 9.81 * cfg.link_length_m
+                            * std::sin(angle * M_PI / 180.0);
+        const double cap = std::max(0.0, approach_coast_gravity_ratio_ * g_true);
+        if (tau_ref[(size_t)a] > cap) {
+          tau_ref[(size_t)a] = cap;
+          approach_coasting = true;
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 500,
+            "[axis%d] 접근 coast: 목표 %.1f°, 현재 %.1f°, 속도 +%.1f deg/s, "
+            "남은 %.1f° <= 예측 %.1f° — 토크를 %.2f N·m로 제한",
+            a, angle_goal, angle, vel, remaining, coast_window, cap);
+        }
+      }
+    }
 
     // ── 폭주 보호 ──────────────────────────────────────────────────────
     //
@@ -3853,10 +3900,11 @@ void Controller::run_optimized_pressure_ref(double dt_sec)
     dbg_kd[(size_t)a]      = -tp.kd * vel_err;
     dbg_fric[(size_t)a]    = tau_fric;
     dbg_err_raw[(size_t)a] = err_raw;
-    // 적분이 왜 안 도는지 구분한다: 0=적분중, 1=압력내층지연, 2=밴드포화, 3=둘다
+    // 상태 비트: 1=압력내층지연, 2=밴드포화, 4=back-calc, 8=접근 coast
     dbg_integ_state[(size_t)a] =
         (inner_behind ? 1.0 : 0.0) +
-        ((integ_hold_on_band_ && err_saturated) ? 2.0 : 0.0);
+        ((integ_hold_on_band_ && err_saturated) ? 2.0 : 0.0) +
+        (approach_coasting ? 8.0 : 0.0);
     dbg_angle[(size_t)a]   = angle;
     dbg_angle_ref[(size_t)a] = angle_ref;
     dbg_vel[(size_t)a]     = vel;
