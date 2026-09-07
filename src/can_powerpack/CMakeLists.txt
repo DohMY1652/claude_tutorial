@@ -171,6 +171,7 @@ install(PROGRAMS
   scripts/valve_fit_from_log.py
   scripts/chamber_volume_from_log.py
   scripts/position_ref_client.py
+  scripts/pressure_sweep_server.py
   scripts/valve_fit_model.py
   scripts/valve_fit_record.py
   scripts/valve_fit_solve.py
