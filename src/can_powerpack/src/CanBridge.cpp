@@ -1,4 +1,17 @@
 #include "CanBridge.hpp"
+
+// ============================================================================
+// DMY 코드 읽기 안내 — 제어 알고리즘과 물리 CAN 버스 사이의 경계다.
+//
+// RX: CAN pressure boards 1..16 -> board/sensors(raw ADC)
+//     CAN encoder boards 17..25 -> 보드별 2점 보정 -> board/analog(degree)
+// TX: Controller의 board/cmd_pwm(보드당 v1,v2,v3, 0..4095) -> CAN FD frame
+//
+// CanBridge는 목표각/목표압을 계산하지 않는다. 대신 마지막 PWM 래치, 송신률 제한,
+// controller/CAN 수신 watchdog과 안전 출력 패턴을 소유한다. Controller가 죽어도
+// 하드웨어 명령은 bridge에 남을 수 있으므로 apply_safe_state와 watchdog을 반드시
+// 같이 읽어야 한다. `전 PWM=0`은 라인 릴리프까지 닫아 안전 상태가 아닐 수 있다.
+// ============================================================================
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -321,6 +334,9 @@ void CanBridge::diag_routine() {
 }
 
 void CanBridge::rx_loop() {
+  // DMY 전용 RX 스레드다. 여기서는 가장 최신 프레임을 snapshot에 덮어쓸 뿐 ROS
+  // publish는 하지 않는다. sensor_routine()이 mutex 아래 복사한 뒤 토픽을 만든다.
+  // board 1..16과 17..25는 같은 CAN ID 규칙을 쓰지만 payload 의미가 다르다.
   const double TO_MV   = 3300.0 / 4095.0;
   const double LPF_ALPHA = 0.2;
 
@@ -393,6 +409,9 @@ void CanBridge::rx_loop() {
 }
 
 void CanBridge::sensor_routine() {
+  // DMY RX snapshot -> ROS 메시지 경계다. pressure는 아직 ADC 기반 정수이고 실제
+  // kPa 보정은 Controller가 한다. encoder만 여기서 2점 보정을 적용해 degree로 낸다.
+  // 즉 압력 보정은 Controller YAML, 각도 보정은 CanBridge YAML이 단일 소유자다.
   std::vector<uint16_t> p_raw;
   std::vector<std::array<double, 3>> c_raw;
   std::vector<uint16_t> a_raw;
@@ -447,6 +466,9 @@ void CanBridge::sensor_routine() {
 
 // TX: boards 1..18 packed into two CAN FD frames. Boards 19..25 are analog-only (no TX).
 void CanBridge::tx_routine() {
+  // DMY 이 타이머는 새 명령 유무와 상관없이 watchdog/keepalive 조건을 평가한다.
+  // on_cmd_pwm()은 targets_만 바꾸고, 실제 CAN write는 tx_send()에서 수행한다.
+  // 그러므로 토픽 주기, can_tx_min_interval_ms, fallback 주기는 서로 다른 개념이다.
   // ── PWM 워치독 ───────────────────────────────────────────────────────────
   // targets_ 는 영구 래치다 — pp_controller 가 죽거나 Ctrl-C 되면 마지막 PWM 이 CAN
   // 주기로 계속 나간다. 밸브가 열린 채로 남으면 실기에서 위험하다.

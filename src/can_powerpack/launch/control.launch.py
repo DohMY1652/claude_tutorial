@@ -5,6 +5,15 @@ from launch_ros.actions import Node
 import os
 from ament_index_python.packages import get_package_share_directory, get_package_prefix
 
+# DMY 읽기 안내
+# 이 launch는 실기 프로세스 네 개를 구성한다.
+#   can_bridge_node : CAN 센서/엔코더 입력과 PWM 출력, watchdog
+#   pp_controller   : 위치/압력/MPPI 제어 알고리즘
+#   pp_logger.py    : 실험 CSV 기록
+#   pp_monitor.py   : 별도 터미널의 실시간 표시
+# 파라미터 우선순위는 powerpack_config.yaml < 자동 생성 fitted yaml < launch override다.
+# 따라서 소스 YAML만 보지 말고 실제 실행 명령의 solver/axis/overrides도 함께 확인한다.
+
 
 # ── 겹치는 노드 감시 ──────────────────────────────────────────────────────
 # virtual.launch.py 의 시뮬레이터는 `name='can_bridge'` 로 실기 브리지의 **노드 이름을

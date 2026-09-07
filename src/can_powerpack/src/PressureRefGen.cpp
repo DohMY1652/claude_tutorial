@@ -2,6 +2,22 @@
 #include "PneumaticFlow.hpp"
 #include "Controller.hpp"   // QP 래퍼 (qpOASES 박스 QP)
 
+// ============================================================================
+// DMY 코드 읽기 안내 — 이 파일은 "목표 힘을 압력 두 개로 배분하는 상위 최적화"다.
+//
+// 입력 : 축별 목표 힘 F_ref[N], 현재 P+/P-[Pa gauge], 부피[m^3], 공유 공급압
+// 출력 : 축별 P+/P- 목표[Pa gauge], 양/음압 레일 목표, macro 부족률 진단
+//
+// 한 step의 순서:
+//   decide_rail_setpoint -> build_slew_box -> objective를 SQP/QP로 반복 최소화
+//   -> 최종 압력/힘/공급 사용량 진단 작성 -> x_prev_를 다음 틱 warm start로 저장
+//
+// 같은 힘을 만드는 P+/P- 조합은 무수히 많다. objective는 힘 오차 외에도 유량,
+// 직전 해와의 변화, 탱크/이젝터 사용을 벌점으로 주어 한 조합을 선택한다.
+// Controller/Mppi는 kPa absolute를 쓰지만 이 클래스는 Pa gauge를 쓰므로 호출 경계의
+// +/- P_atm과 x1000 변환을 반드시 함께 확인한다.
+// ============================================================================
+
 #include <algorithm>
 #include <cmath>
 
@@ -281,6 +297,14 @@ PressureRefGen::Result PressureRefGen::step(const std::vector<double>& F_ref_in,
                                             const SupplyState& sup_in,
                                             const std::vector<std::vector<double>>& F_preview_in)
 {
+  // DMY 반환값을 읽는 순서:
+  //   P_pos_ref/P_neg_ref : 채널 MPC가 실제로 추종할 현재 틱의 목표
+  //   rail_pos_sp/neg_sp  : 공유 라인 PID가 추종할 공급 레일 목표
+  //   starve_pos/neg      : 레일만으로 부족한 비율이며 macro gate 판단에 사용
+  //   F_achieved          : 선택한 압력쌍이 모델상 만드는 힘
+  //   lb/ub               : 현 공급압과 오리피스 유량으로 한 틱에 도달 가능한 경계
+  // 따라서 힘 목표가 맞지 않을 때 solver만 보기 전에 F_ref가 경계 밖인지(lb/ub),
+  // 공급 부족(starve)이 있는지부터 확인해야 한다.
   const int N = p_.N;
   const int nx = 2 * N;
 

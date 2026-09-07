@@ -1,5 +1,13 @@
 #pragma once
 
+// DMY 빠른 클래스 지도
+//   Controller  : ROS 입출력과 한 제어 틱을 소유하는 최상위 노드
+//   AcadosMpc   : 이름은 과거의 흔적이며, 현재는 채널별 QP/MPPI 압력 제어 래퍼
+//   QP          : qpOASES 박스 QP 래퍼(PressureRefGen과 선택적 QP 경로에서 사용)
+//   ThreadPool  : 활성 채널의 solve/MPPI 롤아웃을 제어 틱 안에서 병렬 실행
+//   ControlAug  : 런타임에 켤 수 있는 모델 불일치 보강 항(기본값은 모두 off)
+// 상세 호출 순서는 저장소 루트 DMY_MPPI_CODE_READING_GUIDE.md의 1~3절 참조.
+
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/u_int16_multi_array.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>

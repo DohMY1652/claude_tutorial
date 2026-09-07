@@ -1,6 +1,13 @@
 #ifndef CAN_BRIDGE_HPP_
 #define CAN_BRIDGE_HPP_
 
+// DMY 읽기 안내
+// 이 클래스의 책임은 ROS 배열 메시지와 물리 CAN 프레임 사이의 변환이다.
+// 제어 계산은 Controller에 있고, 여기에는 RX 스레드, 주기적 센서 publish,
+// PWM 명령 래치/TX, 엔코더 보정, 통신 watchdog이 있다. 공유 자료는 RX용
+// sensor_mtx_와 TX용 cmd_mtx_로 나뉜다. 파손 방지 관점에서는 생성자 초기 상태,
+// apply_safe_state(), on_cmd_pwm(), tx_routine() 순서로 읽는 것이 가장 중요하다.
+
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/u_int16_multi_array.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"

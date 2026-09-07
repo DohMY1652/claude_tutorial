@@ -1,5 +1,25 @@
 #include "Controller.hpp"
 
+// ============================================================================
+// DMY 코드 읽기 안내 — 이 파일은 "제어 계층을 연결하는 곳"이다.
+//
+// 위치 제어(control_mode=2)의 호출 사슬:
+//   on_timer
+//     -> slew_targets                         사용자 목표각에 속도 제한
+//     -> run_optimized_pressure_ref           각도오차 -> 토크 -> 힘
+//        -> PressureRefGen::step              힘 -> 양/음압 챔버 목표 + 레일 목표
+//     -> AcadosMpc::solve (활성 채널별 병렬)  챔버 목표 -> 밸브 3개 명령
+//        -> compute_input_reference           비선형 역모델 피드포워드
+//        -> mppi::Solver::solve               롤아웃 기반 보정 delta-u
+//        -> finish                            테이퍼/크래킹/LPF/0..4095 변환
+//     -> LinePID, MacroSwitch, Safety          공유 레일과 최종 안전 처리
+//     -> publish_cmds                         board/cmd_pwm 발행
+//
+// 압력 단위도 계층마다 다르다. 이 파일과 Mppi는 kPa absolute, PressureRefGen은
+// Pa gauge를 쓴다. 변환 경계는 run_optimized_pressure_ref에 모여 있다.
+// 전체 그림과 추천 읽기 순서는 저장소 루트의 DMY_MPPI_CODE_READING_GUIDE.md 참조.
+// ============================================================================
+
 #include <chrono>
 #include <algorithm>
 #include <cmath>
@@ -378,6 +398,12 @@ void AcadosMpc::set_AB_constant(float A_scalar, const Eigen::RowVector3f& B_row)
 
 
 std::array<float,3> AcadosMpc::compute_input_reference(float P_now, float P_micro, float P_macro, float P_macro_neg, float dt_sec, float current_time_sec) {
+  // DMY 이 함수의 출력 uref={micro, macro, atmosphere}[%]는 MPPI가 탐색을 시작할
+  // 중심점이다. 목표 압력에 1차로 접근하도록 필요한 dP/dt를 만들고, 이상기체식으로
+  // 필요 질량유량을 구한 뒤 각 밸브 모델을 역으로 풀어 개도를 얻는다. 압력 오차
+  // 적분항과 Bouc-Wen 히스테리시스 상태도 여기서 갱신된다. 따라서 피드포워드가
+  // 과대하면 MPPI delta-u만 줄여서는 부족할 수 있고, 이 함수의 부피·dt·밸브 모델과
+  // target_time_constant를 함께 확인해야 한다.
   const double lpm2kgps  = 0.0002155;
   const double Rgas      = 287.0;
   const double TempK     = 293.15;
@@ -2605,6 +2631,16 @@ void Controller::run_system_mppi(double P_atm_kPa, double P_line_pos_kPa,
 }
 
 void Controller::on_timer() {
+  // DMY 한 틱 지도:
+  //   (0) 필요한 CAN 센서 수신 확인 및 시작 영점 보정
+  //   (1) ADC raw -> kPa absolute 변환과 저역통과 필터
+  //   (2) 목표각 slew 후 control_mode에 맞는 압력 레퍼런스 생성
+  //   (3) 엔코더 각도로 각 챔버의 현재 부피 계산
+  //   (4) 채널별 MPPI(또는 선택한 solver)를 병렬 실행해 밸브 PWM 생성
+  //   (5) 공유 레일 PID와 macro switch 결정
+  //   (6) 과압/센서 이상 안전 로직 적용 후 CAN bridge로 publish
+  // 이 함수가 길어도 위 순서대로 구역이 나뉘어 있으므로, 먼저 여기서 데이터의
+  // 수명을 따라가고 세부 수식은 호출된 함수로 내려가면 된다.
   // 경과 시간을 **틱 카운트**에서 만든다. 벽시계로 만들면 5초 안에 제어 틱이 몇 번
   // 들어가는지가 실행마다 달라져, 아래 두 게이트(밸브 잠금 해제 / 적분 리셋 해제)가
   // 서로 다른 시점에 풀린다 — 같은 빌드 반복 실행에서 정상상태 밸브 개방률이
@@ -3303,6 +3339,15 @@ void Controller::run_position_control(double dt_sec)
 // (레일은 초 단위로 느리고 챔버는 20 ms 안에 수십 kPa 움직이므로 계층 분리가 성립).
 void Controller::run_optimized_pressure_ref(double dt_sec)
 {
+  // DMY 위치 외부 루프(control_mode=2)의 책임:
+  //   theta error --PID+중력+마찰--> tau_ref [N*m]
+  //   tau_ref / reel_radius        --> F_ref [N]
+  //   PressureRefGen::step         --> P+ref, P-ref [Pa gauge]
+  //   + P_atm, /1000               --> mpc_ref_kpa_ [kPa absolute]
+  // 이 함수는 밸브 PWM을 직접 계산하지 않는다. 여기서 생성한 2N개의 압력 목표를
+  // 같은 틱 뒤쪽의 AcadosMpc::solve가 각각 추종한다. 오버슈트를 볼 때는 먼저
+  // "목표 힘/압력이 늦게 내려오는가"와 "목표는 내려왔는데 실제 압력만 늦는가"를
+  // 나누면 외부 루프와 내부 루프를 구분할 수 있다.
   if (!refgen_) return;
   const int N = num_actuators_;
   const double atm = sensor_.kpa_atm();

@@ -1,5 +1,14 @@
 #include "MppiSystem.hpp"
 
+// ============================================================================
+// DMY 코드 읽기 안내 — `MPC_parameters.solver: mppi_system` 전용 실험 경로다.
+// 기본 채널별 mppi와 달리 모든 챔버와 공유 양/음압 레일을 한 SysState로 예측한다.
+// 장점은 여러 채널이 같은 레일을 동시에 소비하는 결합을 직접 볼 수 있다는 점이고,
+// 단점은 제어 차원이 커져 샘플 공로 배분과 실시간 계산량이 어려워진다는 점이다.
+// 기본 `solver: mppi`를 이해하는 동안에는 Mppi.cpp를 먼저 읽고, Controller의
+// build_system_mppi/run_system_mppi가 이 경로를 어떻게 선택하는지 나중에 본다.
+// ============================================================================
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>

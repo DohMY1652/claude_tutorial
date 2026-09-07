@@ -1,3 +1,11 @@
+# DMY 읽기 안내
+# 이 파일은 3축 성공 실험 코드(기준 커밋 3d60148)의 원래 설정이며, DMY_mppi에서는
+# 값을 바꾸지 않았다. 실제 런타임 값은 이 파일 뒤에 valve_params.yaml,
+# pump_params.yaml, encoder_params.yaml(존재할 때), launch override 순으로 병합된다.
+# 먼저 보드/채널 매핑 -> PositionController -> PressureRefGen -> MPC_parameters ->
+# LinePID/MacroSwitch/Safety 순서로 읽으면 신호 흐름과 같은 방향으로 이해할 수 있다.
+# 전체 수식과 파일 지도는 저장소 루트 DMY_MPPI_CODE_READING_GUIDE.md 참조.
+
 # ==========================================
 # Node 1: CAN Bridge (Hardware Interface)
 # ==========================================
@@ -1187,4 +1195,3 @@
 
     MacroSwitch:
       pwm_index: 9    # (board 4 - 1)*3 + 0 = 9
-

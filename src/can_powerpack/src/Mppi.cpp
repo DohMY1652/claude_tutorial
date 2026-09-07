@@ -1,5 +1,22 @@
 #include "Mppi.hpp"
 
+// ============================================================================
+// DMY 코드 읽기 안내 — 채널 하나의 비선형 플랜트와 샘플링 MPPI 솔버다.
+//
+// 데이터 흐름:
+//   measured ChannelState + Exogenous + u_ref
+//     -> rollout_cost: (u_ref + nominal delta-u + noise)를 NP스텝 시뮬레이션
+//     -> Solver::solve: 낮은 비용 샘플의 noise를 지수 가중 평균
+//     -> 첫 delta-u 3개 반환, 나머지 nominal 시퀀스는 한 스텝 shift해 보존
+//
+// 중요한 구분:
+//   u_ref  = AcadosMpc가 역모델/적분기로 계산한 절대 밸브 명령[%]
+//   nom_   = MPPI가 기억하는 u_ref 주변 보정 명령 delta-u[%]
+//   u_app  = 롤아웃 또는 실기에 실제 적용할 clamp(u_ref + delta-u)[%]
+//   state  = 챔버압 P뿐 아니라 각 밸브의 유량 q/qd와 히스테리시스 z도 포함
+// 단위는 압력 kPa absolute, 부피 m^3, 시간 s, 밸브 명령 %다.
+// ============================================================================
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -200,6 +217,12 @@ float valve_dyn(const PlantParams& p, ValveState& vs, float Q_static, float dt)
 void step(const ChannelPlant& pv, ChannelState& s, const std::array<float, 3>& u,
           const Exogenous& ex, float V, float dt)
 {
+  // DMY 롤아웃 한 물리 스텝:
+  //   1) 세 밸브 각각의 명령 -> 히스테리시스 z -> 정상 유량 -> 2차 동적 유량
+  //   2) 유입 질량유량 - 유출 질량유량 - 누설을 합산
+  //   3) 이상기체식 dP/dt=(R*T/V)*m_dot-(P/V)*Vdot로 챔버압 갱신
+  // 이 함수의 u는 이미 포화된 0..100%이고, 밸브 배열 순서는
+  // {micro, macro, atmosphere}다. CAN board의 v2/v3 순서와 혼동하지 않는다.
   const PlantParams& p = pv[V_MICRO];      // 채널 공통 필드용 (is_positive 등)
   // 밸브별 상·하류압. update_linearization 의 배정과 동일하다.
   float pin[3], pout[3];
@@ -471,6 +494,10 @@ float Solver::rollout_cost(const ChannelState& x0, const Exogenous& ex,
 std::array<float, 3> Solver::solve(const ChannelState& x0, const Exogenous& ex,
                                    const std::array<float, 3>& uref)
 {
+  // DMY MPPI 갱신의 핵심은 제어 시퀀스를 직접 최적화하지 않고, 각 샘플에 더한
+  // noise를 비용 기반 가중 평균해 기존 nominal 시퀀스에 누적하는 것이다.
+  // 반환하는 것은 절대 명령이 아니라 첫 스텝 delta-u다. 절대 명령과 최종 PWM
+  // 후처리는 AcadosMpc::finish가 담당한다.
   const auto t0 = std::chrono::steady_clock::now();
   const int K = pr_.K;
 
