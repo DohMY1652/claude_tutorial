@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""6축(12채널) 무액추에이터 압력 스윕 레퍼런스 서버.
+"""6축(12채널) 무액추에이터 압력 스윕 레퍼런스 전송기.
 
-이 스크립트는 pp_controller의 ``RefTcpClient``가 접속할 TCP 서버다. 기존
-``pressure_ref_client.py``는 ``RefTcpServer``에 양/음압 한 쌍만 보내지만, 이
-스크립트는 12개 목표를 한 패킷으로 보내므로 여러 축을 동시에 시험할 수 있다.
+이 스크립트가 TCP 클라이언트로 동작해 pp_controller의 ``RefTcpServer``에 접속한다.
+기존 ``pressure_ref_client.py``는 양/음압 한 쌍만 보내지만, 이 스크립트는 12개
+목표를 한 패킷으로 보내므로 여러 축을 동시에 시험할 수 있다. 파일명에 server가
+남아 있는 것은 최초 버전의 흔적이며, 현재 네트워크 역할은 명확히 클라이언트다.
 
 패킷 순서와 단위
 ------------------
   [axis1 P+, axis2 P+, ..., axis6 P+,
    axis1 P-, axis2 P-, ..., axis6 P-]  [kPa absolute]
 
-전송 형식은 네트워크 바이트 순서 uint16 12개다. 각 정수에 ``--scale``을 곱한
-값이 컨트롤러의 kPa absolute 목표가 된다. 따라서 실행할 때 controller의
-``RefTcp.pressure_scale``과 이 스크립트의 ``--scale``이 반드시 같아야 한다.
+전송 형식은 기존 RefTcpServer와 같은 little-endian double 12개(96바이트)다.
+컨트롤러는 ``control_mode=0``과 ``RefTcpServer.all_channels=true``로 실행해야 한다.
 
 기본 시험 순서
 --------------
@@ -131,24 +131,15 @@ def build_stages() -> list[Stage]:
     return stages
 
 
-def encode_refs(refs_kpa: Sequence[float], scale: float) -> tuple[bytes, tuple[float, ...]]:
-    """kPa 목표를 controller 프로토콜로 양자화하고 실제 복원값도 반환한다."""
+def encode_refs(refs_kpa: Sequence[float]) -> bytes:
+    """kPa 목표 12개를 RefTcpServer의 little-endian double 패킷으로 만든다."""
 
     if len(refs_kpa) != 2 * NUM_AXES:
         raise ValueError(f"압력 목표는 {2 * NUM_AXES}개여야 한다")
-    if scale <= 0.0:
-        raise ValueError("scale은 0보다 커야 한다")
-
-    raw: list[int] = []
-    actual: list[float] = []
     for pressure in refs_kpa:
-        value = int(round(pressure / scale))
-        if not 0 <= value <= 0xFFFF:
-            raise ValueError(
-                f"{pressure:.3f} kPa는 scale={scale}에서 uint16 범위를 벗어난다")
-        raw.append(value)
-        actual.append(value * scale)
-    return struct.pack(f"!{len(raw)}H", *raw), tuple(actual)
+        if not 0.0 <= pressure <= 1000.0:
+            raise ValueError(f"비정상 압력 목표: {pressure} kPa absolute")
+    return struct.pack(f"<{len(refs_kpa)}d", *refs_kpa)
 
 
 def _fmt_refs(refs: Sequence[float]) -> str:
@@ -186,17 +177,18 @@ def _send_for_dwell(conn: socket.socket, payload: bytes,
         time.sleep(min(period, remaining))
 
 
-def _send_atmosphere(conn: socket.socket | None, scale: float) -> None:
+def _send_atmosphere(conn: socket.socket | None) -> None:
     """종료 전에 전 채널 대기압 목표를 반복 전송한다."""
 
     if conn is None:
         return
-    payload, actual = encode_refs([ATM_KPA] * (2 * NUM_AXES), scale)
+    refs = (ATM_KPA,) * (2 * NUM_AXES)
+    payload = encode_refs(refs)
     try:
         for _ in range(10):
             conn.sendall(payload)
             time.sleep(0.05)
-        print(f"\n[안전 복귀] 전 채널 대기압 목표 전송: {_fmt_refs(actual)}")
+        print(f"\n[안전 복귀] 전 채널 대기압 목표 전송: {_fmt_refs(refs)}")
     except OSError as exc:
         print(f"\n[위험] 대기압 목표 전송 실패: {exc}", file=sys.stderr)
         print("       컨트롤러에는 마지막 목표가 남을 수 있다. 펌프/제어기를 즉시 정지할 것.",
@@ -205,12 +197,12 @@ def _send_atmosphere(conn: socket.socket | None, scale: float) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bind", default="127.0.0.1",
-                        help="controller 접속을 받을 주소 (기본: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=2292,
-                        help="RefTcp.port와 같은 포트 (기본: 2292)")
-    parser.add_argument("--scale", type=float, default=0.003052,
-                        help="RefTcp.pressure_scale과 같은 kPa/count")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="pp_controller가 실행 중인 주소 (기본: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=2293,
+                        help="RefTcpServer.port와 같은 포트 (기본: 2293)")
+    parser.add_argument("--connect-timeout", type=float, default=30.0,
+                        help="controller 접속을 재시도할 최대 시간 [s] (기본: 30)")
     parser.add_argument("--dwell", type=float, default=5.0,
                         help="각 스테이지 유지 시간 [s] (기본: 5)")
     parser.add_argument("--send-hz", type=float, default=10.0,
@@ -224,6 +216,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--dwell은 0보다 커야 한다")
     if args.send_hz <= 0.0:
         parser.error("--send-hz는 0보다 커야 한다")
+    if args.connect_timeout <= 0.0:
+        parser.error("--connect-timeout은 0보다 커야 한다")
     if not 1 <= args.port <= 65535:
         parser.error("--port는 1..65535여야 한다")
     return args
@@ -245,29 +239,33 @@ def main() -> int:
             print("취소했다.")
             return 2
 
-    listener: socket.socket | None = None
     conn: socket.socket | None = None
     try:
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((args.bind, args.port))
-        listener.listen(1)
-        print(f"\n[대기] {args.bind}:{args.port} — pp_controller RefTcpClient 접속 대기")
-        conn, address = listener.accept()
+        deadline = time.monotonic() + args.connect_timeout
+        while conn is None:
+            try:
+                conn = socket.create_connection((args.host, args.port), timeout=2.0)
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"{args.host}:{args.port}에 {args.connect_timeout:g}초 동안 "
+                        f"접속하지 못했다: {exc}") from exc
+                print(f"[접속 재시도] {args.host}:{args.port} — {exc}")
+                time.sleep(1.0)
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        print(f"[접속] pp_controller: {address[0]}:{address[1]}")
+        print(f"[접속] pp_controller RefTcpServer: {args.host}:{args.port}")
 
         # 접속 직후에는 계획 시작 전에도 먼저 안전한 대기압 패킷을 보낸다.
-        _send_atmosphere(conn, args.scale)
+        _send_atmosphere(conn)
 
         for index, stage in enumerate(stages, 1):
-            payload, actual = encode_refs(stage.refs_kpa, args.scale)
+            payload = encode_refs(stage.refs_kpa)
             step = "-" if stage.step_kpa is None else f"{stage.step_kpa:g}"
             print(f"[{index:03d}/{len(stages):03d}] {_axis_label(stage.group):9s} "
                   f"{stage.phase:13s} step={step:>2s} "
                   f"target={stage.target_kpa:7.3f} kPa abs")
-            print(f"             {_fmt_refs(actual)}", flush=True)
+            print(f"             {_fmt_refs(stage.refs_kpa)}", flush=True)
             _send_for_dwell(conn, payload, args.dwell, args.send_hz)
 
         print("\n[완료] 전체 스윕을 마쳤다.")
@@ -281,11 +279,9 @@ def main() -> int:
               file=sys.stderr)
         return 1
     finally:
-        _send_atmosphere(conn, args.scale)
+        _send_atmosphere(conn)
         if conn is not None:
             conn.close()
-        if listener is not None:
-            listener.close()
 
 
 if __name__ == "__main__":

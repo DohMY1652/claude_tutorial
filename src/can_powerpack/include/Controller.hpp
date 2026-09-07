@@ -584,6 +584,7 @@ public:
         int port = 2293;
         int pos_gid = 0;
         int neg_gid = 6;
+        bool all_channels = false;  // pressure mode: true면 2개가 아니라 전체 채널 double 수신
         int num_values = 2;   // doubles per TCP message (2 = pressure mode, N = N-axis angle mode)
     };
     using Callback = std::function<void(const std::vector<double>&)>;

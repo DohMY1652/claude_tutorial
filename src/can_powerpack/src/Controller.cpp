@@ -1786,6 +1786,7 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   ref_server_cfg_.port    = get_param_or<int> (this, "RefTcpServer.port",    2293);
   ref_server_cfg_.pos_gid = get_param_or<int> (this, "RefTcpServer.pos_gid", 0);
   ref_server_cfg_.neg_gid = get_param_or<int> (this, "RefTcpServer.neg_gid", num_positive_channels_);
+  ref_server_cfg_.all_channels = get_param_or<bool>(this, "RefTcpServer.all_channels", false);
 
   if (ref_server_cfg_.enable) {
     if (control_mode_ == 1 || control_mode_ == 2) {
@@ -1809,22 +1810,40 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
         "RefTcpServer [POSITION mode]: port %d — expects [%d doubles: angle_ref_deg per axis]",
         ref_server_cfg_.port, num_actuators_);
     } else {
-      // 압력 제어 모드: TCP가 [pos_kpa, neg_kpa] 수신 (기존 동작)
-      ref_server_cfg_.num_values = 2;
-      ref_server_ = std::make_unique<RefTcpServer>(
-        ref_server_cfg_,
-        [this](const std::vector<double>& v) {
-          if (v.size() < 2) return;
-          std::lock_guard<std::mutex> lk(mpc_ref_mtx_);
-          const int pg = ref_server_cfg_.pos_gid;
-          const int ng = ref_server_cfg_.neg_gid;
-          if (pg >= 0 && pg < (int)mpc_ref_kpa_.size()) mpc_ref_kpa_[pg] = v[0];
-          if (ng >= 0 && ng < (int)mpc_ref_kpa_.size()) mpc_ref_kpa_[ng] = v[1];
-        }
-      );
-      RCLCPP_INFO(get_logger(),
-        "RefTcpServer [PRESSURE mode]: port %d (pos_gid=%d, neg_gid=%d) — expects [double pos_kpa, double neg_kpa]",
-        ref_server_cfg_.port, ref_server_cfg_.pos_gid, ref_server_cfg_.neg_gid);
+      if (ref_server_cfg_.all_channels) {
+        // 6축 자동 스윕용 전체 채널 입력. 순서는 mpc_ref_kpa_의 global id와 동일하다:
+        // [P+ axis1..6, P- axis1..6], 모두 kPa absolute의 little-endian double.
+        ref_server_cfg_.num_values = num_total_channels_;
+        ref_server_ = std::make_unique<RefTcpServer>(
+          ref_server_cfg_,
+          [this](const std::vector<double>& v) {
+            if ((int)v.size() < num_total_channels_) return;
+            std::lock_guard<std::mutex> lk(mpc_ref_mtx_);
+            for (int gid = 0; gid < num_total_channels_; ++gid)
+              mpc_ref_kpa_[(size_t)gid] = v[(size_t)gid];
+          }
+        );
+        RCLCPP_INFO(get_logger(),
+          "RefTcpServer [PRESSURE ALL mode]: port %d — expects [%d doubles: P+ axes then P- axes, kPa abs]",
+          ref_server_cfg_.port, num_total_channels_);
+      } else {
+        // 기존 수동 시험 호환: 지정한 양압/음압 채널 한 쌍만 받는다.
+        ref_server_cfg_.num_values = 2;
+        ref_server_ = std::make_unique<RefTcpServer>(
+          ref_server_cfg_,
+          [this](const std::vector<double>& v) {
+            if (v.size() < 2) return;
+            std::lock_guard<std::mutex> lk(mpc_ref_mtx_);
+            const int pg = ref_server_cfg_.pos_gid;
+            const int ng = ref_server_cfg_.neg_gid;
+            if (pg >= 0 && pg < (int)mpc_ref_kpa_.size()) mpc_ref_kpa_[pg] = v[0];
+            if (ng >= 0 && ng < (int)mpc_ref_kpa_.size()) mpc_ref_kpa_[ng] = v[1];
+          }
+        );
+        RCLCPP_INFO(get_logger(),
+          "RefTcpServer [PRESSURE mode]: port %d (pos_gid=%d, neg_gid=%d) — expects [double pos_kpa, double neg_kpa]",
+          ref_server_cfg_.port, ref_server_cfg_.pos_gid, ref_server_cfg_.neg_gid);
+      }
     }
   }
 
