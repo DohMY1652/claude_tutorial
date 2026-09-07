@@ -616,7 +616,9 @@
       neg_gid: 6         # 음압 채널 global_id (board 11) [압력모드 전용]
       # false: 위 pos_gid/neg_gid 한 쌍의 double 2개 수신 (기존 pressure_ref_client)
       # true : 전체 12채널 double 수신 [P+ axis1..6, P- axis1..6] (자동 스윕)
-      all_channels: false
+      # DMY_mppi는 6축 압력 스윕을 바로 실행하는 브랜치이므로 true가 기본이다.
+      # 위치 모드(control_mode 1/2)에서는 이 값 자체를 사용하지 않는다.
+      all_channels: true
 
     # ──────────────────────────────────────────
     # 위치 제어기 (축별 설정, num_actuators 개수만큼 axis0/axis1/... )
