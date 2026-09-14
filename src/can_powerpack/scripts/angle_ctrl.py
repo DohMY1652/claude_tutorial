@@ -213,6 +213,7 @@ class Chan:
         self.integ = 0.0
         self.fric_q = 0.0        # 지금 적용 중인 마찰 피드포워드 비율 (부호 포함)
         self.move_dir = 0.0      # 지금 이동의 방향 (+1 올림 / −1 내림)
+        self.move_done = False   # 이번 이동의 마찰 FF 를 이미 거뒀나 (재점화 금지)
         self.slew_sat = False    # 직전 틱에 차압 슬루가 포화였나 (적분 정지 조건)
         self.ang_ref_prev = 0.0
         self.ang_prev = 0.0
@@ -296,6 +297,7 @@ class Chan:
         ref_moving = abs(d_ref) > 0.05 * args.ang_slew
         if ref_moving:
             self.move_dir = 1.0 if d_ref > 0 else -1.0
+            self.move_done = False      # 새 이동이 시작됐다 — 빗장을 푼다
         # 내림은 부피 외란(내려오며 양압 챔버가 줄고 음압이 는다)이 늘 지령을
         # 거스르므로 올림보다 더 든다 — 실측 램프 지연 4.9° vs 0.9°. 따로 준다.
         mag = args.fric_ff if self.move_dir > 0 else args.fric_ff_down
@@ -309,7 +311,16 @@ class Chan:
         # 가던 방향으로 아직 --fric-hold-band 넘게 남았으면 이동으로 본다.
         # **가던 방향으로만** 연장하고 절대 뒤집지 않는다 — 부호를 뒤집게 두면
         # 지나칠 때마다 전폭 반전이 걸려 밴드 크기의 한계주기가 된다.
-        still_going = (self.move_dir != 0.0
+        #
+        # 그리고 **한 번의 이동에 한 번만** 쓴다. 위 조건만으로 두면 내림에서 팔이
+        # 목표보다 --fric-hold-band 만 떠올라도 전폭 내림 FF(−f)가 다시 걸린다.
+        # 내려가면 꺼지고 떠오르면 켜지는 뱅뱅이 되어 밴드 크기의 한계주기가 된다 —
+        # 20260914_104223 에서 유지 중 ff 가 21.8 ↔ 17.6 을 주기 10 s 로 왕복했고,
+        # 내림 구간 ang_std 가 올림의 0.010 대비 0.46 이었다. 올림에서 안 나타난
+        # 것은 past_target 이 먼저 잠가서다.
+        # 이동이 끝난 뒤의 잔류는 적분의 몫이다. 다음 램프가 움직일 때 빗장이 풀린다.
+        still_going = (not self.move_done
+                       and self.move_dir != 0.0
                        and err * self.move_dir > args.fric_hold_band)
         # 팔이 **최종 목표**를 이미 지났으면 램프가 안 끝났어도 미는 것을 멈춘다.
         # 올림이 램프보다 빨라지면서(실측 1.74 vs 1.49 °/s) ref 가 목표에 닿기
@@ -318,6 +329,8 @@ class Chan:
         # 지령이 아니다. 미는 것을 거두기만 하고 뒤집지는 않는다.
         past_target = self.move_dir != 0.0 and (ang - tgt) * self.move_dir > 0.0
         moving = (ref_moving or still_going) and not past_target
+        if not moving:
+            self.move_done = True
         q_want = self.move_dir * (mag if moving else args.fric_ff_hold)
         # 어느 쪽이든 계단 없이 옮긴다 (램프 시작 때 걸리는 것도 포함).
         self.fric_q += (q_want - self.fric_q) * min(1.0, dt / args.fric_decay_tau)
