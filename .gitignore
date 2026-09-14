@@ -11,3 +11,9 @@ results_pump/
 
 # 도구가 만드는 타임스탬프 백업 — 디스크에는 남기되 추적하지 않는다
 src/can_powerpack/config/valve_params.yaml.bak.*
+
+# 이전 워크스페이스 배치에서 남은 colcon 산출물 — 디스크에는 두되 추적하지 않는다
+src/can_powerpack/build.stale-*/
+src/can_powerpack/install.stale-*/
+src/can_powerpack/log.stale-*/
+src/can_powerpack/config/powerpack_config.yaml.bak.*

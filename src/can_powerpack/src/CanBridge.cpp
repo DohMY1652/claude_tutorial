@@ -4,7 +4,9 @@
 // DMY 코드 읽기 안내 — 제어 알고리즘과 물리 CAN 버스 사이의 경계다.
 //
 // RX: CAN pressure boards 1..16 -> board/sensors(raw ADC)
-//     CAN encoder boards 17..25 -> 보드별 2점 보정 -> board/analog(degree)
+//     엔코더 -> board/analog(degree). 소스는 encoder_source 파라미터가 정한다:
+//       "teensy"(기본) Teensy USB CDC 6채널 -> 2점 선형 보정
+//       "can"          CAN 보드 17~25      -> 반전앰프 역산 + 2점 보정 (구경로)
 // TX: Controller의 board/cmd_pwm(보드당 v1,v2,v3, 0..4095) -> CAN FD frame
 //
 // CanBridge는 목표각/목표압을 계산하지 않는다. 대신 마지막 PWM 래치, 송신률 제한,
@@ -19,6 +21,12 @@
 #include <limits>
 #include <string>
 #include <vector>
+// Teensy 엔코더용 POSIX 시리얼. 의존성을 늘리지 않으려고 termios 로 직접 연다.
+#include <dirent.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
+#include <cerrno>
 
 #define CMD_ID_GRP1 0x100
 #define CMD_ID_GRP2 0x101
@@ -63,12 +71,64 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
 : Node("can_bridge", options), hnd_(-1), running_(false)
 {
   channel_num_   = this->declare_parameter<int>("can_channel",    0);
+  can_required_  = this->declare_parameter<bool>("can_required", true);
   current_mode_  = (uint8_t)this->declare_parameter<int>("current_mode", 1);  // 1=Debug
   control_type_  = (uint8_t)this->declare_parameter<int>("control_type", 1);  // 1=PWM
 
   int num_actuators = this->declare_parameter<int>("num_actuators", 1);
-  for (int i = 0; i < num_actuators; ++i)
-    active_encoder_boards_.insert(ANALOG_BOARD_START + i);
+
+  // ── 엔코더 소스 ──────────────────────────────────────────────────────────
+  // 기본은 Teensy(USB CDC)다. CAN 엔코더 보드는 우선순위 최하위라 지령을 보내는
+  // 순간 1 Hz 까지 굶었다 — 위치 제어가 눈을 잃는 실패라 경로를 통째로 옮겼다.
+  encoder_source_ = this->declare_parameter<std::string>("encoder_source", "teensy");
+  enc_from_can_ = (encoder_source_ == "can");
+  if (enc_from_can_) {
+    for (int i = 0; i < num_actuators; ++i)
+      active_encoder_boards_.insert(ANALOG_BOARD_START + i);
+  }
+  // active_encoder_boards_ 가 비면 rx_loop 가 보드 17~25 를 아예 파싱하지 않는다.
+
+  teensy_enable_      = this->declare_parameter<bool>("teensy_enable", !enc_from_can_);
+  teensy_port_        = this->declare_parameter<std::string>("teensy_port", "");
+  teensy_watchdog_ms_ = this->declare_parameter<int>("teensy_watchdog_ms", 100);
+  teensy_failsafe_angle_deg_ =
+      declare_double_flexible(this, "teensy_failsafe_angle_deg", 180.0);
+  teensy_failsafe_hold_ms_  = this->declare_parameter<int>("teensy_failsafe_hold_ms", 3000);
+  teensy_failsafe_vent_ms_  = this->declare_parameter<int>("teensy_failsafe_vent_ms", 1500);
+  teensy_failsafe_shutdown_ = this->declare_parameter<bool>("teensy_failsafe_shutdown", true);
+
+  // 2점 보정: deg = (raw − raw_0deg) × 90 / (raw_90deg − raw_0deg).
+  // ADS1115 는 센서를 직접 읽으므로 CAN 쪽의 반전앰프 역산이 **없다**.
+  {
+    const double nan2 = std::numeric_limits<double>::quiet_NaN();
+    std::string bad;
+    for (int c = 0; c < TEENSY_NCH; ++c) {
+      const std::string base = "TeensyEncoder.channels." + std::to_string(c);
+      const double r0  = declare_double_flexible(this, base + ".raw_0deg",  nan2);
+      const double r90 = declare_double_flexible(this, base + ".raw_90deg", nan2);
+      if (!std::isnan(r0) && !std::isnan(r90) && std::abs(r90 - r0) > 1e-6) {
+        tenc_raw0_[c]     = r0;
+        tenc_scale_[c]    = 90.0 / (r90 - r0);
+        tenc_measured_[c] = true;
+      } else {
+        // 보정 전에는 **raw 를 그대로 도 단위로 흘리지 않는다.** 그러면 "0° 에
+        // 있다"는 거짓말이 되어 위치 제어가 그대로 믿는다. scale 0 으로 두고
+        // 아래에서 크게 경고한다 — 값은 항상 0° 로 고정된다.
+        tenc_raw0_[c] = 0.0; tenc_scale_[c] = 0.0; tenc_measured_[c] = false;
+        bad += (bad.empty() ? "" : ", ") + std::to_string(c);
+      }
+    }
+    if (teensy_enable_ && !bad.empty())
+      RCLCPP_ERROR(get_logger(),
+        "Teensy 엔코더 채널 %s 가 **보정되지 않았다** — 각도가 항상 0° 로 나간다. "
+        "이 상태로 위치 제어를 켜면 팔이 실제로 어디 있든 0° 라고 믿는다. "
+        "축을 0° 와 90° 에 놓고 board/analog_raw 의 raw 를 읽어 config 의 "
+        "TeensyEncoder.channels.<N>.raw_0deg / raw_90deg 에 넣을 것.", bad.c_str());
+    else if (teensy_enable_)
+      for (int c = 0; c < TEENSY_NCH; ++c)
+        RCLCPP_INFO(get_logger(), "Teensy ch%d 보정: raw0=%.1f, %.5f deg/count",
+                    c, tenc_raw0_[c], tenc_scale_[c]);
+  }
 
   double enc_offset_default = declare_double_flexible(this, "encoder_offset", 1740.0);
   double enc_gain_default   = declare_double_flexible(this, "encoder_gain",   105.0 / (3127.0 - 1740.0));
@@ -137,6 +197,9 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
   RCLCPP_INFO(get_logger(),
     "PWM 워치독: %d ms (0=끔). 시한 초과 시 채널 밸브 폐쇄 + 라인 밸브(idx %d, %d) 전개",
     wd_timeout_ms_, wd_vent_index_, wd_admit_index_);
+  // std::array<std::atomic<uint32_t>,N>{} 가 이 툴체인에서 원소를 0 으로 만들지
+  // 않는다 — 첫 진단·첫 board/rx_hz 가 쓰레기 값(수백 Hz)을 냈다. 명시적으로 민다.
+  for (auto& c : rx_count_) c.store(0, std::memory_order_relaxed);
   sensors_snapshot_.assign(PWM_BOARDS + 1, 0);
   sensors_filt_.assign(PWM_BOARDS + 1, 0.0);
   current_snapshot_.resize(PWM_BOARDS + 1, {0.0, 0.0, 0.0});
@@ -176,7 +239,17 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
   const int tx_ms = tx_fallback_ms_;
   tx_timer_     = this->create_wall_timer(std::chrono::milliseconds(std::max(1, tx_ms)),
                                           std::bind(&CanBridge::tx_routine,     this));
-  sensor_timer_ = this->create_wall_timer(2ms, std::bind(&CanBridge::sensor_routine, this));
+  // 예전에는 2 ms 로 박혀 있어 pp_controller 의 period_ms 를 바꿔도 실제 주기는
+  // 500 Hz 그대로였다 — period_ms 는 공칭 dt 로만 쓰였다.
+  sensor_period_ms_ = this->declare_parameter<int>("sensor_period_ms", 5);
+  pub_rx_hz_ = create_publisher<std_msgs::msg::Float64MultiArray>("board/rx_hz", 5);
+  rate_timer_ = this->create_wall_timer(1000ms, std::bind(&CanBridge::rate_routine, this));
+  sensor_timer_ = this->create_wall_timer(
+      std::chrono::milliseconds(std::max(1, sensor_period_ms_)),
+      std::bind(&CanBridge::sensor_routine, this));
+  RCLCPP_INFO(get_logger(),
+    "board/sensors 발행 %d ms (= 제어 루프 %.0f Hz). pp_controller.period_ms 와 같아야 한다.",
+    sensor_period_ms_, 1000.0 / std::max(1, sensor_period_ms_));
   if (diag_period_s_ > 0.0)
     diag_timer_ = this->create_wall_timer(
         std::chrono::milliseconds((int)std::lround(diag_period_s_ * 1000.0)),
@@ -184,6 +257,18 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
 
   running_ = true;
   rx_thread_ = std::thread(&CanBridge::rx_loop, this);
+
+  // Teensy 수신 스레드. CAN rx_thread_ 와 **완전히 독립**이다 — 한쪽이 막혀도
+  // 다른 쪽은 계속 돈다. 페일세이프 타이머는 50 ms 로 단계를 진행시킨다.
+  failsafe_timer_ = this->create_wall_timer(
+      50ms, std::bind(&CanBridge::failsafe_tick, this));
+  if (teensy_enable_) {
+    teensy_thread_ = std::thread(&CanBridge::teensy_loop, this);
+  } else {
+    RCLCPP_WARN(get_logger(), "Teensy 엔코더 비활성 (teensy_enable=false) — "
+                "board/analog 은 %s 가 채운다.",
+                enc_from_can_ ? "CAN 보드 17~25" : "**아무도 채우지 않는다**");
+  }
 
   RCLCPP_INFO(this->get_logger(),
     "=== Kvaser CanBridge Running (Ch %d, 5Mbps) | current_mode=%d control_type=%d ===",
@@ -193,6 +278,8 @@ CanBridge::CanBridge(const rclcpp::NodeOptions & options)
 CanBridge::~CanBridge() {
   running_ = false;
   if (rx_thread_.joinable()) rx_thread_.join();
+  if (teensy_thread_.joinable()) teensy_thread_.join();
+  teensy_close();
   close_can();
 }
 
@@ -223,6 +310,12 @@ void CanBridge::init_can() {
   if (hnd_ < 0) {
     char err_msg[64]; canGetErrorText((canStatus)hnd_, err_msg, sizeof(err_msg));
     RCLCPP_ERROR(this->get_logger(), "Open Failed: %s (%d)", err_msg, hnd_);
+    if (!can_required_) {
+      RCLCPP_WARN(this->get_logger(),
+        "can_required:=false 라 CAN 없이 계속한다 — **벤치 점검 전용**이다. "
+        "압력·전류는 발행하지 않고 Teensy 엔코더만 돈다.");
+      return;
+    }
     throw std::runtime_error("Open Failed");
   }
 
@@ -241,6 +334,7 @@ void CanBridge::init_can() {
     char err_msg[64]; canGetErrorText(stat, err_msg, sizeof(err_msg));
     throw std::runtime_error("BusOn Failed");
   }
+  can_ok_ = true;
 }
 
 void CanBridge::close_can() {
@@ -261,6 +355,9 @@ void CanBridge::on_cmd_pwm(const std_msgs::msg::UInt16MultiArray::SharedPtr msg)
   // 판단해 조기 반환하고, 그러면 안전 상태가 실제로 보드에 송신되지 않는다.
   // 갱신하지 않으면 PWM 워치독도 함께 걸리는데, 둘 다 같은 안전 상태를 가리키므로 맞다.
   if (rx_stale_.load(std::memory_order_relaxed)) return;
+  // 페일세이프가 래치된 뒤에는 컨트롤러 지령을 **통째로 버린다.** 안 그러면
+  // apply_safe_state() 가 넣어 둔 밸브 상태를 매 틱 덮어써 무효가 된다.
+  if (failsafe_latched_.load(std::memory_order_relaxed)) return;
   {
     std::lock_guard<std::mutex> lk(cmd_mtx_);
     last_cmd_ = std::chrono::steady_clock::now();
@@ -289,6 +386,37 @@ void CanBridge::on_cmd_pwm(const std_msgs::msg::UInt16MultiArray::SharedPtr msg)
       return;                                   // 다음 타이머 폴백이 보낸다
   }
   tx_send();
+}
+
+// board/rx_hz : [보드1..보드16 Hz, Teensy Hz]. 1 Hz 로 낸다.
+// **실제 경과 시간으로 나눈다** — 공칭 1.0 s 로 나누면 타이머 지연이 그대로
+// 하향 편차가 되어 200 Hz 가 198 Hz 로 보인다.
+void CanBridge::rate_routine() {
+  const auto now_tp = std::chrono::steady_clock::now();
+  // 첫 호출은 **기준선만 잡고 끝낸다.** 경과 시간이 없는데 나누면 기동 순간의
+  // 누적 프레임이 통째로 "1 초 동안 받은 수"로 둔갑한다.
+  if (rate_last_tp_.time_since_epoch().count() == 0) {
+    rate_last_tp_ = now_tp;
+    for (int bid = 1; bid <= PWM_BOARDS; ++bid)
+      rate_prev_[(size_t)bid] = rx_count_[(size_t)bid].load(std::memory_order_relaxed);
+    rate_teensy_prev_ = teensy_frames_.load(std::memory_order_relaxed);
+    return;
+  }
+  double span = std::chrono::duration<double>(now_tp - rate_last_tp_).count();
+  if (span < 1e-3) span = 1.0;
+  rate_last_tp_ = now_tp;
+
+  std_msgs::msg::Float64MultiArray m;
+  m.data.resize(PWM_BOARDS + 1, 0.0);
+  for (int bid = 1; bid <= PWM_BOARDS; ++bid) {
+    const uint32_t now = rx_count_[(size_t)bid].load(std::memory_order_relaxed);
+    m.data[(size_t)(bid - 1)] = (double)(now - rate_prev_[(size_t)bid]) / span;
+    rate_prev_[(size_t)bid] = now;
+  }
+  const uint32_t tf = teensy_frames_.load(std::memory_order_relaxed);
+  m.data[PWM_BOARDS] = teensy_enable_ ? (double)(tf - rate_teensy_prev_) / span : 0.0;
+  rate_teensy_prev_ = tf;
+  pub_rx_hz_->publish(m);
 }
 
 void CanBridge::diag_routine() {
@@ -331,6 +459,31 @@ void CanBridge::diag_routine() {
       "CAN 수신 없음: board %s — 프레임이 **0** 이다. 0 이면 배선·전원·펌웨어 문제이고, "
       "다른 보드보다 주파수만 낮으면 버스 경합이다 (ID 가 높을수록 우선순위가 낮다: "
       "board N = 0x%03X).", dead.c_str(), 0x120 + 20);
+
+  // ── Teensy 엔코더 상태 ───────────────────────────────────────────────────
+  // 각도가 없으면 위치 제어는 눈을 잃는다. CAN 진단과 **따로** 찍어서 어느 쪽
+  // 문제인지 한 줄로 갈리게 한다.
+  if (teensy_enable_) {
+    const uint32_t f  = teensy_frames_.load(std::memory_order_relaxed);
+    const double   hz = (double)(f - teensy_frames_prev_) / diag_period_s_;
+    teensy_frames_prev_ = f;
+    const uint32_t lost = teensy_lost_.load(std::memory_order_relaxed);
+    const uint32_t cerr = teensy_crc_err_.load(std::memory_order_relaxed);
+    const uint32_t st   = teensy_status_.load(std::memory_order_relaxed);
+    if (!teensy_seen_.load(std::memory_order_relaxed)) {
+      RCLCPP_ERROR(get_logger(),
+        "Teensy 엔코더: **프레임 0** (포트 %s). 각도가 전혀 없다 — 위치 제어 금지.",
+        teensy_port_used_.empty() ? "미개방" : teensy_port_used_.c_str());
+    } else {
+      char raws[128]; int off = 0;
+      for (int c = 0; c < TEENSY_NCH && off < (int)sizeof(raws) - 12; ++c)
+        off += snprintf(raws + off, sizeof(raws) - off, "%s%d",
+                        c ? " " : "", teensy_raw_[c].load(std::memory_order_relaxed));
+      RCLCPP_INFO(get_logger(),
+        "Teensy 엔코더: %.0f Hz  유실 %u  CRC오류 %u  status 0x%04X  raw[%s]  (%s)",
+        hz, lost, cerr, st, raws, teensy_port_used_.c_str());
+    }
+  }
 }
 
 void CanBridge::rx_loop() {
@@ -340,6 +493,7 @@ void CanBridge::rx_loop() {
   const double TO_MV   = 3300.0 / 4095.0;
   const double LPF_ALPHA = 0.2;
 
+  if (!can_ok_) return;      // CAN 을 못 열었다 (can_required:=false)
   while (running_ && rclcpp::ok()) {
     long id;
     uint8_t data[64];
@@ -360,7 +514,9 @@ void CanBridge::rx_loop() {
 
       if (bid >= ANALOG_BOARD_START) {
         // Encoder boards (17..25): 8-byte payload, raw[3] (bytes 6-7) = PA7 angle sensor
-        if (dlc >= 8 && (active_encoder_boards_.empty() || active_encoder_boards_.count(bid))) {
+        // enc_from_can_ 이 아니면 active_encoder_boards_ 가 비어 있다 — 그 경우
+        // 이 보드는 없는 것으로 친다 (예전에는 "비면 전체"였다. 뒤집혔으니 주의).
+        if (dlc >= 8 && enc_from_can_ && active_encoder_boards_.count(bid)) {
           uint16_t raw_a;
           memcpy(&raw_a, &data[6], 2);  // bytes 6-7 = raw[3] = PA7
           std::lock_guard<std::mutex> lk(sensor_mtx_);
@@ -422,6 +578,11 @@ void CanBridge::sensor_routine() {
     a_raw = analog_snapshot_;
   }
 
+  // CAN 없이 뜬 경우(can_required:=false)에는 압력·전류를 **내지 않는다.**
+  // 전부 0 인 배열을 내보내면 컨트롤러가 그것을 실측으로 오해한다 — raw 0 은
+  // −176.7 kPa 로 환산되어 밸브를 활짝 여는 값이다 (20260829 사고).
+  // 엔코더 각도는 CAN 과 무관하므로 아래에서 그대로 낸다.
+  if (can_ok_) {
   // Publish pressure: boards 1..18, index i = board (i+1)
   std_msgs::msg::UInt16MultiArray msg_p;
   msg_p.data.resize(PWM_BOARDS);
@@ -438,8 +599,44 @@ void CanBridge::sensor_routine() {
     msg_c.data[i*3+2] = c_raw[i+1][2];
   }
   pub_currents_->publish(msg_c);
+  }   // if (can_ok_)
 
-  // Publish encoder angles [deg]: boards 17..25, raw[3](PA7) → inverting amp recovery → calibration
+  // ── 엔코더 각도 [deg] ────────────────────────────────────────────────────
+  // 소스가 둘이다. 토픽 이름·타입은 같으므로 구독자(Controller, pp_logger,
+  // pp_monitor, encoder_calib ...)는 어느 쪽인지 몰라도 된다.
+  if (!enc_from_can_) {
+    // ── Teensy (기본) ──────────────────────────────────────────────────────
+    // 두절 중에는 **발행을 끊지 않고 페일세이프 각도로 갈아끼운다.** 끊으면
+    // 컨트롤러의 encoder_angles_ 가 마지막 값에 얼어붙고, 컨트롤러는 그걸 현재
+    // 자세로 믿은 채 계속 민다. 갈아끼우면 컨트롤러가 자기 슬루 한계로 천천히
+    // 감압한다. 그 뒤 failsafe_tick() 이 안전상태 → 종료로 이어 간다.
+    if (!teensy_seen_.load(std::memory_order_relaxed) ||
+        teensy_stale_.load(std::memory_order_relaxed)) {
+      std_msgs::msg::Float64MultiArray fs;
+      fs.data.assign(TEENSY_NCH, teensy_failsafe_angle_deg_);
+      pub_analog_->publish(fs);
+      // raw 는 내보내지 않는다 — 가짜 각도를 raw 로 역산해 보정에 쓰면 안 된다.
+      return;
+    }
+
+    std_msgs::msg::Float64MultiArray msg_ta;
+    std_msgs::msg::UInt16MultiArray  msg_tar;
+    msg_ta.data.resize(TEENSY_NCH, 0.0);
+    msg_tar.data.resize(TEENSY_NCH, 0);
+    for (int c = 0; c < TEENSY_NCH; ++c) {
+      const int32_t raw = teensy_raw_[c].load(std::memory_order_relaxed);
+      // ADS1115 단일단은 음수가 0 으로 잘리므로 유효 범위가 0..32767 이다.
+      msg_tar.data[c] = (uint16_t)std::clamp<int32_t>(raw, 0, 65535);
+      // 미보정 채널은 scale 이 0 이라 항상 0° 다 (생성자에서 ERROR 로 경고했다).
+      msg_ta.data[c]  = ((double)raw - tenc_raw0_[c]) * tenc_scale_[c];
+    }
+    pub_analog_->publish(msg_ta);
+    pub_analog_raw_->publish(msg_tar);
+    return;
+  }
+
+  // ── CAN 보드 17~25 (구경로, encoder_source: can) ──────────────────────────
+  // raw[3](PA7) → 반전앰프 역산 → 2점 보정.
   // Circuit: 1~5V → 3.3V~0V. orig_mV = (4125 - adc_mv) / 0.825. angle = (orig_mV - offset)*gain
   std_msgs::msg::Float64MultiArray msg_a;
   msg_a.data.resize(a_raw.size(), 0.0);
@@ -649,4 +846,308 @@ void CanBridge::tx_check(canStatus st, int grp) {
     "CAN 송신 실패 (그룹 %d, status %d, 연속 %d 회) — 밸브 지령이 보드에 "
     "도달하지 않는다. 버스·전원·비트레이트를 확인할 것. 큐를 비우므로 묵은 "
     "지령이 나중에 쏟아지지는 않는다.", grp, (int)st, tx_err_streak_);
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Teensy 엔코더 (USB CDC 시리얼)
+// ════════════════════════════════════════════════════════════════════════════
+// 의존성을 늘리지 않으려고 POSIX termios 로 직접 연다. Teensy 의 USB CDC 는
+// 보레이트를 무시하지만, 호스트 드라이버가 값을 요구하므로 형식상 채워 준다.
+// 프레임 해독 자체는 include/TeensyFrame.hpp (teensy::next) 에 있다.
+
+std::string CanBridge::teensy_find_port() const {
+  // by-id 를 먼저 본다 — 포트 번호는 꽂는 순서에 따라 바뀌지만 by-id 는 안 바뀐다.
+  const char* dirs[] = {"/dev/serial/by-id", nullptr};
+  for (int k = 0; dirs[k]; ++k) {
+    DIR* dp = opendir(dirs[k]);
+    if (!dp) continue;
+    std::string found;
+    while (dirent* de = readdir(dp)) {
+      std::string nm = de->d_name;
+      if (nm == "." || nm == "..") continue;
+      std::string low = nm;
+      std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+      if (low.find("teensy") != std::string::npos) {
+        found = std::string(dirs[k]) + "/" + nm;
+        break;
+      }
+    }
+    closedir(dp);
+    if (!found.empty()) return found;
+  }
+  // 폴백: /dev/ttyACM* 중 가장 작은 번호
+  DIR* dp = opendir("/dev");
+  if (dp) {
+    std::string best;
+    while (dirent* de = readdir(dp)) {
+      std::string nm = de->d_name;
+      if (nm.rfind("ttyACM", 0) == 0 && (best.empty() || nm < best)) best = nm;
+    }
+    closedir(dp);
+    if (!best.empty()) return "/dev/" + best;
+  }
+  return std::string();
+}
+
+bool CanBridge::teensy_open() {
+  const std::string port = teensy_port_.empty() ? teensy_find_port() : teensy_port_;
+  if (port.empty()) { teensy_open_err_ = "포트를 못 찾음 (자동탐색 실패)"; return false; }
+  teensy_port_used_ = port;
+
+  int fd = ::open(port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+  if (fd < 0) {
+    // **왜 실패했는지 반드시 남긴다.** 원인이 없으면 케이블·권한·오타를 구분할 수
+    // 없다 (EACCES = dialout 그룹, ENOENT = 포트 없음, EBUSY = 다른 프로세스).
+    teensy_open_err_ = std::string("open(") + port + ") 실패: " + std::strerror(errno);
+    return false;
+  }
+
+  termios tio{};
+  if (tcgetattr(fd, &tio) != 0) {
+    teensy_open_err_ = std::string("tcgetattr 실패: ") + std::strerror(errno);
+    ::close(fd); return false;
+  }
+  cfmakeraw(&tio);                 // 8N1, 에코·해석·플로우 제어 전부 끈다
+  tio.c_cflag |= (CLOCAL | CREAD);
+  tio.c_cflag &= ~CRTSCTS;
+  tio.c_cc[VMIN]  = 0;             // non-blocking read
+  tio.c_cc[VTIME] = 0;
+  cfsetispeed(&tio, B115200);      // CDC 라 무시된다 (형식상)
+  cfsetospeed(&tio, B115200);
+  if (tcsetattr(fd, TCSANOW, &tio) != 0) {
+    teensy_open_err_ = std::string("tcsetattr 실패: ") + std::strerror(errno);
+    ::close(fd); return false;
+  }
+  tcflush(fd, TCIOFLUSH);
+
+  // **'r' 을 보내야 스트리밍이 시작된다.** 이걸 빠뜨리면 포트는 정상으로 열리는데
+  // 한 바이트도 안 온다. 실기에서 확인한 동작이다.
+  const char start = 'r';
+  if (::write(fd, &start, 1) != 1) {
+    teensy_open_err_ = std::string("시작 명령('r') 송신 실패: ") + std::strerror(errno);
+    ::close(fd); return false;
+  }
+
+  teensy_fd_ = fd;
+  teensy_open_err_.clear();
+  return true;
+}
+
+void CanBridge::teensy_close() {
+  if (teensy_fd_ < 0) return;
+  const char stop = 'x';           // 스트리밍 정지 — 안 보내면 계속 뱉는다
+  ssize_t ign = ::write(teensy_fd_, &stop, 1); (void)ign;
+  ::close(teensy_fd_);
+  teensy_fd_ = -1;
+}
+
+void CanBridge::teensy_loop() {
+  std::vector<uint8_t> buf;
+  buf.reserve(4096);
+  uint8_t chunk[1024];
+  bool have_seq = false;
+  uint16_t prev_seq = 0;
+  auto last_open_try = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+  bool announced = false;
+
+  while (running_.load(std::memory_order_relaxed)) {
+    // ── 포트가 없으면 1 초마다 다시 연다 (핫플러그 복구) ──────────────────
+    if (teensy_fd_ < 0) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last_open_try < std::chrono::seconds(1)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        continue;
+      }
+      last_open_try = now;
+      if (!teensy_open()) {
+        RCLCPP_ERROR_THROTTLE(get_logger(), *this->get_clock(), 5000,
+          "Teensy 시리얼을 열 수 없다 — %s  (teensy_port='%s'). "
+          "**각도가 들어오지 않으므로 위치 제어를 켜면 안 된다.**",
+          teensy_open_err_.c_str(),
+          teensy_port_.empty() ? "자동탐색" : teensy_port_.c_str());
+        continue;
+      }
+      RCLCPP_INFO(get_logger(), "Teensy 열림: %s (200 Hz, 6채널 기대)",
+                  teensy_port_used_.c_str());
+      buf.clear();
+      have_seq = false;
+      announced = false;
+    }
+
+    // ── 읽기 ──────────────────────────────────────────────────────────────
+    const ssize_t n = ::read(teensy_fd_, chunk, sizeof(chunk));
+    if (n > 0) {
+      buf.insert(buf.end(), chunk, chunk + n);
+      // 폭주 방지 — 동기를 못 잡는 상황에서 무한정 자라지 않게 한다.
+      if (buf.size() > 8192)
+        buf.erase(buf.begin(), buf.end() - 4096);
+    } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+      RCLCPP_ERROR(get_logger(), "Teensy read 실패 (%s) — 포트를 닫고 재연결한다.",
+                   std::strerror(errno));
+      teensy_close();
+      continue;
+    } else {
+      // 200 Hz = 5 ms 주기다. 1 ms 잠깐 자도 지연은 무시할 만하고 CPU 는 크게 아낀다.
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // ── 프레임 뽑기 ───────────────────────────────────────────────────────
+    while (true) {
+      teensy::Frame fr;
+      size_t consumed = 0;
+      uint32_t cerr = 0;
+      const bool got = teensy::next(buf.data(), buf.size(), fr, consumed, cerr);
+      if (cerr) teensy_crc_err_.fetch_add(cerr, std::memory_order_relaxed);
+      if (consumed) buf.erase(buf.begin(), buf.begin() + (long)consumed);
+      if (!got) break;
+
+      for (int c = 0; c < TEENSY_NCH; ++c)
+        teensy_raw_[c].store((int32_t)fr.ch[c], std::memory_order_relaxed);
+      if (have_seq) {
+        const uint16_t gap = teensy::lost_between(prev_seq, fr.seq);
+        if (gap) teensy_lost_.fetch_add(gap, std::memory_order_relaxed);
+      }
+      prev_seq = fr.seq;
+      have_seq = true;
+
+      const uint16_t status = fr.status;
+      const uint16_t seq = fr.seq;
+      teensy_status_.store(status, std::memory_order_relaxed);
+      teensy_frames_.fetch_add(1, std::memory_order_relaxed);
+      teensy_last_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count(),
+          std::memory_order_relaxed);
+      teensy_seen_.store(true, std::memory_order_relaxed);
+      if (teensy_stale_.exchange(false, std::memory_order_relaxed)) {
+        // 아직 안전상태를 걸기 전이면 되살린다. 이미 래치됐으면 되돌리지 않는다 —
+        // 밸브를 안전상태로 놓은 뒤 슬그머니 제어로 돌아가면 그게 더 위험하다.
+        if (!failsafe_latched_.load(std::memory_order_relaxed)) {
+          failsafe_since_ns_.store(0, std::memory_order_relaxed);
+          RCLCPP_INFO(get_logger(), "Teensy 엔코더 복구 — 프레임 재개 (페일세이프 해제)");
+        } else {
+          RCLCPP_WARN(get_logger(),
+            "Teensy 엔코더가 돌아왔지만 **이미 안전상태로 래치됐다** — 제어로 "
+            "복귀하지 않는다. 노드를 다시 띄울 것.");
+        }
+      }
+      if (!announced) {
+        announced = true;
+        RCLCPP_INFO(get_logger(), "Teensy 첫 프레임 수신 (seq=%u, status=0x%04X)",
+                    (unsigned)seq, (unsigned)status);
+      }
+      if (status)
+        RCLCPP_ERROR_THROTTLE(get_logger(), *this->get_clock(), 5000,
+          "Teensy status=0x%04X — ADS1115 I2C 오류다 (비트 = 칩 번호). "
+          "해당 칩의 채널 값은 믿을 수 없다.", (unsigned)status);
+    }
+
+    // ── 포트는 열렸는데 프레임이 한 번도 안 오는 경우 ─────────────────────
+    // 펌웨어가 멈췄거나, 시작 명령('r')이 씹혔거나, 다른 프로세스가 바이트를
+    // 나눠 가져가는 상황이다. 아래 워치독은 **한 번이라도 받은 뒤**에만 도므로
+    // 이 경우를 못 잡는다 — 따로 재시도한다 (20260903 에 pty 로 재현해서 잡았다).
+    if (teensy_fd_ >= 0 && !teensy_seen_.load(std::memory_order_relaxed)) {
+      const auto open_age = std::chrono::steady_clock::now() - last_open_try;
+      if (open_age > std::chrono::seconds(2)) {
+        RCLCPP_ERROR_THROTTLE(get_logger(), *this->get_clock(), 5000,
+          "Teensy 포트(%s)는 열렸는데 **프레임이 한 번도 오지 않는다.** "
+          "펌웨어 정지, 시작 명령 유실, 또는 다른 프로세스가 같은 포트를 열고 있는 "
+          "경우다 (teensy_monitor.py / pp_check.py 를 같이 띄우지 말 것). 다시 연다.",
+          teensy_port_used_.c_str());
+        teensy_close();
+        buf.clear();
+        have_seq = false;
+        continue;
+      }
+    }
+
+    // ── 워치독 ────────────────────────────────────────────────────────────
+    if (teensy_watchdog_ms_ > 0 && teensy_seen_.load(std::memory_order_relaxed)) {
+      const long long now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      const long long age_ms =
+          (now_ns - teensy_last_ns_.load(std::memory_order_relaxed)) / 1000000LL;
+      if (age_ms > teensy_watchdog_ms_) {
+        if (!teensy_stale_.exchange(true, std::memory_order_relaxed))
+          // **board/analog 발행을 멈춘다** (sensor_routine 이 이 플래그를 본다).
+          // 얼어붙은 각도를 계속 내보내면 위치 제어가 그걸 현재 자세로 믿는다.
+          // 발행을 멈추면 컨트롤러의 encoder_angles_ 가 마지막 값에서 정지하므로
+          // 최소한 0° 로 급변하지는 않는다. CAN 쪽 rx_stale_ 과 같은 사고방식이다.
+        {
+          const long long now2 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count();
+          long long expect = 0;
+          if (failsafe_since_ns_.compare_exchange_strong(expect, now2,
+                                                         std::memory_order_relaxed))
+            RCLCPP_ERROR(get_logger(),
+              "Teensy 엔코더 두절 — %lld ms 동안 프레임이 없다. "
+              "**페일세이프 진입**: board/analog 을 %.1f° 로 고정 발행해 컨트롤러가 "
+              "감압하도록 하고, %d ms 뒤 안전상태(채널 폐쇄 + 레일 배기)를 걸고 "
+              "%d ms 더 유지한 뒤 노드를 내린다.",
+              age_ms, teensy_failsafe_angle_deg_,
+              teensy_failsafe_hold_ms_, teensy_failsafe_vent_ms_);
+        }
+
+        // **포트를 닫아 재연결을 강제한다.**
+        // 이게 없으면 케이블을 뽑았다 꽂아도 영영 복구되지 않는다. 장치가 사라지면
+        // read() 가 -1/EIO 가 아니라 **0(EOF)** 을 돌려주는 경우가 있는데, 그때는
+        // 아래 read 분기가 "데이터 없음"으로 보고 그냥 기다린다. 20260903 에 pty 로
+        // 재현해서 잡았다 — 뽑기는 감지했는데 다시 꽂아도 안 붙었다.
+        // 조용히 멈춘 펌웨어(포트는 살아 있는데 프레임이 안 옴)도 이 경로로 복구된다.
+        if (teensy_fd_ >= 0) {
+          RCLCPP_WARN(get_logger(), "Teensy 포트를 닫고 재연결을 시도한다.");
+          teensy_close();
+          buf.clear();
+          have_seq = false;
+          last_open_try = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+        }
+      }
+    }
+  }
+  teensy_close();
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  엔코더 두절 페일세이프 — 감압 → 안전상태 → 종료
+// ════════════════════════════════════════════════════════════════════════════
+// 단계:
+//   1) 두절 즉시   sensor_routine 이 board/analog 을 teensy_failsafe_angle_deg 로
+//                  고정 발행한다. 컨트롤러가 **자기 슬루 한계로 천천히** 압력을
+//                  뺀다. 밸브를 여기서 직접 때리는 것보다 부드럽고, 챔버 배기
+//                  밸브가 어느 슬롯인지도 컨트롤러가 안다.
+//   2) +hold_ms    하드 안전상태: 채널 밸브 전부 닫고 레일 배기 밸브를 연다.
+//                  이후 컨트롤러 지령을 **무시한다**(failsafe_latched_).
+//   3) +vent_ms    노드 종료. 마지막으로 보드에 남는 것은 안전상태 프레임이다.
+void CanBridge::failsafe_tick() {
+  const long long since = failsafe_since_ns_.load(std::memory_order_relaxed);
+  if (since == 0) return;                       // 두절 아님
+
+  const long long now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  const long long ms = (now - since) / 1000000LL;
+
+  // ── 2) 하드 안전상태 ──────────────────────────────────────────────────
+  if (ms >= teensy_failsafe_hold_ms_ &&
+      !failsafe_latched_.exchange(true, std::memory_order_relaxed)) {
+    {
+      std::lock_guard<std::mutex> lk(cmd_mtx_);
+      apply_safe_state();
+    }
+    RCLCPP_ERROR(get_logger(),
+      "페일세이프 2단계 — **안전상태 진입**. 채널 밸브를 전부 닫고 레일 배기 밸브를 "
+      "열었다. 이제부터 컨트롤러 지령을 무시한다. %d ms 뒤 노드를 내린다.",
+      teensy_failsafe_vent_ms_);
+    tx_send();                                   // 즉시 한 번 내보낸다
+  }
+
+  // ── 3) 종료 ───────────────────────────────────────────────────────────
+  if (teensy_failsafe_shutdown_ &&
+      failsafe_latched_.load(std::memory_order_relaxed) &&
+      ms >= (long long)teensy_failsafe_hold_ms_ + teensy_failsafe_vent_ms_) {
+    RCLCPP_ERROR(get_logger(),
+      "페일세이프 3단계 — 노드를 내린다. 보드에 마지막으로 남는 지령은 안전상태다. "
+      "**엔코더(Teensy) 배선·전원을 확인하고 다시 띄울 것.**");
+    rclcpp::shutdown();
+  }
 }

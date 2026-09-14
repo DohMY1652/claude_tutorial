@@ -29,6 +29,10 @@ NEG_GIDS   = [6, 7, 8, 9, 10, 11]    # axis별 음압 채널 global_id
 CHANNEL_BOARD_OFFSET = 5     # board_id = gid + CHANNEL_BOARD_OFFSET
 PWM_BOARDS = 18              # board/pwm_cmd·board/currents 배열 크기 = PWM_BOARDS*3
 VALVE_NAMES = ['v1micro', 'v2atm', 'v3macro']   # 보드 위 v1/v2/v3 순서
+# controller/channel_dbg 한 채널당 값 개수. Controller.hpp 의 CH_DBG_N 과 같아야 한다.
+CH_DBG_N = 12
+# controller/rail_dbg 길이. Controller.cpp 의 발행부와 같아야 한다.
+RAIL_DBG_N = 13
 # 라인 밸브 pwm 인덱스 (Controller.cpp 기본값)
 LINE_PWM_IDX = [('line_pos', 0), ('line_neg', 3), ('macro_sw', 9)]
 
@@ -90,6 +94,15 @@ class PpLogger(Node):
         # 말미 공용 6 개: [rail_pos_sp, rail_neg_sp, tank, tank_low, boost g/s, eject g/s]
         self._rg_tail  = [0.0] * 6
         self._rg_seen  = False
+        # control_mode=0 은 position_dbg 도 pressure_ref_dbg 도 발행하지 않는다.
+        # 그때 축별 목표압 컬럼이 0 으로 남아 "레퍼런스가 안 들어왔다" 로 보였다.
+        self._pos_dbg_seen = False
+        # 채널 PID 내부 — 채널당 12 개 × 12 채널.
+        # 밸브 지령만으로는 역산이 안 된다: u_hw = (표(dp) − 여유) + u_pid 라
+        # 표가 틀리면 그 오차가 전부 적분처럼 보인다. 항을 따로 받아 분해한다.
+        self._chd = [0.0] * (12 * CH_DBG_N)
+        # 레일 루프 내부. 개도만으로는 무엇이 흔드는지 못 가른다.
+        self._rail = [0.0] * RAIL_DBG_N
 
         ns = NAMESPACE
         self.create_subscription(Float64MultiArray, f'{ns}/controller/position_dbg',
@@ -110,6 +123,10 @@ class PpLogger(Node):
                                  self._cb_vol, 10)
         self.create_subscription(Float64MultiArray, f'{ns}/controller/pressure_ref_dbg',
                                  self._cb_refgen, 10)
+        self.create_subscription(Float64MultiArray, f'{ns}/controller/channel_dbg',
+                                 self._cb_chan_dbg, 10)
+        self.create_subscription(Float64MultiArray, f'{ns}/controller/rail_dbg',
+                                 self._cb_rail_dbg, 10)
 
         # 폴더 및 파일 생성
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -168,6 +185,27 @@ class PpLogger(Node):
         header += ['rail_pos_sp_kpa', 'rail_neg_sp_kpa', 'tank_kpa',
                    'tank_low', 'boost_gps', 'eject_gps']
 
+        # ── 채널 PID 내부 ──────────────────────────────────────────────────
+        # gid 0~5 = 양압 1~6축, 6~11 = 음압 1~6축.
+        #   u_pid  : 데드존을 더하기 **전**의 제어기 출력 [%]
+        #   p/i/d/ff : 그 u_pid 를 이루는 항. i 는 적분 누적 [%] 그 자체다.
+        #   i_state: 0 정상 / 1 누적 클램프(i_limit_pct)에 걸림 / 2 조건부 정지
+        #   dz_*   : 실제로 더해진 데드존 (표(dp) − 여유)
+        # 밸브 지령(pwm_pct_*)에서 dz_* 를 빼면 u_pid 가 나와야 한다 — 안 나오면
+        # 그 차이가 곧 표의 오차다.
+        # ── 레일 루프 내부 ────────────────────────────────────────────────
+        # 개도(pwm_pct_line_*)만 보면 ff·비례·적분 중 무엇이 흔드는지 못 가른다.
+        header += ['rail_ref_pos', 'rail_ref_neg', 'rail_ff_vent', 'rail_ff_admit',
+                   'rail_open_vent', 'rail_open_admit', 'rail_p_pos', 'rail_p_neg',
+                   'rail_u_pos', 'rail_i_pos', 'rail_gs_pos',
+                   'rail_u_neg', 'rail_i_neg']
+        for g in range(12):
+            header += [f'u_pid_pct_gid{g}', f'p_term_gid{g}', f'i_term_gid{g}',
+                       f'd_term_gid{g}', f'ff_term_gid{g}', f'i_state_gid{g}',
+                       f'err_kpa_gid{g}', f'ref_rate_kpa_s_gid{g}',
+                       f'gain_scale_gid{g}', f'dz_micro_pct_gid{g}',
+                       f'dz_atm_pct_gid{g}', f'dp_micro_kpa_gid{g}']
+
         self._writer.writerow(header)
         self._header = header
         self._write_meta(csv_path, header)
@@ -209,6 +247,7 @@ class PpLogger(Node):
         with self._lock:
             n = min(len(msg.data), 8 * NUM_AXES)
             self._pos_dbg[:n] = list(msg.data[:n])
+            self._pos_dbg_seen = True
 
     def _cb_sensors(self, msg):
         with self._lock:
@@ -247,6 +286,15 @@ class PpLogger(Node):
             if len(d) >= 6:
                 self._rg_tail = [float(x) for x in d[-6:]]
 
+    def _cb_rail_dbg(self, msg):
+        n = min(len(msg.data), len(self._rail))
+        self._rail[:n] = list(msg.data[:n])
+
+    def _cb_chan_dbg(self, msg):
+        """채널 PID 내부. 길이가 모자라면 앞부분만 갱신한다(구버전 제어기 대비)."""
+        n = min(len(msg.data), len(self._chd))
+        self._chd[:n] = list(msg.data[:n])
+
     def _cb_vol(self, msg):
         with self._lock:
             for i, v in enumerate(msg.data):
@@ -263,6 +311,7 @@ class PpLogger(Node):
             vol = list(self._vols)
             rg  = list(self._rg); rg_seen = self._rg_seen
             rgt = list(self._rg_tail)
+            pos_dbg_seen = self._pos_dbg_seen
 
         elapsed = (self.get_clock().now().nanoseconds - self._start_ns) / 1e9
 
@@ -273,6 +322,11 @@ class PpLogger(Node):
             if rg_seen:                      # control_mode=2 는 position_dbg 를 안 낸다
                 angle, target = rg[12*a], rg[12*a + 1]
                 p_pos, p_neg  = rg[12*a + 4], rg[12*a + 5]
+            elif not pos_dbg_seen:
+                # control_mode=0 (직접 압력 제어): 위치 루프도 생성기도 돌지 않아
+                # 두 디버그 토픽이 없다. 축별 목표압은 controller/mpc_refs_kpa 가
+                # 단일 출처이므로 거기서 채운다 (채널 PID 가 추종하는 바로 그 값).
+                p_pos, p_neg = ref[POS_GIDS[a]], ref[NEG_GIDS[a]]
             pos_board_idx = POS_GIDS[a] + CHANNEL_BOARD_OFFSET - 1
             neg_board_idx = NEG_GIDS[a] + CHANNEL_BOARD_OFFSET - 1
             row += [
@@ -314,6 +368,28 @@ class PpLogger(Node):
                     f'{rg[b + 10]:.2f}', f'{rg[b + 11]:.2f}']
         row += [f'{rgt[0]:.4f}', f'{rgt[1]:.4f}', f'{rgt[2]:.4f}',
                 f'{rgt[3]:.0f}', f'{rgt[4]:.4f}', f'{rgt[5]:.4f}']
+
+        row += [f'{v:.4f}' for v in self._rail]
+
+        chd = self._chd
+        for g in range(12):
+            b = CH_DBG_N * g
+            row += [f'{chd[b + 0]:.4f}', f'{chd[b + 1]:.4f}', f'{chd[b + 2]:.4f}',
+                    f'{chd[b + 3]:.4f}', f'{chd[b + 4]:.4f}', f'{chd[b + 5]:.0f}',
+                    f'{chd[b + 6]:.4f}', f'{chd[b + 7]:.4f}', f'{chd[b + 8]:.4f}',
+                    f'{chd[b + 9]:.3f}', f'{chd[b + 10]:.3f}', f'{chd[b + 11]:.3f}']
+
+        # 컬럼이 어긋나면 조용히 밀려 기록돼 분석이 통째로 틀어진다.
+        # 첫 행에서 한 번만 확인하고, 어긋나면 바로 알린다.
+        if not getattr(self, '_width_checked', False):
+            self._width_checked = True
+            if len(row) != len(self._header):
+                self.get_logger().error(
+                    f'CSV 컬럼 불일치: 헤더 {len(self._header)} vs 행 {len(row)} '
+                    f'— channel_dbg 추가분을 확인할 것')
+            else:
+                self.get_logger().info(
+                    f'CSV 컬럼 {len(self._header)}개 (채널 PID 내부 {12 * CH_DBG_N}개 포함)')
 
         self._writer.writerow(row)
         b0 = _pwm_base(POS_GIDS[0])

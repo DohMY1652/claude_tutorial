@@ -73,6 +73,13 @@ def _setup(context, *_a, **_k):
     act = LaunchConfiguration('actuator_connected').perform(context)
     if act:
         overrides['actuator_connected'] = (act.lower() == 'true')
+    # 0 = 압력 직접(TCP 로 받은 목표압을 채널 PID 가 추종) — 압력·레일 시험은 전부 이것
+    # 1 = 위치 PID,  2 = 위치→토크→PressureRefGen
+    # **모드 2 에서는 PressureRefGen 이 레일 셋포인트를 매 틱 덮어쓴다** —
+    # controller/rail_ref_kpa 로 레일 목표를 주려면 0 이어야 한다.
+    cmode = LaunchConfiguration('control_mode').perform(context)
+    if cmode:
+        overrides['control_mode'] = int(cmode)
     for item in filter(None, (x.strip() for x in
                               LaunchConfiguration('overrides').perform(context).split(','))):
         k, _, v = item.partition('=')
@@ -110,9 +117,18 @@ def _setup(context, *_a, **_k):
     # (17 .. 17+N-1) 로 정한다. 넘기지 않으면 `num_actuators:=1` 로 1축 시험을 해도
     # 브리지는 yaml 의 6 을 그대로 써서 board 17~22 를 기대하고, 20~22 에 대해
     # 캘리브레이션 경고와 수신 없음 오류를 쏟는다 (그 시험에는 쓰이지도 않는 보드다).
+    # encoder_source/teensy_* 를 여기에 둬야 `encoder_source:=can` 처럼 런치 인자로
+    # 소스를 갈아 끼울 수 있다. 벤치에서 Teensy 없이 띄울 때는
+    #   ros2 launch ... teensy_enable:=false encoder_source:=can
+    # 처럼 쓴다 (그러면 board/analog 을 CAN 보드 17~25 가 다시 채운다).
     BRIDGE_KEYS = ('num_actuators', 'can_channel', 'current_mode', 'control_type',
                    'pwm_watchdog_ms', 'can_rx_watchdog_ms',
-                   'can_tx_fallback_ms', 'can_tx_min_interval_ms', 'can_diag_period_s')
+                   'can_tx_fallback_ms', 'can_tx_min_interval_ms', 'can_diag_period_s',
+                   'sensor_period_ms',
+                   'encoder_source', 'teensy_enable', 'teensy_port',
+                   'teensy_watchdog_ms', 'teensy_failsafe_angle_deg',
+                   'teensy_failsafe_hold_ms', 'teensy_failsafe_vent_ms',
+                   'teensy_failsafe_shutdown')
     bridge_overrides = {k: v for k, v in overrides.items() if k in BRIDGE_KEYS}
 
     can_bridge = Node(
@@ -160,6 +176,10 @@ def generate_launch_description():
                               description='축(=채널쌍) 수. 1..6. 비우면 yaml 값'),
         DeclareLaunchArgument('actuator_connected', default_value='',
                               description='true|false. 비우면 yaml 값'),
+        DeclareLaunchArgument('control_mode', default_value='',
+            description='0=압력 직접(TCP 목표압) | 1=위치 PID | 2=위치→토크→RefGen. '
+                        '비우면 yaml 값. 레일/채널 압력 시험은 0 을 쓴다 — '
+                        '2 에서는 RefGen 이 레일 목표를 매 틱 덮어쓴다.'),
         DeclareLaunchArgument('axis', default_value='',
             description='돌릴 물리 채널. 하나면 axis:=2 (양압 ch2 / 음압 ch8 / 엔코더 board19), 여럿이면 쉼표로 axis:=0,1. 비우면 yaml 그대로 (6 축).'),
         DeclareLaunchArgument('overrides', default_value='',

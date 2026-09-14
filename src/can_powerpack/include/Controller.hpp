@@ -1,12 +1,15 @@
 #pragma once
 
 // DMY 빠른 클래스 지도
-//   Controller  : ROS 입출력과 한 제어 틱을 소유하는 최상위 노드
-//   AcadosMpc   : 이름은 과거의 흔적이며, 현재는 채널별 QP/MPPI 압력 제어 래퍼
-//   QP          : qpOASES 박스 QP 래퍼(PressureRefGen과 선택적 QP 경로에서 사용)
-//   ThreadPool  : 활성 채널의 solve/MPPI 롤아웃을 제어 틱 안에서 병렬 실행
-//   ControlAug  : 런타임에 켤 수 있는 모델 불일치 보강 항(기본값은 모두 off)
-// 상세 호출 순서는 저장소 루트 DMY_MPPI_CODE_READING_GUIDE.md의 1~3절 참조.
+//   Controller   : ROS 입출력과 한 제어 틱을 소유하는 최상위 노드
+//   PressureCtrl : 채널별 압력 PID (PressureCtrl.hpp)
+//                   제어기 **밖**에서 하드웨어로 나가는 명령에 적용한다
+//   QP           : qpOASES 박스 QP 래퍼 (PressureRefGen 이 쓴다)
+//   ThreadPool   : 활성 채널의 제어 계산을 제어 틱 안에서 병렬 실행
+//
+// 이 브랜치는 제어기 내부를 비운 스켈레톤이다. 통신(CanBridge/토픽/TCP), 센서
+// 환산, 목표압 수신, 위치·힘 외부 루프(PressureRefGen), 라인 PID, 과압
+// 세이프티, PWM 발행은 그대로다. 비어 있는 것은 PressureCtrl::compute() 뿐이다.
 
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/u_int16_multi_array.hpp>
@@ -35,8 +38,7 @@
 #include <string>
 
 #include <qpOASES.hpp>
-#include "Mppi.hpp"
-#include "MppiSystem.hpp"
+#include "PressureCtrl.hpp"
 
 #ifdef __linux__
   #include <pthread.h>
@@ -159,306 +161,6 @@ private:
   std::vector<int> pin_cpus_;
 };
 
-// ============================================================================
-// ControlAug — 실행 중 켜고 끌 수 있는 제어 보강
-// ============================================================================
-// 실기는 모델과 다르다. 어디가 다른지 미리 알 수 없으므로, **모르는 부분을 온라인으로
-// 메우는 항**을 셋 두고 각각 독립적으로 켜고 끈다. 전부 기본 off 이므로 아무것도 켜지
-// 않으면 기존 동작과 **비트 단위로 같다.**
-//
-// `ros2 param set /pack2/pp_controller aug.<이름> <값>` 으로 **재시작 없이** 바뀐다.
-// 하나씩 켜 가며 효과를 분리해서 볼 수 있게 만든 것이 요점이다.
-struct ControlAug {
-  // ── ① 온라인 유량 이득 적응 ──────────────────────────────────────────
-  // 밸브 모델의 절대 스케일(A_max)은 챔버 부피 추정에 통째로 비례한다. 부피는
-  // 이중부피법으로 재도 ±30% 가 남고, 오리피스 면적비 환산도 스풀이 병목이면 틀린다.
-  // 그래서 "모델이 예측한 유량 대비 실제 유량의 비" k_flow 를 매 틱 추정해
-  // 역모델에 곱한다. k_flow=1 이면 모델 그대로다.
-  //   측정 유량 q_meas = dP/dt·V/(R·T)   (챔버가 곧 유량계다)
-  //   모델 유량 q_model = Σ_j q_static(적용된 명령)
-  //   k ← k + rate·(q_meas/q_model − k)
-  // 유량이 작을 때는 비가 잡음이라 갱신하지 않는다.
-  bool  adapt_gain{false};
-  float adapt_rate{0.20f};            // 창마다 적용하는 완화 계수
-  float gain_min{0.25f}, gain_max{4.0f};
-  float adapt_min_flow_lpm{0.10f};    // 이보다 작은 모델 유량에서는 갱신 안 함
-  int   adapt_window{100};            // 최소자승 누적 창 [tick] (500 Hz 기준 0.2 s)
-
-  // ── ② 오프셋 프리 (정상상태 외란 추정) ───────────────────────────────
-  // 모델 오차·누설·센서 영점 이탈은 정상상태 오차로 남는다. 출력 외란 d 를 적분
-  // 추정해 **레퍼런스를 그만큼 밀어** 실제 출력이 목표에 가게 한다 (offset-free MPC 의
-  // 실용형). MPPI 비용에 손대지 않으므로 솔버 튜닝과 독립이다.
-  //   d ← clamp(d + rate·(P_ref − P_meas))
-  //   MPPI 가 추종하는 목표 = P_ref + d
-  bool  offset_free{false};
-  float dist_rate{0.5f};              // [1/s] — 제어 주기와 무관하게 초당 속도로 준다
-  float dist_band_kpa{5.0f};          // 오차가 이 안일 때만 적분 (과도에서는 적분 금지)
-  float dist_limit_kpa{30.0f};
-  float dist_deadband_kpa{0.3f};      // 센서 분해능(0.25 kPa) 이하에서는 적분하지 않는다
-
-  // ── ③ 접근 시상수 자동 조정 ──────────────────────────────────────────
-  // mppi_ref_tau_s 가 성능을 가장 크게 좌우한다(MPPI.md 6.3). 오차 부호가 자주 바뀌면
-  // (진동) 느리게, 한 방향으로 크게 남으면(둔함) 빠르게 민다. 경계 안에서만 움직인다.
-  bool  auto_tune{false};
-  float tune_rate{0.02f};             // 한 번에 바꾸는 비율
-  float tau_min{0.06f}, tau_max{0.40f};
-  float osc_hi{0.30f};                // 최근 창에서 부호 변화 비율이 이보다 크면 진동
-  float err_slow_kpa{3.0f};           // 이보다 큰 오차가 한 방향으로 유지되면 둔하다
-  int   tune_window{250};             // 판정 창 [tick] (500 Hz 기준 0.5 s)
-};
-
-class AcadosMpc {
-public:
-  struct Config {
-    int can_board_id{4};   // physical CAN board ID (1-based); sensor = filt_out_[can_board_id-1]
-    int global_id{0};
-    int   NP{10};
-    int   n_x{1};
-    int   n_u{3};
-    float Ts{0.004f};
-    float Q_value{1.0f};
-    float R_value{1.0f};
-    float A_lin{1.0f};
-    std::array<float,3> B_lin{1.0f, 0.0f, 0.0f};
-    bool  is_positive{true};
-    float pos_ki_micro{0.0f}, pos_ki_macro{0.0f}, pos_ki_atm{0.0f};
-    float neg_ki_micro{0.0f}, neg_ki_macro{0.0f}, neg_ki_atm{0.0f};
-    float ref_value{0.0f};
-    float du_min{-100.0f};
-    float du_max{+100.0f};
-    float u_abs_min{0.0f};
-    float u_abs_max{100.0f};
-    float volume_m3{1.0e-5f};
-    float prev_vol_m3{1.0e-5f};
-
-    float last_ref_value_ = 101.325f;
-    float ejector_k = 0.005f;
-    float ejector_p_limit = 11.325f;
-    float leakage_u_pos = 0.0f;
-    float leakage_u_neg = 0.0f;
-    float target_time_constant = 0.2f;
-    // macro 를 여는 판정에 쓰는 micro 포화 기준 [%]. 100 = 레일 밸브를 완전히 열었는데도
-    // 요구 유량을 못 낼 때만 macro 를 연다 (임의 임계값이 아니라 밸브 물리 한계).
-    // 명령 테이퍼 폭 [kPa]. 오차가 이 안으로 들어오면 **크래킹 임계 위쪽 여유분**을
-    // 연속적으로 줄인다. 하드 데드밴드를 대체한다 — 이유는 solve() 주석 참조.
-    // "닫힘"으로 볼 유효면적 비율 (A_eff / A_max). 이 면적에 해당하는 전류가 크래킹
-    // 임계이고, 그 이하에서는 솔레노이드 자기력이 스풀을 못 들어 유량이 0 이다.
-    float valve_crack_area_frac = 1e-6f;
-    // ── 명령 저역통과 [Hz] (0 = 끔) ────────────────────────────────────
-    // 밸브는 2차계이고 실측 피팅이 ωn≈39.5~45.3 rad/s(6.3~7.2 Hz), ζ≈0.2 를 준다.
-    // ζ=0.2 는 공진 첨두가 1/(2ζ)=2.5배인 **매우 약한 감쇠**다. 그런데 MPPI 는
-    // du_limit=100 이라 한 틱(2 ms)에 u 를 0↔100 로 던질 수 있어 250 Hz 성분까지
-    // 실린 명령이 나간다 — 그 스펙트럼이 7 Hz 공진을 정면으로 때린다.
-    // 실기 계측: 챔버가 6.86 Hz 로 peak-to-peak 210 kPa 진동했고, 그 주파수가
-    // 밸브 고유주파수와 정확히 일치했다. 첫스텝 포화도 97.6~100% 였다.
-    // → 명령을 공진보다 한참 아래에서 잘라 낸다. 액추에이터가 따라올 수 없는
-    //   빠르기로 명령하지 않는다는, 제어에서 가장 기본적인 규칙이다.
-    float cmd_lpf_hz = 0.0f;
-    float ki_u_limit_pct = 10.0f;  // 지령 트림 상한 [%p] — 크래킹 위치 오차용
-    float ki_flow = 0.02f;         // 유량 트림 이득 [1/(kPa·s)]
-    float q_trim_limit = 2.0f;     // 유량 배율 보정 상한 (2.0 = 최대 3배/1/3배)
-    float crack_floor_rate_kpas = 5.0f;  // |dP/dt| 가 이보다 작을 때만 크래킹 하한을 건다
-    float crack_floor_min_err_kpa = 1.5f; // 오차가 이보다 클 때만 크래킹 하한을 건다
-    float integ_hold_rate_kpas = 0.0f;    // >0 이면: 압력이 그보다 빠르면 적분 멈춤 (0=끔)
-    float integ_deadzone_boost = 1.0f;    // 데드존(무반응)에서 적분 배속 (1=평소대로)
-    ControlAug aug{};                 // Controller 가 매 틱 최신값을 밀어 넣는다
-    // 밸브별 13-parameter (0=micro, 1=macro, 2=atm). build_mpcs 가 채운다.
-    // **이것이 모델의 단일 출처다.** 아래 평면 필드는 하위 호환용으로 micro 값을 담는다.
-    std::array<mppi::PlantParams, 3> pv{};
-    // 13-variable proportional valve model parameters
-    float I_MAX{0.30f};
-    float A_max{0.2845f};
-    float k_shape{33.09f};
-    float C_k{0.0288f};
-    float C_p{0.00012f};
-    float C_z{0.0f};
-    float A_bw{260649.5f};
-    float beta_bw{179.0f};
-    float gamma_bw{0.06f};
-    float alpha_shape{3884.2f};
-    float wn_up{40.0f};
-    float zeta_up{1.2f};
-    float wn_down{45.0f};
-    float zeta_down{1.0f};
-
-    // ── 솔버 선택 ─────────────────────────────────────────────────────────
-    // false: 기존 경로 (선형화 → 응축 QP → qpOASES)
-    // true : MPPI (선형화 없음, 비선형 롤아웃 샘플링).  Mppi.hpp 머리말 참조.
-    // 하네스가 비결정론적이라(README 0절) 두 경로를 남겨 A/B 비교할 수 있게 했다.
-    bool  use_mppi{false};
-    int   mppi_samples{128};
-    float mppi_lambda{0.30f};
-    float mppi_sigma_pct{8.0f};
-    float mppi_sigma_explore_pct{30.0f};
-    float mppi_explore_frac{0.30f};
-    float mppi_du_limit_pct{100.0f};   // MPPI 경로의 Δu 한계 (QP 경로의 du_min/max 와 별개)
-    // 지평 안 스테이지 레퍼런스의 접근 시상수 [s]. ≤0 이면 target_time_constant 를 쓴다.
-    // 피드포워드보다 **빠른** 궤적을 주면 MPPI 가 그만큼 더 밀어붙인다.
-    float mppi_ref_tau_s{-1.0f};
-    // 계획 지평은 제어 주기와 **독립**이다. ≤0 이면 NP / Ts 를 그대로 쓴다.
-    // 지평 길이 = mppi_np · mppi_ts_s. 밸브 τ≈25 ms 보다 충분히 길어야 밸브가
-    // 응답하는 것을 지평 안에서 볼 수 있다.
-    int   mppi_np{-1};
-    float mppi_ts_s{-1.0f};
-    float mppi_noise_beta{0.70f};
-    // 음수면 Q_value / R_value 를 그대로 쓴다 (기존 튜닝 의미를 잇는다).
-    float mppi_w_track{-1.0f};
-    float mppi_w_effort{-1.0f};
-    float mppi_w_du{0.05f};
-    float mppi_track_scale_kpa{10.0f};
-    float mppi_terminal_mult{5.0f};
-    int   mppi_substeps{2};
-    // 롤아웃 초기 상태로 필터 전 생값을 쓴다. 측정 지연 가설의 싼 **진단** 스위치.
-    // 계측(스텝 4개 평균): 압력 RMSE 5.51 → 5.09, 정상상태 압력오차 0.25 → 0.00 으로
-    // 개선되지만 위치 IAE 는 5.30 → 6.43 으로 악화된다. 생값은 양자화 잡음(양압 보드
-    // 0.25 kPa/LSB)이 그대로라 MPPI 가 잡음을 쫓아 밸브가 떨린다. 즉 지연 가설은 맞지만
-    // 해법은 생값이 아니라 **관측기**다 (아래).
-    bool  mppi_raw_state{false};
-
-    // ── 상태 관측기 ────────────────────────────────────────────────────────
-    // 필터값은 매끄럽지만 ≈18 ms 늦고(LPF 직렬 2단, 각 τ≈9 ms — 지평 40 ms 의 45%),
-    // 생값은 즉각이지만 시끄럽다. 모델로 앞서 예측하고 그 예측에 **같은 LPF 2단을
-    // 복제**해 측정과 같은 조건으로 비교한 뒤 잔차로 보정하면 둘을 동시에 얻는다.
-    // MPPI 에는 필터가 안 걸린 추정값을 넘긴다.
-    bool  mppi_estimator{false};
-    float obs_gain{0.10f};          // 잔차 보정 이득 [1/tick]
-    float obs_bridge_alpha{0.2f};   // 브리지/시뮬 LPF 계수 (컨트롤러가 직접 모르는 값)
-    float obs_ctrl_alpha{0.2f};     // 컨트롤러 LPF 계수 (sensor_filter_alpha 를 그대로 받는다)
-  };
-
-  explicit AcadosMpc(const Config& cfg);
-  void set_qp_solver(std::shared_ptr<QP> qp);
-  inline void set_ref_value(float ref_kpa) { cfg_.ref_value = ref_kpa; }
-  inline void set_volume(float vol_m3) { cfg_.volume_m3 = std::max(1e-12f, vol_m3); }
-  inline void set_prev_volume(float vol_m3) { cfg_.prev_vol_m3 = std::max(1e-12f, vol_m3); }
-  void update_linearization(float x_ref, const Eigen::RowVector3f& u_ref);
-  void set_AB_sequences(const std::vector<float>& A_seq, const std::vector<Eigen::RowVector3f>& B_seq);
-  void set_AB_constant(float A_scalar, const Eigen::RowVector3f& B_row);
-  void solve(float dt_ms, std::array<uint16_t, MPC_OUT_DIM>& out3, float current_time_sec);
-  // 중앙집중 MPPI 용 분리 — 그 사이에 전체 시스템 솔버가 끼어든다.
-  // prepare: z 갱신 · 피드포워드 · 적분항 · 크래킹 임계 → uref
-  // finish : 테이퍼 · 클램프 · PWM · 밸브 상태 추정 전진
-  std::array<float,3> prepare(float dt_ms, float current_time_sec);
-  void finish(const std::array<float,3>& du3, std::array<uint16_t, MPC_OUT_DIM>& out3);
-  void report_mppi_stats();
-  inline float p_used() const { return P_used_; }          // 실제 쓴 압력 (추정/생/필터)
-  inline const std::array<float,3>& u_crack() const { return u_crack_; }
-  inline const std::array<float,3>& uref()    const { return uref_; }
-  inline const mppi::ChannelState& plant_est() const { return plant_est_; }
-  inline float vol_dot_est() const { return vol_dot_est_; }
-  inline float k_flow()   const { return k_flow_; }
-  inline float d_hat()    const { return d_hat_; }
-  inline float tau_used() const { return tau_ref_cur_; }
-  // 롤아웃 초기 상태 — 채널 경로와 중앙집중 경로가 **같은 조립 규칙**을 쓰게 한다.
-  // prepare() 직후에 부를 것 (z 가 이번 틱 값으로 갱신된 뒤여야 한다).
-  mppi::ChannelState rollout_state() const;
-  const mppi::ChannelPlant& plant_params() const { return mppi_pv_; }
-  const Config& cfg() const { return cfg_; }
-  Config& cfg_mutable() { return cfg_; }   // 보강 설정을 매 틱 밀어 넣기 위해
-
-  // macro 개방 게이트는 없다. 분담량이 곧 개방 여부다 —
-  // compute_input_reference 의 split_demand 주석 참조.
-  // 이 채널이 붙은 레일의 압력 변화율 [kPa/s]. 컨트롤러가 12채널 명목 명령으로 한 번
-  // 계산해 공유한다 — 롤아웃이 레일을 상수로 두던 오차(≈5~34 kPa)를 없앤다.
-  inline void set_rail_rate(float r) { rail_rate_ = r; }
-  // 과압 세이프티가 래치되면 컨트롤러 명령이 **무시되고** 밸브가 강제 전개된다.
-  // 그동안의 추종 오차는 컨트롤러 탓이 아니므로 적분(오프셋 프리)을 멈춰야 한다.
-  inline void set_safety_latched(bool v) { safety_latched_ext_ = v; }
-
-  float current_P_now_       = 101.325f;
-  // 롤아웃 초기 상태 전용 생값(필터 전). 오차·피드포워드·적분항은 그대로 필터값을 쓴다 —
-  // 그래야 "초기 상태만" 바꾼 효과를 분리해 볼 수 있다.
-  float current_P_now_raw_   = 101.325f;
-  float current_P_micro_     = 101.325f;
-  float current_P_macro_     = 101.325f;
-  float current_P_macro_neg_ = 101.325f;
-  float current_P_atm_       = 101.325f;
-
-private:
-  // Bouc-Wen hysteresis state estimates for each valve (micro/atm/macro)
-  double z_micro_{0.0}, prev_I_micro_{0.0};
-  double z_atm_{0.0},   prev_I_atm_{0.0};
-  double z_macro_{0.0}, prev_I_macro_{0.0};
-  int    dir_micro_{0},  dir_atm_{0},  dir_macro_{0};
-  // 밸브별 크래킹 임계 [%] — compute_input_reference 가 매 틱 현재 Pin/z 로 갱신한다.
-  // 순서는 last_u3_ 와 동일: [0]=micro, [1]=macro, [2]=atm.
-  std::array<float,3> u_crack_{0.f, 0.f, 0.f};
-  std::array<float,3> compute_input_reference(float P_now, float P_micro, float P_macro, float P_macro_neg, float dt_sec, float current_time_sec);
-  void build_mpc_qp(const std::vector<float>& A_seq, const std::vector<Eigen::RowVector3f>& B_seq, float P_now, const std::vector<float>& P_ref, Eigen::MatrixXf& P, Eigen::VectorXf& q, Eigen::MatrixXf& A_con, Eigen::VectorXf& LL, Eigen::VectorXf& UL);
-  std::array<float,3> solve_qp_first_step(const Eigen::MatrixXf& P, const Eigen::VectorXf& q, const Eigen::MatrixXf& A_con, const Eigen::VectorXf& LL, const Eigen::VectorXf& UL);
-
-private:
-  Config cfg_;
-  std::shared_ptr<QP> qp_;
-  std::vector<float> P_ref_;
-  std::vector<float> A_seq_;
-  std::vector<Eigen::RowVector3f> B_seq_;
-  Eigen::MatrixXf Q_, R_, Pmat_, Acon_;
-  Eigen::VectorXf qvec_, LL_, UL_;
-  std::array<float,3> last_u3_{0,0,0};
-  float pos_error_integral_{0.0f};
-  // ── 보강 상태 (채널별) ──────────────────────────────────────────────
-  float k_flow_{1.0f};        // ① 적응된 유량 이득 (1 = 모델 그대로)
-  float d_hat_{0.0f};         // ② 추정 출력 외란 [kPa]
-  float tau_ref_cur_{-1.0f};  // ③ 현재 접근 시상수 [s] (<0 = 아직 초기화 전)
-  int   sign_flips_{0}, tune_tick_{0};
-  int   last_err_sign_{0};
-  float err_abs_acc_{0.0f};
-  float q_model_last_{0.0f};  // 직전 틱에 적용한 명령의 모델 유량 [LPM]
-  double adapt_sxy_{0.0}, adapt_sxx_{0.0};   // Σ(q_meas·q_model), Σ(q_model²)
-  int    adapt_n_{0};
-  float ref_eff_{101.325f};   // 외란 보정이 들어간 유효 레퍼런스 [kPa]
-  // 적분 보정 [지령 %p]. uref 가 아니라 **MPPI 뒤**에 더한다 — 자세한 이유는
-  // AcadosMpc::finish() 의 주석 참조.
-  float ki_flow_{0.02f};      // 유량 트림 이득
-  float q_trim_{1.0f};        // 이번 틱의 유량 배율 (진단용)
-  float err_abs_{0.0f};       // 이번 틱의 |Pref − P| [kPa]
-  float want_sign_{0.0f};     // +1 = 압력을 올리려는 요구, −1 = 내리려는 요구
-  std::array<bool,3>  u_want_{false, false, false};  // 이 틱에 유량을 요구한 밸브
-  std::array<float,3> u_trim_{0.f, 0.f, 0.f};
-  std::array<float,3> u_lpf_{0.f, 0.f, 0.f};   // 명령 저역통과 상태
-  bool  u_lpf_init_{false};
-  bool  safety_latched_ext_{false};
-  float dpdt_f_{0.0f};        // 측정 압력 변화율 [kPa/s], τ=100 ms
-  float p_prev_meas_{-1.0f};  // 직전 틱 측정압 [kPa] (유량 역산용)
-  float neg_error_integral_{0.0f};
-
-  float last_error_{0.0f};
-
-  std::deque<float> vol_dot_buffer_;
-  const size_t vol_dot_window_size_ = 5;
-
-  int qp_fail_count_{0};
-  int nonfinite_cnt_{0};           // 비유한 명령 차단 횟수 (실기 안전 진단)
-  int qp_stat_tick_{0};
-
-  // ── MPPI 경로 ────────────────────────────────────────────────────────────
-  // plant_est_ 는 밸브 2차 동특성 상태(q, qd) 추정이다. 롤아웃 초기값으로 쓰고,
-  // 매 틱 실제 인가 명령 + 측정 압력으로 함께 전진시킨다. z 는 여기 두지 않고
-  // z_micro_/z_atm_/z_macro_ 를 단일 출처로 삼아 매 틱 복사해 넣는다.
-  std::unique_ptr<mppi::Solver> mppi_;
-  mppi::ChannelPlant            mppi_pv_{};
-  mppi::ChannelState            plant_est_{};
-  int   mppi_stat_tick_{0};
-  float vol_dot_est_{0.0f};        // compute_input_reference 가 매 틱 갱신 [m³/s]
-  // prepare → finish 사이에 넘겨야 하는 값들
-  std::array<float,3> uref_{0.f,0.f,0.f};
-  float dt_sec_{0.004f};
-  float P_used_{101.325f};         // 이번 틱에 실제로 쓴 압력 (추정/생/필터 중 하나)
-  float rail_rate_{0.0f};          // 레일 압력 변화율 [kPa/s] (컨트롤러가 주입)
-
-  // ── 관측기 상태 ──────────────────────────────────────────────────────────
-  // p_hat_      : 필터가 걸리지 않은 **진짜** 챔버압 추정 (MPPI 초기 상태로 쓴다)
-  // p_hat_f1/f2 : 그 추정에 브리지 LPF·컨트롤러 LPF 를 복제 적용한 값.
-  //               측정값(filt_out_)과 같은 지연을 가지므로 직접 비교할 수 있다.
-  float p_hat_{101.325f}, p_hat_f1_{101.325f}, p_hat_f2_{101.325f};
-  bool  p_hat_init_{false};
-  double obs_resid_acc_{0.0};      // 진단: 잔차 절대값 누적
-  int    obs_resid_n_{0};
-
-  Eigen::MatrixXf S_bar_, T_bar_;
-  Eigen::VectorXf x0_mpc_, Xref_mpc_, qtmp_, solution_;
-};
 
 struct SensorCalib {
   struct Channel { double offset{1.0}; double gain{250.0}; };
@@ -611,7 +313,7 @@ private:
   void on_sensor(const std_msgs::msg::UInt16MultiArray::SharedPtr msg);
   void on_volume(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
   void on_timer();
-  void build_mpcs();
+  void build_ctrls();
   void on_zero_calibration(
     const std_srvs::srv::Trigger::Request::SharedPtr,
     std_srvs::srv::Trigger::Response::SharedPtr res);
@@ -630,8 +332,8 @@ private:
   std::vector<double> filt_state_;                      // [NUM_CAN_BOARDS]
   std::array<double,   NUM_CAN_BOARDS> filt_out_{};     // kPa, indexed by board_id-1
   // 필터 **전** 압력. 측정 경로에 LPF 가 직렬 2단(브리지 α=0.2 + 여기 α=0.2, 각 τ≈9 ms)
-  // 걸려 있어 filt_out_ 은 약 18 ms 낡았고, 그것은 MPPI 지평 40 ms 의 45% 다.
-  // 예측기의 초기 상태로는 생값이 더 나을 수 있어 비교용으로 함께 들고 간다.
+  // 걸려 있어 filt_out_ 은 약 18 ms 낡았다. 지연 없는 값이 필요한 제어기를 위해
+  // 생값도 함께 들고 가서 PressureCtrl::Input.P_meas_raw_kpa 로 넘긴다.
   std::array<double,   NUM_CAN_BOARDS> raw_out_{};
   bool filter_initialized_{false};
 
@@ -677,13 +379,7 @@ private:
   };
 
   struct ChannelConfig {
-    double pos_ki_micro{0.0};
-    double pos_ki_macro{0.0};
-    double pos_ki_atm{0.0};
-    double neg_ki_micro{0.0};
-    double neg_ki_macro{0.0};
-    double neg_ki_atm{0.0};
-    // 밸브별 13-parameter. 인덱스는 mppi::ValveIdx 와 동일 (0=micro, 1=macro, 2=atm).
+    // 밸브별 13-parameter. 인덱스는 PressureCtrl::ValveIdx 와 동일 (0=micro, 1=macro, 2=atm).
     std::array<Valve13, 3> v{};
     double chamber_volume_ml{-1.0};   // 피팅으로 구한 챔버 부피 (<0 이면 미측정)
     bool   per_valve_loaded{false};   // 진단용 — 피팅 파일이 실제로 로드됐는지
@@ -702,39 +398,16 @@ private:
   std::array<double, 9> encoder_angles_{};   // boards 17..25 [deg], index 0 = board 17
   rclcpp::Publisher<std_msgs::msg::UInt16MultiArray>::SharedPtr pub_pwm_cmd_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_mpc_refs_;
+  // 채널 PID 내부 — 항별로 찍어야 적분 포화·표 오차·피드포워드를 분리할 수 있다.
+  // 채널당 CH_DBG_N 개 × 12 채널. 순서는 Controller.cpp 의 발행부 주석 참조.
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_chan_dbg_;
+  static constexpr int CH_DBG_N = 12;
+  std::vector<std::array<double, CH_DBG_N>> chan_dbg_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_active_vols_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_kpa_all_;
 
   std::unique_ptr<ThreadPool> pool_;
   size_t pool_threads_{2};
-  std::vector<std::function<void()>> sys_tasks_;   // 핫패스 재할당 방지
-
-  // ── 중앙집중 MPPI (solver: mppi_system) ──────────────────────────────────
-  // 12개 채널 + 라인 밸브 2개를 **하나의 최적화**로 푼다. 레일 강하와 채널 유량 요구
-  // 총합이 같은 모델 안에 들어오므로, 채널별 독립 MPPI 가 레일을 무한 소스로 가정해
-  // 생기던 ≈34 kPa(6채널 동시) 예측 오차가 원리적으로 사라진다. 라인 PID 는 흡수된다.
-  std::unique_ptr<mppi::SystemSolver> sys_mppi_;
-  mppi::SysParams    sys_params_{};
-  mppi::SysState     sys_state_{};
-  mppi::SysExo       sys_exo_{};
-  std::vector<float> sys_uref_;
-  bool  sys_init_{false};
-  bool  sys_control_lines_{false};
-  double sys_deadline_us_{1200.0};
-  int    sys_over_budget_{0};
-  long   sys_over_cnt_{0}, sys_skipped_{0};
-  int   sys_stat_tick_{0};
-  double sys_pred_err_pos_{0.0}, sys_pred_err_neg_{0.0};
-  double sys_pred1_pos_{0.0}, sys_pred1_neg_{0.0};
-  bool   sys_pred1_valid_{false};
-  int    sys_pred_n_{0};
-  void build_system_mppi();
-  void estimate_rail_rates(double P_line_pos_kPa, double P_line_neg_kPa,
-                           double P_atm_kPa, float& dPpos_dt, float& dPneg_dt);
-  float rail_rate_pos_{0.0f}, rail_rate_neg_{0.0f};
-  bool  rail_rate_enable_{false};
-  void run_system_mppi(double P_atm_kPa, double P_line_pos_kPa, double P_line_neg_kPa,
-                       double P_line_macro_kPa, double P_line_macro_neg_kPa);
   std::mutex sensors_mtx_;
   std::array<uint16_t, NUM_CAN_BOARDS> sensors_raw_{};   // indexed by board_id-1
 
@@ -742,50 +415,103 @@ private:
   std::array<int,      PWM_TOTAL> inner_{};
   std::array<uint16_t, PWM_TOTAL> cmds_{};
 
-  std::vector<std::unique_ptr<AcadosMpc>> mpcs_;
+  // 채널(gid)마다 하나. 활성 채널만 만든다.
+  std::vector<std::unique_ptr<PressureCtrl>> ctrls_;
   uint64_t tick_{0};
   double wall_elapsed_sec_{0.0};   // 실제 벽시계 경과 — 틱 간격 진단용 (제어에는 쓰지 않는다)
   SensorCalib sensor_;
 
-  struct MpcYaml {
-    int   NP{5}; int n_x{1}; int n_u{3}; double Ts{0.01}; double Q_value{10.0}; double R_value{1.0};
-    double ejector_k{0.005};
-    double ejector_p_limit{11.325};
-    double leakage_u_pos{0.0};
-    double leakage_u_neg{0.0};
-    double target_tc{0.2};
-    double valve_crack_area_frac{1e-6};
-    double cmd_lpf_hz{0.0};   // 명령 저역통과 [Hz], 0=끔
-    double ki_u_limit_pct{10.0};  // 지령 트림 상한 [%p]
-    double ki_flow{0.02};
-    double q_trim_limit{2.0};
-    double crack_floor_rate_kpas{5.0};
-    double crack_floor_min_err_kpa{1.5};
-    double integ_hold_rate_kpas{0.0};
-    double integ_deadzone_boost{1.0};
-    // 솔버 선택 + MPPI 하이퍼파라미터
-    std::string solver{"qp"};
-    int    mppi_samples{128};
-    double mppi_lambda{0.30};
-    double mppi_sigma_pct{8.0};
-    double mppi_sigma_explore_pct{30.0};
-    double mppi_explore_frac{0.30};
-    double mppi_du_limit_pct{100.0};
-    double mppi_ref_tau_s{-1.0};
-    int    mppi_np{-1};
-    double mppi_ts_s{-1.0};
-    double mppi_noise_beta{0.70};
-    double mppi_w_track{-1.0};
-    double mppi_w_effort{-1.0};
-    double mppi_w_du{0.05};
-    double mppi_track_scale_kpa{10.0};
-    double mppi_terminal_mult{5.0};
-    int    mppi_substeps{2};
-    bool   mppi_raw_state{false};
-    bool   mppi_estimator{false};
-    double obs_gain{0.10};
-    double obs_bridge_alpha{0.2};
-  } mpc_;
+  // 크래킹 임계의 정의값 — "닫힘" 으로 볼 유효면적 비율 (A_eff/A_max).
+  // ── 밸브 데드존 (죽은 구간) 표 ────────────────────────────────────────────
+  // 밸브 모델은 제어에 쓰지 않는다. 이 값은 **실측**이다: 각 밸브가 열리기 시작하는
+  // 지령 [%]. scripts/valve_deadzone.py 가 실기에서 재서 yaml 에 적는다.
+  //
+  //   u_hw = deadzone(차압) + u_pid       (죽은 구간을 지나간 지점에서 PID 가 출발)
+  //
+  // **차압의 함수**다. 상류압이 스풀을 여는 방향으로 밀기 때문에 차압이 크면 더 낮은
+  // 지령에서 열린다 (실측: 챔버압 10 kPa 변화 → 임계 0.5 %p 이동). 상수 하나로
+  // 보상하면 사인파 반주기는 덜 열고 반주기는 더 열게 되므로 표로 보간한다.
+  //
+  // 모델 역산을 쓰던 예전 방식은 버렸다 — 13-parameter 가 6채널 공용이라 실제 임계와
+  // 채널별로 최대 2 %p 어긋났고, 양압 micro 가 임계 **아래**에 놓여 간헐 펄스로만
+  // 열렸다 (20260908_171520: 양압 RMSE 2.0~2.7 / 음압 0.9).
+  bool dz_enable_{true};
+
+  // 표에서 **빼는** 안전 여유 [%p]. 0 이면 표를 그대로 쓴다.
+  //
+  // 과보상이 부족보상보다 훨씬 나쁘기 때문에 둔다. 표가 실제 임계보다 높으면
+  // u_pid 가 0 을 조금만 넘어도 밸브가 이미 임계 위에서 열려 **유량 0 을 만드는
+  // 지령이 아예 없다**. 그러면 루프가 릴레이가 되어 반드시 진동한다 —
+  // 실측 20260909_215513: 양압 ch0 에 과보상 +2.68 %p 가 걸려 5.70 Hz,
+  // p-p 30~40 kPa 로 떨렸고 micro↔atm 이 초당 11.5 회 번갈았다 (동시 열림 0%).
+  // 반대로 부족보상이면 u_pid 가 여유만큼 커져야 열리기 시작할 뿐, 그 구간은
+  // 적분이 메운다. 표의 채널 간 편차가 2~4 %p 이므로 그 정도를 빼 두는 것이 안전하다.
+  double dz_margin_pct_{0.0};
+
+  // 채널별 여유 [%p] — channel_config.chN.deadzone.margin_pct (없으면 위 전역값).
+  // 표의 정확도가 채널마다 다르므로(측정 sd 0.4~1.7 %p) 문제 채널만 깊게 뺄 수 있어야
+  // 한다. 전역값을 올리면 멀쩡한 채널까지 죽은 구간이 넓어져 느려진다.
+  // [채널][밸브] 여유 [%p]. channel_config.chN.deadzone.margin_{micro,atm,macro}_pct
+  //  → 없으면 chN.deadzone.margin_pct → 없으면 전역 valve_deadzone.margin_pct.
+  //
+  // 밸브별로 나눈 이유: 같은 채널 안에서도 표의 오차가 밸브마다 반대다. 실측
+  // 20260910 (표 대비 유량 0 교차 x0, x0<0 = 표가 높다 = 과보상):
+  //     ch3 micro −0.46 / atm +3.44,  ch5 micro −0.07 / atm +3.60
+  // 채널 하나로 묶으면 micro 를 맞추면 atm 이 4 %p 죽고, atm 을 맞추면 micro 가
+  // 릴레이가 된다. 실제로 ch3·ch5 의 하강이 상승보다 2~3 배 느렸던 원인이다.
+  std::vector<std::array<double, 3>> dz_margin_ch_;
+
+  // ── 밸브 파킹 ─────────────────────────────────────────────────────────────
+  // 쉬는 밸브를 0 으로 두지 않고 (표 최솟값 − park_below_pct) 에 걸어 둔다.
+  //
+  // 왜: 솔레노이드 코일은 인덕턴스가 있어 0 에서 지령을 주면 전류가 붙는 데
+  // 시간이 걸린다. 미리 흘려 두면 열어야 할 때 그 시간이 빠진다. 표 최솟값보다
+  // 더 낮게 두므로 **어떤 차압에서도 유량은 0** 이다 (데드존은 차압이 커질수록
+  // 낮아지니 최솟값이 최악의 경우다).
+  bool   dz_park_enable_{false};
+  double dz_park_below_pct_{5.0};
+  // [채널][밸브] 실제 파킹 지령 [%] — 기동 때 한 번 계산한다.
+  std::vector<std::array<double, 3>> dz_park_ch_;
+
+  // 표가 없는 밸브에 쓰는 상수 [%] — valve_deadzone.{micro,macro,atm}_pct
+  std::array<double, 3> dz_pct_{{0.0, 0.0, 0.0}};
+
+  // macro(부스트) 밸브를 쓰나. false = 지령을 항상 0 으로 내고 파킹도 안 한다.
+  bool use_macro_{false};
+
+  // 차압 → 데드존 지령. 표가 비어 있으면 flat 을 상수로 쓴다.
+  struct DzTable {
+    std::vector<double> dp_kpa;   // 오름차순 (로드할 때 검사한다)
+    std::vector<double> u_pct;    // 같은 길이
+    double flat{0.0};             // 표가 없을 때의 상수
+
+    // 표 전체에서 가장 낮은 값 [%] — 파킹 기준. 어떤 차압에서도 이 값 아래면
+    // 확실히 닫혀 있다 (데드존은 차압이 커질수록 낮아지므로 최솟값이 최악의 경우다).
+    double u_min() const {
+      if (u_pct.empty()) return flat;
+      double m = u_pct.front();
+      for (double v : u_pct) m = std::min(m, v);
+      return m;
+    }
+
+    // 선형보간. 표 밖은 **클램프한다** — 외삽하면 잰 적 없는 차압에서 밸브를 활짝
+    // 열어 버릴 수 있고, 데드존은 차압에 대해 완만한 포화 곡선이라 끝값이 더 안전하다.
+    double at(double dp) const {
+      const size_t n = dp_kpa.size();
+      if (n == 0 || u_pct.size() != n) return flat;
+      if (n == 1 || dp <= dp_kpa.front()) return u_pct.front();
+      if (dp >= dp_kpa.back()) return u_pct.back();
+      size_t k = 1;
+      while (k < n && dp_kpa[k] < dp) ++k;
+      const double d0 = dp_kpa[k - 1], d1 = dp_kpa[k];
+      const double w = (d1 > d0) ? (dp - d0) / (d1 - d0) : 0.0;
+      return u_pct[k - 1] + w * (u_pct[k] - u_pct[k - 1]);
+    }
+  };
+
+  // [채널][밸브] — 밸브 인덱스는 PressureCtrl::V_MICRO/V_MACRO/V_ATM.
+  std::vector<std::array<DzTable, 3>> dz_ch_;
+  std::vector<std::array<float, 3>> u_hw_pct_;
 
   std::vector<double> vol_ml_;
 
@@ -793,7 +519,7 @@ private:
 
   std::vector<double> vol_scale_;
 
-  bool sys_valve_operate_{false};
+  bool valve_operate_{false};   // system_parameters.valve_operate — false 면 PWM 을 내지 않는다
   RefTcpClient::Config ref_client_cfg_;
   std::unique_ptr<RefTcpClient> ref_client_;
   RefTcpServer::Config ref_server_cfg_;
@@ -801,8 +527,90 @@ private:
   std::mutex mpc_ref_mtx_;
   std::vector<double> mpc_ref_kpa_;
 
-  struct PidGains { double kp{0.5}, ki{0.0}, kd{0.0}, ref{150.0}; };
+  // ── 채널 압력 PID 게인 로더 ───────────────────────────────────────────────
+  // 채널 × 양/음압 × 상승/하강 을 **모두 개별 튜닝**할 수 있게 6단으로 겹쳐 읽는다.
+  // 뒤 단계가 앞 단계를 덮어쓰고, yaml 에 없는 키는 앞 단계 값을 그대로 쓴다.
+  //
+  //   1  ChannelPID.*                          전 채널·전 방향
+  //   2  ChannelPID.{up,down}.*                방향별 (전 채널)
+  //   3  ChannelPID.{pos,neg}.*                측별   (전 방향)
+  //   4  ChannelPID.{pos,neg}.{up,down}.*      측별·방향별
+  //   5  channel_config.chN.pid.*              채널별 (전 방향)
+  //   6  channel_config.chN.pid.{up,down}.*    채널별·방향별
+  //
+  // up = 압력을 올리는 방향, down = 내리는 방향 (채널 종류와 무관한 물리 방향).
+  PressureCtrl::Gains load_gains(const std::string& prefix, PressureCtrl::Gains g);
+  PressureCtrl::Gains gains_for(int gid, bool is_positive, const char* dir);
+
+  // ── 아래는 공유 레일(라인) PID — 채널 PID 와 다른 루프다 ──────────────────
+  // i_limit: 적분 '항'(출력 %p 단위) 상한. 레일은 펌프 충전률이 한계인 구간이 있어
+  //          벤트를 다 닫아도 오차가 안 줄어든다. 그때 적분이 출력 상한까지 차면
+  //          목표를 지난 뒤 되돌리는 데 수십 초가 걸린다(실측 레일 정착 50 s).
+  struct PidGains { double kp{0.5}, ki{0.0}, kd{0.0}, ref{150.0}, i_limit{100.0}; };
   struct PidState { double integ{0.0}; double prev_err{0.0}; bool has_prev{false}; };
+
+  // ══════════════════════════════════════════════════════════════════════
+  //  레일 피드포워드 (RailFF) — 20260912 실측 맵의 역함수
+  // ══════════════════════════════════════════════════════════════════════
+  // 레일 둘은 펌프 하나로 이어진 **닫힌 회로**라 서로 독립이 아니다. 방출을
+  // 열면 회로에서 기체가 빠져 P+ 만이 아니라 P− 도 내려가고, 유입을 열면 P− 만이
+  // 아니라 P+ 도 오른다. SISO 두 개(예전 LinePID)는 서로의 작용을 외란으로만 봐서
+  // 160 목표에서 정착에 120 초가 걸렸고 40~50 초 주기로 왕복했다.
+  //
+  // 실측(rail_map.py, 21점)에서 구조가 거의 **삼각형**임이 드러났다:
+  //   · P− 는 유입이 거의 단독 결정 — 유입 +1.27 kPa/%p 대 방출 −0.32
+  //   · P+ 는 그 유입 아래에서 방출이 결정
+  // 그래서 순차적으로 푼다: 유입 = g(P−_ref), 방출 = h(P+_ref, 유입).
+  //
+  // **적분이 동작점을 만들 필요가 없어지는 것**이 요점이다. 예전에는 u 의 거의
+  // 전부를 적분이 만들었고(정착 시 u 46 중 적분 46) 그래서 동작점이 바뀔 때마다
+  // 적분이 처음부터 다시 쌓여야 했다. 채널 쪽 kv 피드포워드와 같은 구조다.
+  struct RailFF {
+    bool enable{false};
+    std::vector<double> admit_pneg, admit_u;                 // P− → 유입 %
+    std::vector<double> vent_admit;                          // 곡선의 유입 수준
+    std::vector<std::vector<double>> vent_ppos, vent_u;      // 곡선별 P+ → 방출 %
+    // 국소 이득 |dP+/d방출| 가 1.67~9.88 kPa/%p 로 **5.9 배** 달라진다 (최대 이득
+    // 위치가 유입에 따라 움직인다). 고정 게인으로는 한쪽이 과하고 다른 쪽이 무의미하다.
+    double gain_ref{0.0}, gain_min{0.3}, gain_max{3.0};
+
+    static double interp(const std::vector<double>& xs,
+                         const std::vector<double>& ys, double x);
+    double admit_at(double p_neg) const;
+    double vent_at(double p_pos, double admit) const;
+    double vent_slope(double p_pos, double admit) const;     // |dP+/d방출|
+    bool ok() const {
+      return enable && admit_pneg.size() >= 2 && !vent_admit.empty();
+    }
+    // 표가 덮는 범위. **밖을 목표로 주면 ff 가 끝값에 붙고 PID 와 싸운다** —
+    // 20260912 에 P− 목표 62 (표 상한 56.5 밖) 를 줬더니 ff 는 유입 100 을,
+    // PID 는 "유입을 닫아라" 를 동시에 내서 개도가 0 이 됐다. 유입은 펌프
+    // 흡입구라 0 이면 펌프가 굶어 P+ 도 못 오른다.
+    double pneg_min() const { return admit_pneg.front(); }
+    double pneg_max() const { return admit_pneg.back(); }
+    double ppos_min() const;
+    double ppos_max() const;
+  };
+  RailFF rail_ff_;
+  double rail_pp_prev_{0.0};   // 진단: 직전 주기의 P+ (펌프 정지 감지)
+  double rail_u_pos_{0.0}, rail_u_neg_{0.0}, rail_gs_pos_{1.0};  // 진단용 스냅샷
+  // 레일 상태를 토픽으로도 낸다. 모드 0 에서는 pressure_ref_dbg 가 안 나와서
+  // pp_monitor 의 레일 Ref 칸이 **비어 있었다** — 목표가 바뀌었는지 화면으로
+  // 확인할 방법이 없었다.
+  //   controller/rail_dbg : [P+목표, P−목표, ff방출, ff유입, 개도방출, 개도유입]
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_rail_dbg_;
+
+  // ── 레일 목표를 런타임에 받는다 ────────────────────────────────────────
+  //   controller/rail_ref_kpa : [P+ 목표, P− 목표]  (Float64MultiArray, kPa abs)
+  // yaml 의 LinePID.{pos,neg}.ref 를 덮어쓴다. **control_mode 2 에서는 무시된다** —
+  // 그때는 PressureRefGen 이 매 틱 레일 셋포인트를 다시 쓰므로 외부 값이 곧
+  // 지워지고, 두 주인이 싸우는 상태가 된다.
+  // NaN 이면 "아직 안 받았다" = yaml 값을 그대로 쓴다.
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_rail_ref_;
+  std::atomic<double> rail_ref_pos_{std::numeric_limits<double>::quiet_NaN()};
+  std::atomic<double> rail_ref_neg_{std::numeric_limits<double>::quiet_NaN()};
+  double rail_ref_pos_min_{101.325}, rail_ref_pos_max_{250.0};
+  double rail_ref_neg_min_{10.0},    rail_ref_neg_max_{101.325};
   PidGains pid_pos_;
   PidState pid_pos_state_;
   double pid_out_min_{0.0}, pid_out_max_{100.0};
@@ -942,8 +750,8 @@ private:
   // 무차원이라 "레일이 이번 스텝 수요의 몇 %를 못 대면 부스트를 부른다"로 읽힌다.
   std::vector<double> gen_starve_pos_, gen_starve_neg_;   // 진단용 [%]
 
-  // gid → MPC 조회 (macro 게이트 설정용)
-  AcadosMpc* mpc_for_gid(int gid) const;
+  // gid → 채널 제어기 조회
+  PressureCtrl* ctrl_for_gid(int gid) const;
 
   // 생성기 결과 ZOH (생성기 주기 사이 유지)
   std::vector<double> gen_pos_ref_kpa_, gen_neg_ref_kpa_;
@@ -978,14 +786,6 @@ private:
   double dt_meas_sec_{-1.0};
   std::chrono::steady_clock::time_point last_tick_time_{};
   double dt_ctrl_sec_{0.002};        // 이번 틱에 실제로 쓰는 dt
-  // ── 실행 중 켜고 끌 수 있는 보강 ──────────────────────────────────────
-  // 파라미터 콜백이 갱신하고, on_timer 가 매 틱 각 MPC 의 cfg_.aug 로 밀어 넣는다.
-  // 값 자체는 콜백 스레드와 제어 스레드가 함께 만지므로 뮤텍스로 보호한다.
-  ControlAug aug_{};
-  std::mutex aug_mtx_;
-  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr aug_cb_;
-  void declare_aug_params();
-  void push_aug_to_mpcs();
   bool   sensor_zeroed_{true};   // true = use YAML offsets directly (no auto-calib at startup)
   // 보드별 "프레임을 한 번이라도 받았나". 전부 받기 전에는 제어를 시작하지 않는다.
   std::array<bool, 16> sensor_seen_{};

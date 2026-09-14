@@ -31,8 +31,7 @@ include_directories(include)
 add_executable(pp_controller
   src/Controller.cpp
   src/PressureRefGen.cpp
-  src/Mppi.cpp
-  src/MppiSystem.cpp
+  src/PressureCtrl.cpp
   src/controller_main.cpp
 )
 
@@ -152,6 +151,12 @@ if(CANLIB_LIBRARY)
   )
 endif()
 
+# Teensy 프레임 해독기 검증 — 실기 캡처(test/data/teensy_5s.bin)로 돌린다.
+# ROS·CAN 에 의존하지 않으므로 **하드웨어 없이** 언제든 돌릴 수 있다.
+#   ./build/can_powerpack/test_teensy_frame src/can_powerpack/test/data/teensy_5s.bin
+add_executable(test_teensy_frame test/test_teensy_frame.cpp)
+target_include_directories(test_teensy_frame PRIVATE include)
+
 # (2) Python 스크립트 설치
 install(PROGRAMS
   scripts/dashboard.py
@@ -159,6 +164,13 @@ install(PROGRAMS
   scripts/preflight.sh
   scripts/encoder_calib.py
   scripts/can_monitor.py
+  scripts/teensy_monitor.py
+  scripts/sensor_monitor.py
+  scripts/actuator_map.py
+  scripts/angle_ctrl.py
+  scripts/rail_map.py
+  scripts/rail_ref.py
+  scripts/rail_live.py
   scripts/can_control.py
   scripts/can_test.py
   scripts/log_topics.py
@@ -172,6 +184,7 @@ install(PROGRAMS
   scripts/chamber_volume_from_log.py
   scripts/position_ref_client.py
   scripts/pressure_sweep_server.py
+  scripts/sensor_zero.py
   scripts/valve_fit_model.py
   scripts/valve_fit_record.py
   scripts/valve_fit_solve.py
