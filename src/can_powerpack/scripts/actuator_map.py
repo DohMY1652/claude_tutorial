@@ -476,6 +476,10 @@ def main() -> int:
                     help="차압을 **직접 나열**한다 [kPa], 쉼표. --diff-start/stop/step 대신. "
                          "중력 토크가 m·g·L·sin(θ) 라 위로 갈수록 각도가 차압에 "
                          "민감해진다 — 등간격으로는 위쪽이 통째로 묻힌다")
+    ap.add_argument("--preset-ref", default="57.1,60.0", metavar="DIFF,ANGLE",
+                    help="--preset 이 차압을 역산할 **실측 기준점** '차압[kPa],각도[°]'. "
+                         "기본은 1축(57.1 kPa → 60.0°). 축마다 강성이 다르므로 그 축에서 "
+                         "한 점 아는 값을 준다 — 2축은 55,49.3 이다")
     ap.add_argument("--preset", choices=("lift90",), default=None,
                     help="lift90 = 0~85° 를 고르게 훑는 차압 목록을 자동으로 만든다. "
                          "--mass/--link 와 1축 실측(차압 40 → 46.9°)에서 계산한다")
@@ -531,12 +535,70 @@ def main() -> int:
     ap.add_argument("--connect-timeout", type=float, default=30.0)
     ap.add_argument("--send-hz", type=float, default=20.0)
     ap.add_argument("--out", default=None, help="CSV 경로 (기본 ~/result/actuator_map_<ts>.csv)")
+    ap.add_argument("--recalib", metavar="CSV", default=None,
+                    help="엔코더 2점 보정을 다시 잡았을 때, **이미 뜬 맵을 다시 뜨지 "
+                         "않고 각도를 고친다.** raw 카운트는 옛 보정에서 정확히 "
+                         "역산되므로(선형·가역) 손실이 없다. --old-raw / --new-raw 필요")
+    ap.add_argument("--old-raw", default=None, metavar="R0,R90",
+                    help="이 CSV 를 뜰 때 쓰던 raw_0deg,raw_90deg")
+    ap.add_argument("--new-raw", default=None, metavar="R0,R90",
+                    help="새로 잰 raw_0deg,raw_90deg")
     ap.add_argument("--analyze", default=None, metavar="CSV",
                     help="측정 CSV 를 읽어 왕복 두 곡선에서 **마찰을 분리**한다. "
                          "실기에 아무것도 보내지 않는다")
     ap.add_argument("--dry-run", action="store_true", help="계획만 찍고 끝낸다")
     ap.add_argument("--yes", action="store_true", help="확인 프롬프트를 건너뛴다")
     args = ap.parse_args()
+
+    if args.recalib:
+        if not (args.old_raw and args.new_raw):
+            ap.error("--recalib 에는 --old-raw 와 --new-raw 가 둘 다 필요하다")
+        try:
+            o0, o90 = (float(v) for v in args.old_raw.split(","))
+            n0, n90 = (float(v) for v in args.new_raw.split(","))
+        except ValueError:
+            ap.error("--old-raw / --new-raw 는 'R0,R90' 형식이다")
+        # 옛 보정:  deg_old = (raw − o0)·90/(o90 − o0)
+        # 새 보정:  deg_new = (raw − n0)·90/(n90 − n0)
+        # raw 를 소거하면 deg_new = A·deg_old + B 로 딱 떨어진다. 선형·가역이라
+        # 원본 raw 를 다시 안 봐도 손실 없이 고칠 수 있다 — 다시 뜰 필요가 없다.
+        so = (o90 - o0) / 90.0
+        sn = (n90 - n0) / 90.0
+        if abs(sn) < 1e-9:
+            ap.error("새 보정의 두 점이 같다")
+        A, B = so / sn, (o0 - n0) / sn
+        src = os.path.expanduser(args.recalib)
+        dst = (os.path.expanduser(args.out) if args.out
+               else src.replace(".csv", "_recal.csv"))
+        kmax = args.mass * G * args.link
+        rows = list(csv.DictReader(open(src, newline="", encoding="utf-8")))
+        if not rows:
+            print("[중단] 빈 CSV 다.", file=sys.stderr); return 2
+        with open(dst, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            lo = hi = None
+            for r in rows:
+                th = A * float(r["angle_deg"]) + B
+                lo = th if lo is None else min(lo, th)
+                hi = th if hi is None else max(hi, th)
+                r["angle_deg"] = f"{th:.3f}"
+                if "angle_std_deg" in r:      # 표준편차는 **기울기만** 곱한다
+                    r["angle_std_deg"] = f"{abs(A) * float(r['angle_std_deg']):.3f}"
+                if "tau_grav_Nm" in r:
+                    tau = kmax * math.sin(math.radians(th - args.angle_offset))
+                    r["tau_grav_Nm"] = f"{tau:.4f}"
+                    if "force_N" in r:
+                        r["force_N"] = (f"{tau / (args.reel_dia / 2.0):.2f}"
+                                        if args.reel_dia > 0 else "nan")
+                w.writerow(r)
+        print(f"옛 보정 {so:+.3f} → 새 {sn:+.3f} 카운트/도")
+        print(f"  deg_new = {A:.5f}·deg_old {B:+.3f}")
+        print(f"  각도 범위 → {lo:.2f} ~ {hi:.2f}°")
+        print(f"[기록] {dst}  ({len(rows)} 행)")
+        print(f"  ⚠ 마찰(kPa)은 그대로지만 **플랜트 기울기 kPa/° 가 ×{1/A:.3f}** 로 "
+              "바뀐다 — angle_ctrl 기동 출력에서 확인할 것")
+        return 0
 
     if args.analyze:
         return analyze(args.analyze, args)
@@ -552,11 +614,17 @@ def main() -> int:
     args.diff_list = None
     if args.preset == "lift90":
         # 목표 각도를 고르게 잡고 **거기에 필요한 차압**을 역산한다.
-        #   τ(θ) = m·g·L·sin(θ),  τ = k·차압   (k 는 아래 실측에서)
-        # 실측 기준점: 1축에서 차압 40 kPa → 46.9° (20260912_210653)
-        #   k = 2.943·sin(46.9°)/40 = 0.0537 N·m/kPa
+        #   τ(θ) = m·g·L·sin(θ),  τ = k·차압   (k 는 실측 기준점에서)
         # 등간격 차압으로 뜨면 위쪽이 묻힌다 — 60°→90° 가 차압 7 kPa 안에 들어간다.
-        k = args.mass * G * args.link * math.sin(math.radians(46.9)) / 40.0
+        #
+        # 기준점은 **축마다 다르다.** 기본값은 1축 실측(차압 57.1 → 60.0°, 20260914
+        # 엔코더 재보정 반영). 축2 는 훨씬 뻣뻣해 같은 차압에서 절반밖에 못 올라가므로
+        # 그대로 쓰면 목록이 통째로 모자란다 — --preset-ref 로 그 축 값을 준다.
+        try:
+            d_ref, a_ref = (float(v) for v in args.preset_ref.split(","))
+        except ValueError:
+            ap.error("--preset-ref 는 '차압,각도' 형식이다 (예: 55,49.3)")
+        k = args.mass * G * args.link * math.sin(math.radians(a_ref)) / d_ref
         tgt = [0, 10, 20, 30, 40, 50, 55, 60, 65, 70, 74, 78, 81, 83, 85]
         args.diff_list = [round(args.mass * G * args.link *
                                 math.sin(math.radians(a_)) / k, 1) for a_ in tgt]
