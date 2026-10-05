@@ -576,6 +576,21 @@ Controller::Controller(const rclcpp::NodeOptions& opts)
   // flat index: (P_neg_board_id-1)*3 + 0 = (2-1)*3+0 = 3
   pid_neg_pwm_index_ = get_param_or<int>(this, "LinePID.neg.pwm_index", 3);
 
+  rail_assist_.enable       = get_param_or<bool>  (this, "RailAssist.enable",       false);
+  rail_assist_.err_kpa      = get_param_or<double>(this, "RailAssist.err_kpa",      10.0);
+  rail_assist_.vent_eps_pct = get_param_or<double>(this, "RailAssist.vent_eps_pct",  1.0);
+  rail_assist_.delay_s      = get_param_or<double>(this, "RailAssist.delay_s",       5.0);
+  rail_assist_.gain         = get_param_or<double>(this, "RailAssist.gain",         0.15);
+  rail_assist_.max_kpa      = get_param_or<double>(this, "RailAssist.max_kpa",       6.0);
+  rail_assist_.tau_s        = get_param_or<double>(this, "RailAssist.tau_s",         3.0);
+  if (rail_assist_.enable)
+    RCLCPP_INFO(get_logger(),
+      "공급 구제(RailAssist): 켜짐 — 양압 오차 >%.0f kPa 이고 방출 개도 <%.1f %% 가 "
+      "%.0f s 지속되면 음압 목표를 최대 %.1f kPa 완화한다 (이득 %.2f, 시정수 %.0f s). "
+      "펌프가 하나라 흡입(유입)을 열어야 토출(양압)이 오른다.",
+      rail_assist_.err_kpa, rail_assist_.vent_eps_pct, rail_assist_.delay_s,
+      rail_assist_.max_kpa, rail_assist_.gain, rail_assist_.tau_s);
+
   // ── 레일 피드포워드 표 (rail_map.py --invert 가 생성) ──────────────────
   {
     auto dvec = [&](const std::string& name) {
@@ -1098,6 +1113,10 @@ PressureCtrl::Gains Controller::load_gains(const std::string& pre, PressureCtrl:
   set("gain_scale_min",      g.gain_scale_min);
   set("gain_scale_max",      g.gain_scale_max);
   set("kv",                  g.kv);                 // 레퍼런스 속도 피드포워드
+  set("i_lead_s",            g.i_lead_s);          // 적분 접근 속도 게이팅
+  set("i_dp_min_kpa",        g.i_dp_min_kpa);      // 적분 공급 차압 게이팅
+  set("i_opp_leak_tau_s",    g.i_opp_leak_tau_s);  // 반대 부호 적분 누설
+  set("atm_boost_pct",       g.atm_boost_pct);      // 대기압 반대편 회수 부스트
   return g;
 }
 
@@ -1167,6 +1186,8 @@ void Controller::build_ctrls() {
     cfg.u_max_pct    = 100.0f;
     cfg.ref_rate_tau_s = (float)get_param_or<double>(this, "ChannelPID.ref_rate_tau_s", 0.3);
     cfg.ff_limit_pct   = (float)get_param_or<double>(this, "ChannelPID.ff_limit_pct",  15.0);
+    cfg.d_tau_s        = (float)get_param_or<double>(this, "ChannelPID.d_tau_s",        0.02);
+    cfg.atm_margin_kpa = (float)get_param_or<double>(this, "ChannelPID.atm_margin_kpa", 0.5);
 
     // PID 게인: 양압/음압 공통 기본값 → 채널별 오버라이드
     // 상승/하강 방향 게인을 따로 읽는다 (6단 우선순위 — gains_for 주석 참조)
@@ -1195,7 +1216,7 @@ void Controller::build_ctrls() {
     RCLCPP_INFO(get_logger(),
       "  ch%-2d %s | 상승 kp=%.3f(far %.3f, 경계 %.1f) ki=%.3f(far %.3f) kd=%.4f i_lim=%.0f%%"
       " | 하강 kp=%.3f(far %.3f, 경계 %.1f) ki=%.3f(far %.3f) kd=%.4f i_lim=%.0f%%"
-      " | i_db=%.2f 스텝리셋>%.1f kPa"
+      " | i_db=%.2f 스텝리셋>%.1f kPa i_lead=%.2f/%.2f s d_tau=%.3f s"
       " | 여유 mi %.2f / at %.2f %%p, 데드존 micro %s atm %s",
       g, k.is_positive ? "양압" : "음압",
       (double)k.g_up.kp, (double)k.g_up.kp_far, (double)k.g_up.kp_break_kpa,
@@ -1204,6 +1225,7 @@ void Controller::build_ctrls() {
       (double)k.g_down.ki, (double)k.g_down.ki_far, (double)k.g_down.kd,
       (double)k.g_down.i_limit_pct,
       (double)k.g_up.i_deadband_kpa, (double)k.g_up.i_reset_on_step_kpa,
+      (double)k.g_up.i_lead_s, (double)k.g_down.i_lead_s, (double)k.d_tau_s,
       dz_margin_ch_[(size_t)g][PressureCtrl::V_MICRO],
       dz_margin_ch_[(size_t)g][PressureCtrl::V_ATM],
       dz_desc(dz_ch_[(size_t)g][PressureCtrl::V_MICRO]).c_str(),
@@ -1635,7 +1657,8 @@ void Controller::on_timer() {
                  zoh_[(size_t)pid_neg_pwm_index_] / 40.95,
                  filt_out_[P_pos_board_id_ - 1], filt_out_[P_neg_board_id_ - 1],
                  rail_u_pos_, pid_pos_state_.integ * pid_pos_.ki, rail_gs_pos_,
-                 rail_u_neg_, pid_neg_state_.integ * pid_neg_.ki};
+                 rail_u_neg_, pid_neg_state_.integ * pid_neg_.ki,
+                 rail_assist_kpa_};   // 공급 구제로 완화 중인 음압 목표 [kPa]
       pub_rail_dbg_->publish(rd);
     }
 
@@ -1964,14 +1987,39 @@ void Controller::on_timer() {
     if (pid_pos_pwm_index_ >= 0 && pid_pos_pwm_index_ < PWM_TOTAL) {
       zoh_[(size_t)pid_pos_pwm_index_] = pwm;
     }
+
+    // ── 공급 구제: 양압에 남은 권한이 없으면 음압 목표를 완화한다 ──────────
+    // 방출을 다 닫았는데도 오차가 남으면 양압 루프가 할 수 있는 일은 없다.
+    // 펌프가 하나라 토출을 늘리려면 흡입(유입)을 열어야 하고, 그러려면 음압
+    // 목표를 일시적으로 올려 줘야 한다. 자세한 근거는 Controller.hpp 의
+    // RailAssist 주석 참조.
+    if (rail_assist_.enable) {
+      const bool saturated = (inverted_u <= rail_assist_.vent_eps_pct) &&
+                             (err > rail_assist_.err_kpa);
+      // 과도 구간에서 잠깐 닫히는 것만으로 발동하면 안 된다 — 지속 시간을 센다.
+      rail_sat_s_ = saturated ? (rail_sat_s_ + dt) : 0.0;
+      const double want = (saturated && rail_sat_s_ >= rail_assist_.delay_s)
+                            ? std::clamp(rail_assist_.gain * err, 0.0, rail_assist_.max_kpa)
+                            : 0.0;
+      // 계단으로 넣고 빼면 음압이 출렁인다. 1차 지연으로 밀어 넣는다.
+      const double a = (rail_assist_.tau_s > 1e-6)
+                         ? (dt / (rail_assist_.tau_s + dt)) : 1.0;
+      rail_assist_kpa_ += a * (want - rail_assist_kpa_);
+      if (!std::isfinite(rail_assist_kpa_)) rail_assist_kpa_ = 0.0;
+    } else {
+      rail_sat_s_ = 0.0; rail_assist_kpa_ = 0.0;
+    }
   }
 
   // -------------------------------------------------------------
   // [음압 라인 PID] (Negative Line)
   // -------------------------------------------------------------
   {
-    const double err = P_line_neg_kPa - pid_neg_.ref; 
-    
+    // 공급 구제가 걸려 있으면 목표를 그만큼 **올린다**(= 진공을 얕게 한다).
+    // 유입이 더 열리고 펌프가 질량유량을 받아 양압이 오른다.
+    const double neg_ref_eff = pid_neg_.ref + rail_assist_kpa_;
+    const double err = P_line_neg_kPa - neg_ref_eff;
+
     pid_neg_state_.integ += err * dt;
     if (pid_neg_.ki > 1e-6) {
       const double ilim = std::abs(pid_neg_.i_limit) / pid_neg_.ki;
@@ -1989,7 +2037,7 @@ void Controller::on_timer() {
 
     // 유입 개도는 P− 목표가 거의 단독으로 정한다 (실측 +1.27 kPa/%p 대 방출 −0.32).
     const double ff_admit = rail_ff_.ok()
-        ? std::clamp(rail_ff_.admit_at(pid_neg_.ref), pid_out_min_, pid_out_max_)
+        ? std::clamp(rail_ff_.admit_at(neg_ref_eff), pid_out_min_, pid_out_max_)
         : pid_out_max_;
     rail_u_neg_ = u;
     const double open_raw_n = ff_admit - u;
