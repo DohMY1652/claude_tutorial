@@ -4,9 +4,13 @@
 그대로 이어받고, 그 위에 **물리 기반(port-Hamiltonian) nominal 모델 + passivity 가
 보장되는 NN residual 모델**을 만들기 위한 데이터 수집과 모델링을 한다.
 
-```zsh
-git checkout DMY_actuator_variance && git checkout -b DMY_ph_residual
-```
+워크스페이스 루트는 `/home/risebrl/passivity_model` 이다. 다른 문서의
+`~/claude_tutorial` 은 이 경로로 읽는다. 루트 `AGENTS.md` 는 이 파일의 심볼릭 링크다.
+
+압력 제어 기준은 원격 부모 브랜치의 `f3cd4af` 까지의 코드·활성 설정 조합이다
+(2026-10-05 병합: `4b0e783`, `2c1ac21`, `f3cd4af`). 이 기준에는 압력 제어 개선,
+계측 도구, 개체 대장이 포함된다. 이후 측정 중 압력 제어 설정은 고정한다.
+이 병합은 실기 검증이나 빌드 성공을 뜻하지 않는다.
 
 사용자와는 **한국어**로 대화한다. 코드 식별자·커밋 메시지는 영어, 주석은 기존 코드처럼
 한국어 허용.
@@ -31,11 +35,15 @@ git checkout DMY_actuator_variance && git checkout -b DMY_ph_residual
 **확정된 운용 결정 (사용자):**
 
 - 실험은 **1축만** 쓴다. 채널(양압 gid 0, 음압 gid 6, 엔코더 인덱스 0)은 바꾸지 않고
-  **액추에이터만 교체**한다.
+  **액추에이터와 그에 귀속된 엔코더를 함께 교체**한다. 액추에이터 ID 에 따라
+  엔코더 보정값도 1축 칸에 함께 적용한다 (§5.5).
 - **최대 진공까지 사용 가능**하다.
 - **문서·논문·설명과 코드의 값이 상반되면 코드의 값을 쓴다.** 기준은 활성 설정
   `src/can_powerpack/config/powerpack_config.yaml` 과 스크립트 기본값이다
-  (`config/best/` 는 기준이 아니다).
+  (`config/best/` 는 기준이 아니다). 실제 실행값은 launch 가 뒤에 병합하는
+  `valve_params.yaml`, `pump_params.yaml`, `encoder_params.yaml`(존재할 때)과
+  launch override 까지 확인·기록한다. 기존 코드 기본값과 이 문서의 신규 요구사항을
+  구분한다. 특히 기존 각도 기본 상한 125° 로 이 브랜치의 88° 안전 규칙을 완화하지 않는다.
 
 ---
 
@@ -47,15 +55,21 @@ git checkout DMY_actuator_variance && git checkout -b DMY_ph_residual
 4. `src/can_powerpack/scripts/actuator_map.py` — 이 브랜치 실행기의 원형(안전 감시·슬루·대기압 램프)
 5. `src/can_powerpack/scripts/pressure_sweep_server.py` — TCP 패킷 형식(`encode_refs`, `_refs`, `_connect`)
 
+이어서 `src/can_powerpack/docs/액추에이터_개체_대장.md` 의 개체별 보정값과
+`src/can_powerpack/docs/압력제어_튜닝_인수인계.md` 의 갱신된 제어 기준을 확인한다.
+과거 인수인계 문서의 축별 보정값을 새 개체에 그대로 적용하지 않는다.
+
 ---
 
 ## 2. 항상 지킬 것
 
 ### 2.1 부모 브랜치 규칙 (그대로 유지)
 
-- **`control_mode:=0`** 으로 런치한다. 기본값 2 로 띄우면 `PressureRefGen` 이 매 틱
+- 실기 운용 시 **`control_mode:=0 axis:=0`** 으로 런치한다. launch 의 `axis:=0` 은
+  물리 1축이며 실행기의 `--axis 1` 과 번호 기준이 다르다. 기본값 2 로 띄우면 `PressureRefGen` 이 매 틱
   레퍼런스를 덮어써 외부 지령이 안 먹는다. 기동 로그에
-  `RefTcpServer [PRESSURE ALL mode]: port 2293 — expects [12 doubles...]` 가 떠야 한다.
+  `RefTcpServer [PRESSURE ALL mode]: port 2293 — expects [12 doubles: P+ axes then P- axes, kPa abs]`
+  가 떠야 한다. 1축 운용도 TCP 는 12채널 패킷을 유지한다.
 - **밸브 모델을 쓰지 않는다.** 채널 제어는 PID + 실측 데드존 표뿐이다.
 - **압력 제어 설정을 건드리지 않는다.** 채널 PID·데드존 표·`i_limit_pct`·레일 게인은
   현재 상태 유지 — 바뀌면 축간·개체간 비교의 기준이 흔들린다.
@@ -64,14 +78,16 @@ git checkout DMY_actuator_variance && git checkout -b DMY_ph_residual
 - **90° 위는 정적으로 불안정하다.** 각도 상한 88° 를 반드시 건다.
 - **진동은 절대 안 된다. 액추에이터가 깨진다.** 느려도 되니 천천히. 레퍼런스에 계단을 주지 않는다.
 - **중단은 실행 스크립트에서 Ctrl-C 한 번** → 양 챔버를 대기압까지 램프. 런치를 먼저 죽이지 않는다.
-- **살아 있는 `/pack2` 네임스페이스에 발행 노드를 더 띄우지 않는다.** 새 노드는 **구독만** 한다.
-  `board/pwm_cmd` 를 둘이 발행하면 지령이 섞인다.
+- **`board/pwm_cmd` 발행자를 추가하지 않는다.** T2 는 ROS **구독만** 하고 압력 목표는
+  TCP 로 보낸다. 지정된 기존 `rail_ref.py` 는 별도 운용하는 레일 목표 발행기이며
+  `controller/rail_ref_kpa` 만 발행한다. 레일 목표 발행자도 중복 기동하지 않는다.
 - 과압 소프트웨어 가드를 새로 걸지 않는다(양압 레일 릴리프 270~280 kPa, 펌프 고정 회전수).
 - 빌드는 반드시 워크스페이스 루트에서:
   ```zsh
   cd /home/risebrl/passivity_model && source /opt/ros/humble/setup.zsh
-  colcon build --packages-select can_powerpack --cmake-args -DCMAKE_BUILD_TYPE=Release
+  colcon build --packages-up-to can_powerpack --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
   ```
+  의존성 `qpoases_vendor` 까지 빌드하며, 기존 워크스페이스와 같은 symlink-install 을 쓴다.
 
 ### 2.2 이 브랜치에서 추가로 지킬 것
 
@@ -92,12 +108,12 @@ git checkout DMY_actuator_variance && git checkout -b DMY_ph_residual
 
 ## 3. 하드웨어·인터페이스 요약 (코드 분석 결과)
 
-### 3.1 노드 구성 (`ros2 launch can_powerpack control.launch.py control_mode:=0`)
+### 3.1 노드 구성 (실기 운용 시 `control_mode:=0 axis:=0`)
 
 | 노드 | 역할 |
 | --- | --- |
-| `can_bridge` | CAN(밸브 보드) + Teensy 엔코더(시리얼 500 Hz). `board/sensors`, `board/analog`, `board/analog_raw`, `board/rx_hz` 발행 |
-| `pp_controller` | 500 Hz. 채널 압력 PID + 데드존 FF + 레일(라인) PID. **TCP 2293 으로 압력 레퍼런스 수신** |
+| `can_bridge` | CAN(밸브 보드) + Teensy 엔코더(코드상 기대 수신율 200 Hz). `sensor_period_ms=5` 로 센서 토픽 공칭 200 Hz 발행. 실제 수신율은 실측 확인 |
+| `pp_controller` | 센서 콜백 기준 공칭 200 Hz (`period_ms=5`). 채널 압력 PID + 데드존 FF + 레일(라인) PID. **TCP 2293 으로 압력 레퍼런스 수신** |
 | `pp_logger` | 100 Hz CSV + `meta.json` → `~/result/<YYYYMMDD_HHMMSS>/` |
 | `pp_monitor` | 실시간 표(팝업) |
 
@@ -105,10 +121,16 @@ git checkout DMY_actuator_variance && git checkout -b DMY_ph_residual
 
 - TCP 클라이언트로 `127.0.0.1:2293` 에 접속해 **little-endian double 12개(96 B)** 를 반복 전송.
 - 순서: `[축1 P+, …, 축6 P+, 축1 P−, …, 축6 P−]`, 단위 **kPa absolute** (대기압 `ATM_KPA = 101.325`).
-- 컨트롤러는 마지막 목표를 유지한다. TCP 가 끊기면 마지막 값이 남으므로 종료 경로에서
-  반드시 전 채널 대기압을 여러 번 보낸다(`_send_atmosphere`).
-- 재사용: `pressure_sweep_server.encode_refs`, `_refs`, `_connect`, `actuator_map.Guard`, `RigView`,
-  `valve_deadzone.read_config`.
+- `RefTcpServer.enable=true`, `all_channels=true` 가 전제다. 컨트롤러는 TCP 단절 시에도
+  마지막 목표를 유지한다. 종료는 중단 사유 기록 → `Driver` 로 대기압 목표까지 램프
+  → 대기압 목표 5 s 반복 송신·기록 → 연결 종료 순서다. 다른 10채널은 항상 대기압 목표다.
+  `_send_atmosphere()` 자체는 즉시 대기압 패킷을 보내므로 복귀 램프를 대체하지 못한다.
+  목표 송신 완료와 실측 대기압 도달을 구분하며, 실측값·송신 실패를 따로 기록한다.
+  이미 TCP 가 끊긴 경우 램프 복귀를 보장할 수 없고 성공으로 기록하지 않는다.
+- 재사용: `pressure_sweep_server.encode_refs`, `_refs`, `_connect`, `ATM_KPA`, `NUM_AXES`;
+  `actuator_map.RigView`, `Guard`, `Abort`, `Driver`, `goto_and_settle`, `reachable`,
+  `build_points`, `POS_BOARD`, `NEG_BOARD`; `valve_deadzone.read_config`.
+  `valve_deadzone.Rig` 는 PWM 발행자이므로 T2 에 재사용하지 않는다.
 
 ### 3.3 인덱스
 
@@ -122,21 +144,38 @@ git checkout DMY_actuator_variance && git checkout -b DMY_ph_residual
 | `pp_logger` 열 접미사 | `axis{a}` (0부터) |
 
 **이 브랜치는 1축만 쓴다:** 양압 gid 0(보드 5), 음압 gid 6(보드 11), 엔코더 인덱스 0,
-`pp_logger` 열 `axis0`. 1축 엔코더 2점 보정은 20260914 이 장비에서 실측된 값이다.
+`pp_logger` 열 `axis0`. 보정은 축이 아니라 액추에이터 ID 에 귀속된다.
+부모 `f3cd4af` 의 1축 YAML 값 `29000/9000` 은 **3번 개체** 값이며 공통 기본값이 아니다.
+개체 대장의 ID별 보정값을 확인하여 현재 장착한 개체의 값을 적용한다.
+
+갱신된 `pp_logger` 는 mode 0 에서 `angle_deg_axis0` 에 엔코더 폴백을 적용한다.
+수정 전 로그에서는 이 열이 0 으로 남을 수 있으므로 실제 각도 열 `enc_bd17_deg` 를 쓴다.
+과거 로그를 읽을 때는 기록 당시 코드·스키마를 확인한다.
 
 압력 환산: `kPa = (raw − offset[board]) × gain[board] + atm` (`valve_deadzone.read_config`).
 각도 환산: `deg = (raw − raw_0deg) × 90 / (raw_90deg − raw_0deg)` (yaml `TeensyEncoder.channels`).
 
 ### 3.4 챔버와 도달 범위
 
-- 축마다 챔버 2개: **양압 챔버 P+**(레일에서 채우고 대기로 뺌 → 대기압 **아래로 못 감**),
-  **음압 챔버 P−**(진공 레일로 빼고 대기를 넣음 → 대기압 **위로 못 감**).
+- 축마다 챔버 2개: **양압 챔버 P+**(레일에서 채우고 대기로 뺌),
+  **음압 챔버 P−**(진공 레일로 빼고 대기를 넣음). 목표는 각각 대기압 위/아래로 잡는다.
+  운동에 따른 부피 외란으로 실측이 대기압 반대편으로 넘어갈 수 있다. 갱신된 제어기는
+  이를 대기압 밸브로 회수한다. 모델의 압력 부호 가정과 맞지 않는 표본은 따로 표시한다.
 - 차압 `diff = P+ − P−` 가 팔을 들어 올린다. 공통압 `center = (P+ + P−)/2`.
-- 도달 가능 영역 (`actuator_map.reachable` 기준):
-  `P+ ∈ [103, rail_pos − 10]`, `P− ∈ [rail_neg + 10, 100]`.
-  측정 중 레일은 `rail_ref.py --hold-ref 200 30` 으로 유지한다. 그때 코드 값으로
-  **P+ ≤ 185**(채널 정격 `p_pos_max_kpa`, 레일 − 10 = 190 중 작은 쪽),
-  **P− ≥ 40**(레일 + 10, 채널 하한 `p_neg_min_kpa 27` 중 큰 쪽).
+- **기존 코드의 기본 범위:** `actuator_map` 은 YAML `LinePID` 의 160/30 을 읽어
+  `P+ ∈ [103,150]`, `P− ∈ [40,100]` 으로 계획한다. `rail_ref.py` 로 런타임 목표를
+  바꿔도 이 범위나 YAML 이 자동 갱신되지 않는다. `reachable` 는 전달된 범위만 검사하며,
+  `PositionController` 의 `p_pos_max_kpa=185`, `p_neg_min_kpa=27` 을 읽지 않는다.
+  mode 0 TCP→PID 경로도 이 위치제어 한계를 자동 적용하지 않는다.
+- **T1·T2 의 명시적 계획 기준:** 실험 레일 목표 200/30 kPa abs, 레일 여유 10 kPa,
+  측정 목표 범위 `P+ ∈ [103,min(185,200−10)] = [103,185]`,
+  `P− ∈ [max(27,30+10),100] = [40,100]` 으로 고정하고 메타데이터에 남긴다.
+  이는 목표 계획 검사이며, 실측 과압 가드를 새로 추가하는 것이 아니다.
+  이 범위가 실제로 항상 도달 가능하다고 보장하지 않는다. 부모 설정의 `RailAssist` 는
+  양압 공급 부족 시 음압 레일 목표를 최대 +6 kPa 완화할 수 있다. 실제 레일·추종 상태도
+  기록하고, 실행 중 개체별로 목표를 조용히 잘라 다른 프로파일을 만들지 않는다.
+  실기 레일 운용은 기존 `rail_ref.py --hold-ref 200 30` 을 사용자가 수행한다.
+- 위 측정 영역과 대기압 유지·진입·복귀 구간은 구분한다 (§5.2).
 - **최대 진공까지 사용 가능**하다(사용자 확정). 원 논문의 −50 kPa(게이지) 한계는 이 리그에
   적용하지 않는다.
 
@@ -164,8 +203,10 @@ git checkout DMY_actuator_variance && git checkout -b DMY_ph_residual
 | 관절각 `q` [rad] | 엔코더 각도(° → rad), 매달린 자세 0 |
 | 풀리 유효 반경 `r_e` | 릴 반경 0.025 m (`actuator_map.py --reel-dia 0.05`) |
 
-이 리그에서는 **챔버 1 은 항상 진공, 챔버 2 는 항상 양압**이다. 따라서 유효면적의
-압력 부호 전환이 없다: 챔버 1 은 항상 `A1 = A_minus(x1)`, 챔버 2 는 항상 `A2 = A_plus`.
+nominal 식의 적용 영역은 **챔버 1 의 게이지 압력 ≤ 0, 챔버 2 의 게이지 압력 ≥ 0** 이다.
+이 영역에서는 `A1 = A_minus(x1)`, `A2 = A_plus` 로 둔다. 실측이 부피 외란으로 부호를
+넘는 표본은 원본을 보존하고 별도 표시한다. 이를 임의 클리핑해 모델에 넣거나,
+확인 없이 위 식의 유효 영역으로 간주하지 않는다.
 
 ### 4.2 nominal 식
 
@@ -206,7 +247,8 @@ Hdot    = -qdot*tau_f0 + P^T y + qdot*tau_ext <= P^T y + qdot*tau_ext
 1. `P^T y == tau_act*qdot`, `qdot*tau_f >= 0`, 무입력 시 H 비증가 — 테스트로 고정.
 2. NN 은 퍼텐셜(스칼라 출력, 힘은 autodiff), 유효면적 보정(출력 y 동시 재정의),
    소산 계수(softplus ≥ 0), 잠재 이력 요소(`H_h = Σ½k_j(q−ξ_j)²`, `R_j ≥ 0`)에만 넣는다.
-3. 금지: 자유 힘 NN, 저장 에너지에 압력 의존, 자유 RNN 잠재 상태, ReLU.
+3. 금지: 자유 힘 NN, 저장 에너지에 압력 의존, 자유 RNN 잠재 상태, **NN 활성함수 ReLU**.
+   §4.2 의 명시적 기계 한계 퍼텐셜 `V_lim` 에 쓰는 `relu(z)^2 = max(0,z)^2` 는 허용한다.
 4. residual 출력층 0 초기화. 액추에이터 항 입력은 챔버 변위 `x_i`. float64.
 5. 바꿔야 할 것 같으면 먼저 사용자에게 묻는다.
 
@@ -219,7 +261,11 @@ Hdot    = -qdot*tau_f0 + P^T y + qdot*tau_ext <= P^T y + qdot*tau_ext
 1. **모든 액추에이터에 같은 프로파일.** 1축 하나에서 순차로 재므로 시간에 따른 리그 표류
    (데드존 3~5 %p/9분, 레일, 온도)가 액추에이터 차이와 섞일 수 있다. 그래서 측정마다 기준
    블록 R0 를 앞뒤로 넣고, **기준 액추에이터**를 주기적으로 다시 잰다(§5.5).
-2. **계단 금지, 슬루 제한.** 기본 최대 기울기 2 kPa/s(빠른 램프 시험만 3 kPa/s), 종료 램프 4 kPa/s.
+2. **계단 금지, 슬루 제한은 각 챔버 목표압 기준**이다 (사용자 확정).
+   기본 `max(|dP+/dt|, |dP−/dt|) ≤ 2 kPa/s`, 빠른 램프 시험만 3 kPa/s,
+   종료 램프는 각 챔버 4 kPa/s. 중심압 고정 시 차압 기울기는 챔버 기울기의 2배다.
+   S3 의 {0.5,1,2,3} 과 S5 의 1 kPa/s 도 챔버 기준이다.
+   S6 은 중심압·차압을 합성한 최종 P+·P− 각각에서 최대 기울기를 검사한다.
 3. **모든 세그먼트는 왕복**(올림·내림) — 마찰·이력 분리.
 4. **center 를 바꾸고, 단일 챔버 시험을 넣는다** — 양압·음압 챔버 기여(`A2`, `A1`) 분리.
 5. 압력 루프 대역이 낮아(수 kPa/s) 관성·감쇠는 압력 가진으로 잘 안 드러난다. 데이터는
@@ -228,8 +274,23 @@ Hdot    = -qdot*tau_f0 + P^T y + qdot*tau_ext <= P^T y + qdot*tau_ext
 ### 5.2 공통 표기
 
 `P+ = c + d/2`, `P− = c − d/2` (kPa abs). 단일 챔버 시험은 반대쪽을 `P+ = 103` 또는 `P− = 100` 에 둔다.
-모든 점은 도달 가능 영역(§3.4)과 `d ≤ d_max` 를 만족해야 한다. `d_max` 기본 72(부모 브랜치 목록 최댓값).
-도달 불가능한 점은 `actuator_map.build_points` 처럼 빼고, 뺀 목록을 출력한다.
+측정점은 측정 목표 영역(§3.4)과 `0 ≤ d ≤ d_max` 를 만족해야 한다.
+`d_max` 기본 72 는 부모 브랜치의 계획 목록 최댓값이며, 모든 개체의 안전성을 보장하는 실측 한계가 아니다.
+정착형 목록의 불가능한 점은 생성 시 `actuator_map.build_points` 처럼 제외하고 이유·목록을 남긴다.
+이렇게 확정한 동일 프로파일을 모든 개체에 적용한다. 실행 중 자동 클리핑·점 삭제는 하지 않는다.
+
+구간은 다음처럼 명시적으로 구분한다.
+
+- `atmosphere`: 양 챔버 목표를 정확히 `ATM_KPA=101.325` 로 두고 시작·끝에 각각 5 s 유지.
+- `entry` / `release`: 대기압과 유효 측정점을 챔버별 단조 램프로 연결한다.
+  이 구간은 측정 영역의 대기압 근처 경계(P+ 103, P− 100)를 지나갈 수 있다.
+  각 챔버는 두 끝점 사이에 있고, `0 ≤ diff ≤ d_max` 및 챔버별 슬루 제한을 만족해야 한다.
+- `measurement`: §3.4 측정 목표 영역을 적용한다.
+
+`c=101.3,d=0` 은 정확한 대기압도 측정점도 아니다. R0·S3 의 0 끝점은 별도 대기압
+구간과 전이로 표현하고, `c=101.3` 을 유지하는 측정 구간은 `d ≥ 3.4` 부터다.
+S2 의 최소 유효 차압은 c=101.3/108/115 에서 각각 3.4/16/30 이다.
+대기압·전이 예외를 전체 측정 구간으로 확대하지 않는다.
 
 ### 5.3 프로파일 세트
 
@@ -244,6 +305,15 @@ Hdot    = -qdot*tau_f0 + P^T y + qdot*tau_ext <= P^T y + qdot*tau_ext
 | S5 | 소루프 | c = 101.3, 1 kPa/s 올림 중 d = 20, 40, 60 에서 −6 되돌림 후 재개, 내림도 대칭(+6) | pre-sliding·소루프(잠재 이력 요소) | 6분 |
 | S6 | 매끄러운 랜덤 | (c, d) 웨이포인트를 8~30 s 간격으로 무작위, 사이를 코사인 램프(최대 기울기 2 kPa/s), 0~15 s 무작위 유지. 학습용 시드 4개, 검증용 시드 2개, 각 10분 | 일반 궤적 학습·검증, 이후 제어 시험 | 60분 |
 
+**S1a·S4 끝점은 결정 보류다 (사용자: 설명 후 결정).** 위 표는 원안이며 그대로 실행 가능한
+확정안이 아니다. S1a 의 175−100=75, S4 의 66+12=78 은 `d_max=72` 를 넘는다.
+권장 후보는 `d_max=72` 유지, S1a 끝점 P+=172, S4 유지점 {24,48,60} 에서
+동일한 +12 접근폭 유지다. 사용자 확정 전에는 이 후보를 확정 프로파일로 구현하지 않는다.
+조용한 클리핑이나 상한 자동 확대는 금지한다.
+
+표의 모든 기울기는 **챔버압 기준**이며 대기압 끝점은 §5.2 를 따른다.
+시간은 원안의 개략치다. 챔버압 기준 속도, 진입·복귀, 끝점 확정 후 생성기가 다시 계산한다.
+
 액추에이터 하나에 약 2시간. 순서: R0 → S2 → S1a → S1b → S3 → S5 → S4 → S6 → R0.
 시간이 빠듯하면 표준 세트는 S6 를 시드 3개(학습 2, 검증 1)로 줄여 약 1.5시간으로 하고,
 액추에이터 3개만 시드 6개 전체를 돈다.
@@ -254,21 +324,36 @@ Hdot    = -qdot*tau_f0 + P^T y + qdot*tau_ext <= P^T y + qdot*tau_ext
 
 ### 5.4 안전 감시 (하나라도 걸리면 대기압 램프)
 
-`actuator_map.Guard` 와 같은 항목: 각도 [−5, 88]°, |각속도| ≤ 25 °/s, 진동(4 s 안 부호 반전 6회),
-엔코더 무갱신 1 s, 압력 추종 |오차| > 4 kPa 가 5 s 지속. 중단 시 어느 축·어떤 조건이었는지 기록.
+T2 는 `actuator_map.Guard` 에 각도 [−5, 88]°, |각속도| ≤ 25 °/s 를 명시적으로 전달한다.
+기존 CLI 기본 상한 125° 를 상속하지 않으며, 개체 측정에서 `use_angle=False` 를 쓰지 않는다.
+진동은 |각속도| < 0.5 °/s 를 제외한 유효 부호 반전 6회/4 s 로 판정한다.
+각도 ROS 메시지 무수신 1 s, 압력 추종 |오차| > 4 kPa 가 5 s 를 넘으면 중단한다.
+`RigView.angle_age()` 는 마지막 ROS 메시지 수신 나이이며 Teensy 원시 프레임 나이가 아니다.
+브리지에는 별도로 Teensy watchdog 100 ms 와 180° 대체 각도 발행이 있다.
+기존 `Guard` 는 압력값 None 을 추종 검사에서 건너뛰며 `RigView` 에는 압력 갱신 나이
+검사가 없다. 이를 센서 정상으로 해석하지 않는다. T2 구현 시 결측·비유한값·수신 나이를
+명시적으로 관리하고, 센서 유효성/무갱신 처리 기준을 정해야 한다. 기존 기능인 것처럼 쓰지 않는다.
+중단 시 어느 축·어떤 조건이었는지 기록하고 §3.2 복귀 절차를 따른다.
 처음 쓰는 액추에이터는 `--dry-run` 계획 확인 후, `--d-max 48` 로 S2 를 한 번 돌려 각도 여유를 본다.
 
 ### 5.5 액추에이터 교체 운용 (1축, 10개)
 
 - 실행기에 `--actuator A03 --mount 1` 처럼 **액추에이터 ID 와 장착 번호**를 준다
   (같은 액추에이터를 다시 달면 장착 번호를 올린다).
+- **엔코더는 액추에이터에 귀속된다 (사용자 확정).** ID별 보정값의 출처는
+  `src/can_powerpack/docs/액추에이터_개체_대장.md` 의 개체별 절이다. 1축에 장착할 때
+  그 개체의 `raw_0deg`, `raw_90deg` 를 `/pack2/can_bridge` 의
+  `TeensyEncoder.channels."0"` 에 함께 적용하고 실행 시 실제 적용 여부를 확인한다.
+  보정이 없는 새 개체는 사용자가 실측하여 등록한다. 과거 문서의 축별 표나 날짜만 보고
+  다른 개체의 값을 대신 넣지 않는다. T2 는 ID·장착 번호와 보정값의 일치를 확인하고
+  사용한 값·출처를 기록한다. 파일만 바꾸고 이미 실행 중인 브리지에도 적용됐다고 가정하지 않는다.
 - 교체 직후 확인: 텐던 장력·풀림, 대기압에서 매달린 각도(영점 이동 = 장착·텐던 길이 차이,
   그대로 기록), 짧은 R0.
 - **기준 액추에이터(예: A01)** 를 정해 매일 시작 시 R0 + S2 를 잰다 → 일간 리그 표류.
   하루 3개 정도면 3~4일.
 - 반복성: 액추에이터 2개를 탈착·재장착해 R0 + S2 를 다시 잰다(장착 편차), 다른 날 1회 더(일간 편차).
-- 축이 하나뿐이라 프레임·엔코더·릴의 영향은 모든 액추에이터에 공통이다. 개체차 비교에는
-  유리하지만, 다른 프레임으로의 일반화는 이 데이터로 주장하지 않는다.
+- 축이 하나뿐이라 프레임·릴은 공통이지만 엔코더는 개체별이다. 개체별 엔코더 보정 오차와
+  장착 오프셋을 기계적 개체차와 구분한다. 다른 프레임으로의 일반화는 이 데이터로 주장하지 않는다.
 
 ### 5.6 별도 시험
 
@@ -280,13 +365,19 @@ Hdot    = -qdot*tau_f0 + P^T y + qdot*tau_ext <= P^T y + qdot*tau_ext
 
 - 프로파일: `profiles/<id>_<seed>.csv`(열 `t_s, segment, center_kpa, diff_kpa, p_pos_ref, p_neg_ref`;
   정착형은 `idx, segment, center_kpa, diff_kpa, p_pos_ref, p_neg_ref, ramp_kpa_s`)
-  + `.json`(id, seed, 파라미터, 최대 기울기, sha256).
+  + `.json`(id, seed, 파라미터, 챔버별 최대 기울기, 명시적 압력·차압 범위,
+    구간 종류, 제외점·사유, sha256). 계획 변경은 다른 프로파일/해시로 남긴다.
 - 실행 결과: `~/result/ph/<actuator>/<YYYYMMDD_HHMMSS>_<profile>/`
   - `run.csv`: `t_mono_s, segment, ref_pos_kpa, ref_neg_kpa, p_pos_kpa, p_neg_kpa, angle_deg, angle_age_s`
     (100 Hz, 최신 수신값 표본화)
   - `points.csv`(정착형만): 점마다 정착 평균 각도·압력, 표준편차, 정착 여부 — `actuator_map` CSV 와 같은 열 이름
-  - `meta.json`: 프로파일 id·sha256, 축(1), **액추에이터 ID·장착 번호**, 레일 설정, 엔코더 보정값 스냅샷
-    (yaml 에서 읽음), git 커밋, 시작·종료 wall-clock, 중단 정보, 사용자 메모(`--note`)
+  - `meta.json`: 프로파일 id·sha256, 축(1), **액추에이터 ID·장착 번호**, 기준 코드 커밋,
+    레일 목표·실측 상태, 실제 설정 스냅샷(기본 YAML·추가 YAML·launch override 및 적용 여부),
+    엔코더 보정값·출처, git 커밋·미커밋 변경 유무, 시작·종료 wall-clock, 중단 정보,
+    복귀 목표 송신 완료/실패와 종료 시 실측 압력, 사용자 메모(`--note`).
+    `read_config()` 는 엔코더 보정을 반환하지 않는다. YAML 의
+    `/pack2/can_bridge.ros__parameters.TeensyEncoder.channels` 를 별도로 읽고,
+    실제 실행 설정과 일치하는지 확인한다.
   - `pp_logger` 는 런치가 따로 기록한다(백업·밸브 진단용). 시각 대조를 위해 시작 wall-clock 을 meta 에 남긴다.
 
 ---
@@ -295,14 +386,22 @@ Hdot    = -qdot*tau_f0 + P^T y + qdot*tau_ext <= P^T y + qdot*tau_ext
 
 | # | 작업 | 위치 | 완료 기준 |
 | --- | --- | --- | --- |
-| T0 | (사용자) 1축 엔코더 보정 상태 확인(0°·90° raw 한 번 대조) | config | 부모 문서 절차대로 |
-| T1 | **프로파일 생성기** — ROS 없음. §5.3 세트 생성, 도달영역·`d_max`·기울기 검사, 계획 그림·요약 출력, CSV+JSON 저장 | `src/can_powerpack/scripts/ph_profiles.py` | pytest: 모든 점이 도달영역 안, 최대 기울기 ≤ 설정값, 시작·끝 대기압, 같은 시드 → 같은 sha256 |
+| T0 | (사용자) 액추에이터 ID별 엔코더 보정을 1축에 적용하고 물리 0°·90° raw 대조 | config·개체 대장 | ID·보정·실행값 일치 확인 |
+| T1 | **프로파일 생성기** — ROS 없음. §5.3 세트 생성, 구간별 영역·`d_max`·챔버별 기울기 검사, 계획 그림·요약 출력, CSV+JSON 저장 | `src/can_powerpack/scripts/ph_profiles.py` | pytest: §5.2 구간별 조건, 챔버별 최대 기울기 ≤ 설정값, 시작·끝 대기압, 같은 시드·설정 → 같은 sha256 |
 | T2 | **실행·기록기** — 구독만 하는 노드 + TCP 클라이언트(50 Hz 송신, 1축 목표만 바꾸고 나머지 10채널은 대기압). 시간형 재생 + 정착형 실행, 감시, 대기압 램프, §5.7 기록. 옵션 `--dry-run`, `--actuator`, `--mount`, `--d-max`, `--note` (`--axis` 기본 1) | `src/can_powerpack/scripts/ph_run_profile.py` | `--dry-run` 이 계획·소요시간·최대 압력·최대 차압을 출력. 실기 확인은 사용자 |
 | T3 | **로더·전처리** — `run.csv` → SI 단위, 게이지 압력 `P1, P2`, `q`, 영위상 필터, `qdot` 추정, 세그먼트 분할 | `ph_model/data.py` | 합성 데이터로 단위·부호 테스트 |
 | T4 | **정특성·개체차 분석** — S2 에서 액추에이터별 `mid(θ)`, `f`(왕복 간격 절반, **각도 기준** 짝짓기), 기울기, 오프셋; S1 로 `A1`, `A2` 분리; R0·기준 액추에이터로 표류 보정; 분산 성분(개체 간 / 장착 / 일간 / 잡음) | `ph_model/analysis_static.py` | 1·2축 기존 값(§3.5)과 같은 수준이 재현됨 |
 | T5 | **nominal 모델** — §4.2 구현, §4.3 테스트 | `ph_model/nominal.py`, `geometry.py`, `kinematics.py` | 회귀값·전력 항등식·에너지 부등식·준정적 극한(올림/내림 차 = `2α_Σ|τ_act|`) 테스트 통과 |
 | T6 | **nominal vs 데이터** — 액추에이터별 파라미터(`x1_0`, `x2_0`, `M_g`, `α_Σ`, `V_el0`) 식별 후 S2·S3·S6 비교 그림 | `ph_model/fit_nominal.py` | residual 이 채울 몫의 크기·모양을 그림으로 보고 |
 | T7+ | residual(퍼텐셜 → 유효면적 → 소산 → 잠재 이력), 개체 코드 z, leave-one-actuator-out | `ph_model/` | 사용자와 단계별 합의 |
+
+위 표는 **신규 구현 요구사항**이다. 기존 `actuator_map` 은 기본 20 Hz 송신,
+시작 대기압 2 s, 복귀 목표 도착 후 1 s 유지, 정착점 CSV 만 제공한다.
+T2 는 50 Hz 송신과 100 Hz 연속 기록을 별도 시간 기준으로 처리하며 시작·끝 5 s 를 보장한다.
+`goto_and_settle()` 의 내부 반복문을 그대로 호출해 기록을 멈추지 않도록 정착 로직을 통합한다.
+기존 CSV 열 이름을 유지하되 추가 통계(압력 표준편차 등)는 명시적으로 정의한다.
+T0 는 ID별 보정 적용·확인, T1 검증은 §5.2 의 측정/대기압/전이 구간별 조건과
+챔버별 슬루를 기준으로 한다. 기존 함수를 가져오는 것만으로 이 요구가 충족되지는 않는다.
 
 작업 방식:
 
@@ -316,7 +415,9 @@ Hdot    = -qdot*tau_f0 + P^T y + qdot*tau_ext <= P^T y + qdot*tau_ext
 
 ## 7. 확정된 것과 남은 질문
 
-확정: 최대 진공 사용 가능 / 1축만 사용, 채널 고정, 액추에이터만 교체 / 값이 상반되면 코드 값.
+확정: 원격 부모 `f3cd4af` 기준 / 최대 진공 사용 가능 / 1축 채널 고정 /
+액추에이터와 엔코더는 한 개체이며 ID별 보정 동반 적용 / 슬루는 챔버압 기준 /
+측정·대기압·전이 구간 구분 / 기존 값이 상반되면 코드 값, 신규 안전 요구는 별도 준수.
 
 남은 질문:
 
@@ -324,3 +425,4 @@ Hdot    = -qdot*tau_f0 + P^T y + qdot*tau_ext <= P^T y + qdot*tau_ext
 2. 액추에이터가 DC-BiPAM(한 몸체 2챔버)인가, 챔버별 주름 수는?
 3. 관절각 0 에서의 챔버 변위 오프셋(`x1_0`, `x2_0`)을 잴 수 있는가(못 재면 식별).
 4. 링크·릴 자체 질량(중력 토크의 `m·g·L` 외 몫) — 모르면 식별.
+5. S1a·S4 끝점과 `d_max` 의 일관성: §5.3 권장 후보 설명 후 사용자 결정.
