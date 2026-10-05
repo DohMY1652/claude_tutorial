@@ -450,6 +450,78 @@ def preposition(rig: Rig, probes: list[Probe], args) -> None:
         _preposition_one_batch(rig, probes[k:k + n], args)
 
 
+# 위치잡기 피드포워드용 기존 표. main 에서 한 번 채운다 (아래 DzLookup 참조).
+DZ: "DzLookup"
+
+# ── 램프 위치잡기의 학습 기억 ────────────────────────────────────────────
+# (gid, slot) → 직전에 **실제로 유량이 나온** 지령 [%p].
+# 램프를 매번 0 에서 올리면 데드존(≈55 %p)까지 기어 올라가는 7 초가 통째로
+# 낭비다. 같은 밸브를 다시 열 때는 그때 값보다 --prepos-backoff 만큼만 아래에서
+# 시작하면 그 구간을 건너뛴다. 표(DZ)와 달리 **이번 장비에서 방금 확인한 값**이라
+# 채널이 바뀌어도 맞는다. 차압이 달라지면 크래킹도 조금 움직이므로 backoff 로
+# 여유를 둔다 — 조금 낮게 시작해 램프가 나머지를 메운다.
+PREPOS_MEM: dict = {}
+
+
+class DzLookup:
+    """yaml 에 이미 적혀 있는 데드존 표를 **위치잡기 피드포워드**로만 쓴다.
+
+    측정 정확도에는 영향이 없다 — 데드존 확정은 밸브를 닫은 상태에서 새로 훑어
+    올리며(COARSE→FINE) 하고, 표의 x 좌표도 확정 시점의 *실측* 차압을 쓴다.
+    여기서 표가 좀 틀려도 "목표 압력에 얼마나 빨리 가느냐" 만 달라진다.
+
+    채널별 표가 없으면 측별 표, 그것도 없으면 None (그때는 예전 bang-bang).
+    """
+
+    def __init__(self, path: str, num_pos: int) -> None:
+        self.ok = False
+        self.num_pos = num_pos
+        try:
+            ex = read_existing(path)
+        except Exception:
+            return
+        self.ch, self.side = ex.get("ch", {}), ex.get("side", {})
+        self.ok = bool(self.ch or self.side)
+
+    def u_at(self, gid: int, role: str, dp: float) -> float | None:
+        """차압 dp 에서의 크래킹 지령 [%]. 표 밖은 끝값으로 물린다."""
+        t = (self.ch.get(gid) or {}).get(role)
+        if t is None:
+            side = "pos" if gid < self.num_pos else "neg"
+            t = (self.side.get(side) or {}).get(role)
+        if t is None:
+            return None
+        xs, ys = t
+        if not xs:
+            return None
+        if dp <= xs[0]:
+            return ys[0]
+        if dp >= xs[-1]:
+            return ys[-1]
+        for i in range(1, len(xs)):
+            if dp <= xs[i]:
+                f = (dp - xs[i-1]) / max(1e-9, xs[i] - xs[i-1])
+                return ys[i-1] + f * (ys[i] - ys[i-1])
+        return ys[-1]
+
+
+def _prepos_dp(rig: Rig, pr: Probe, slot: int) -> float:
+    """위치잡기에 쓸 밸브(slot)의 차압 [kPa]. Probe.ref_kpa 와 같은 규약이되
+    **측정 대상 밸브가 아니라 지금 여는 밸브** 기준이다."""
+    P = rig.kpa(pr.board)
+    if P is None:
+        return 0.0
+    if slot == V_MICRO:
+        ref = rig.kpa(RAIL_POS_BOARD if pr.is_pos else RAIL_NEG_BOARD)
+        if ref is None:
+            return 0.0
+    else:
+        ref = rig.atm
+    # dir 규약: 이 밸브를 열면 챔버압이 가는 방향
+    d = +1.0 if (pr.is_pos == (slot == V_MICRO)) else -1.0
+    return max(0.0, d * (ref - P))
+
+
 def _preposition_one_batch(rig: Rig, probes: list[Probe], args) -> None:
     """챔버를 목표압 근처로 몰아간다.
 
@@ -463,8 +535,17 @@ def _preposition_one_batch(rig: Rig, probes: list[Probe], args) -> None:
     정지했다. 대신 **여는 시간**을 줄인다: --pulse-sec 주기 안에서 오차에 비례하는
     만큼만 열고 나머지는 닫는다. 밸브 시정수 25 ms 보다 충분히 긴 펄스라 유량이 나온다.
     """
-    print("    위치잡기: " + ", ".join(f"ch{p.gid}→{p.sp:.0f}" for p in probes))
-    st = {id(p): {"ok_since": None, "p_ref": None, "t_ref": 0.0, "done": False}
+    mode = ("램프(지령을 천천히 올려 목표 변화율에 맞춘다)" if args.prepos == "ramp"
+            else "서보(표 피드포워드)" if (DZ.ok and args.prepos == "servo")
+            else "bang-bang")
+    seeds = [f"ch{p.gid}" for p in probes
+             if any((p.gid, sl) in PREPOS_MEM for sl in (p.slot_up, p.slot_dn))]
+    print(f"    위치잡기[{mode}]: " + ", ".join(f"ch{p.gid}→{p.sp:.0f}" for p in probes)
+          + (f"  (학습값에서 시작: {', '.join(seeds)})" if seeds else ""))
+    st = {id(p): {"ok_since": None, "p_ref": None, "t_ref": 0.0, "done": False,
+                  # ramp 모드 상태: 지금 내보내는 개도, 그 개도가 붙은 밸브,
+                  # 직전 압력·시각 (실제 변화율을 재려고)
+                  "u": 0.0, "slot": None, "P_prev": None, "t_prev": None}
           for p in probes}
     t_end = time.monotonic() + args.prepos_timeout
     while time.monotonic() < t_end:
@@ -493,7 +574,16 @@ def _preposition_one_batch(rig: Rig, probes: list[Probe], args) -> None:
             v["ok_since"] = None
 
             # ② 못 가고 멈춰 있나 (데드존·누설 균형). 받아들일 만하면 그대로 간다.
-            if v["p_ref"] is None or abs(P - v["p_ref"]) > args.stall_kpa:
+            #
+            # ramp 모드에서는 **지령이 아직 다 안 올라갔으면 세지 않는다.**
+            # 램프는 0 에서 시작해 크래킹(≈55 %p)까지 --prepos-slew 로 기어
+            # 올라가므로 그 7 초 동안은 당연히 안 움직인다. 그걸 '멈춤' 으로
+            # 세면 stall_sec 3 초에 걸려 매번 포기한다 (20260918 에 실제로
+            # bang 이 45 초 타임아웃으로 죽던 것과 같은 자리다).
+            # "다 열었는데도 안 움직인다" 일 때만 접는 것이 이 검사의 뜻이다.
+            if args.prepos == "ramp" and v["u"] < args.drive_pct - 1e-6:
+                v["p_ref"], v["t_ref"] = P, now
+            elif v["p_ref"] is None or abs(P - v["p_ref"]) > args.stall_kpa:
                 v["p_ref"], v["t_ref"] = P, now
             elif now - v["t_ref"] >= args.stall_sec:
                 pr.close(rig)
@@ -505,13 +595,77 @@ def _preposition_one_batch(rig: Rig, probes: list[Probe], args) -> None:
                 print(f"      ch{pr.gid} {pr.note}")
                 continue
 
-            # ③ 몰아간다 — 지령은 활짝, 여는 **시간**만 오차에 비례해서 줄인다
-            duty = min(1.0, max(args.min_duty, abs(err) / max(0.1, args.full_duty_kpa)))
-            phase = (now % args.pulse_sec) / args.pulse_sec
+            # ③ 몰아간다
+            slot = pr.slot_up if err > 0 else pr.slot_dn
+            role = ROLE[slot]
+            u_dz = DZ.u_at(pr.gid, role, _prepos_dp(rig, pr, slot)) if DZ.ok else None
             pr.close(rig)
-            if phase < duty:
-                rig.set_valve(pr.board, pr.slot_up if err > 0 else pr.slot_dn,
-                              args.drive_pct)
+            if args.prepos == "ramp":
+                # ── 램프: 지령을 0 에서 천천히 올리고, 챔버가 원하는 속도로
+                #    움직이기 시작하면 거기서 멈춘다 ──────────────────────────
+                # 표를 전혀 안 쓴다. 데드존이 어디든 **스스로 찾아 올라간다.**
+                # bang-bang 은 매 펄스가 전량 유량이라 챔버가 레일까지 튀었고
+                # (20260918 ch1: 한 스텝에 175 → 200.7), 서보는 표가 틀리면
+                # 처음부터 크래킹 위/아래로 어긋난다. 램프는 둘 다 안 겪는다.
+                #
+                # 밸브가 바뀌면 (올리다 내리는 쪽으로) 처음부터 다시 올린다 —
+                # 반대 밸브의 개도를 물려받으면 그 순간 활짝 열린 셈이 된다.
+                dp_now = _prepos_dp(rig, pr, slot)
+                if v["slot"] != slot:
+                    # 기억은 차압이 비슷할 때만 쓴다. 크래킹은 차압이 커질수록
+                    # 낮아지므로(음압 atm 은 0.35 %p/kPa), 멀리 떨어진 차압의
+                    # 기억을 쓰면 오히려 크래킹 **위**에서 시작해 확 열린다.
+                    mem = PREPOS_MEM.get((pr.gid, slot))
+                    seed = None
+                    if mem and abs(mem[1] - dp_now) <= args.prepos_mem_dp:
+                        seed = mem[0]
+                    v["u"] = max(0.0, seed - args.prepos_backoff) if seed else 0.0
+                    v["slot"] = slot
+                    v["P_prev"], v["t_prev"] = None, None
+                dt = (now - v["t_prev"]) if v["t_prev"] is not None else 0.0
+                actual = ((P - v["P_prev"]) / dt) if (dt > 1e-3 and v["P_prev"] is not None) else 0.0
+                v["P_prev"], v["t_prev"] = P, now
+                # 목표 접근 속도: 오차에 비례하되 상한을 둔다. 가까워지면 저절로
+                # 느려지므로 오버슛이 안 난다.
+                want = max(-args.prepos_rate, min(args.prepos_rate, 0.5 * err))
+                # 실제가 목표보다 느리면 더 열고, 빠르면 닫는다. 이것이
+                # "지령을 천천히 움직인다" 의 구현이다.
+                # 두 단 속도. **데드존 안에서는 아무 일도 안 일어나므로 빨리
+                # 지나가고, 흐르기 시작하면 천천히** 조절한다. 한 속도로 하면
+                # 데드존(≈55 %p)까지 기어가느라 매번 몇 초를 버리거나, 빠르게
+                # 잡으면 크래킹을 지나쳐 확 열린다.
+                flowing = abs(actual) > 0.5
+                rate_pps = args.prepos_slew if flowing else args.prepos_slew_fast
+                slew = rate_pps * max(0.0, min(dt, 0.2))
+                if abs(actual) < abs(want) * 0.8:
+                    v["u"] = min(args.drive_pct, v["u"] + slew)
+                elif abs(actual) > abs(want) * 1.3:
+                    v["u"] = max(0.0, v["u"] - slew)
+                # 실제로 흐르고 있으면 그 지령을 차압과 함께 기억한다.
+                if flowing and v["u"] > 0.0:
+                    PREPOS_MEM[(pr.gid, slot)] = (v["u"], dp_now)
+                if v["u"] > 0.0:
+                    rig.set_valve(pr.board, slot, v["u"])
+            elif u_dz is not None and args.prepos == "servo":
+                # ── 서보: 크래킹(표) 위로 오차에 비례해 **연속**으로 연다 ──────
+                # 컨트롤러와 같은 구조다:  u_hw = 데드존(차압) + kp·오차
+                # 예전 방식은 밸브를 활짝 연 채 **여는 시간**만 쪼갰다(bang-bang).
+                # 데드존을 모르던 시절의 방식이라 안전했지만 느리고 거칠다 —
+                # 매 펄스마다 전량 유량이 들어갔다 나가서 압력이 톱니로 오르고,
+                # 목표 근처에서 duty 가 작아지면 한 펄스의 유량이 그대로 오버슛이다.
+                # 표가 있으면 크래킹 바로 위에서 **조금씩** 열 수 있다.
+                #
+                # 표가 틀려도 측정은 안 다친다 — 데드존 확정은 밸브를 닫고 새로
+                # 훑어 올리며 하고, 표의 x 좌표도 확정 시점의 실측 차압을 쓴다.
+                # 여기서는 "목표에 얼마나 빨리 가느냐" 만 달라진다.
+                u = u_dz + args.prepos_kp * abs(err)
+                rig.set_valve(pr.board, slot,
+                              min(args.drive_pct, max(u_dz, u)))
+            else:
+                # 표가 없는 채널/밸브 (또는 --prepos bang) 은 예전 방식 그대로.
+                duty = min(1.0, max(args.min_duty, abs(err) / max(0.1, args.full_duty_kpa)))
+                if (now % args.pulse_sec) / args.pulse_sec < duty:
+                    rig.set_valve(pr.board, slot, args.drive_pct)
     for pr in probes:
         v = st[id(pr)]
         P = rig.kpa(pr.board)
@@ -1198,7 +1352,14 @@ def yaml_block(results: list[Probe], args, existing: dict) -> str:
                 continue
             out.append("        deadzone:")
             for mk, mv in sorted((existing.get("ch_margin") or {}).get(gid, {}).items()):
-                out.append(f"          {mk}: {float(mv):g}")
+                # **반드시 소수점을 남긴다.** `:g` 는 2.0 을 "2" 로 찍는데, rclcpp 는
+                # double 파라미터에 int 가 오면 타입 검사에서 **노드를 죽인다.**
+                # 20260916: 이 한 글자 때문에 ch7 margin 이 2 로 적혀 pp_controller 가
+                # 기동에 실패했다 (ros2 node list 가 비고, rail_ref 는 "구독자 없음",
+                # pressure_id_seq 는 접속 재시도만 했다).
+                # CanBridge.cpp 상단에도 같은 함정이 주석으로 남아 있다.
+                out.append(f"          {mk}: {float(mv):.6g}"
+                           + ("" if "." in f"{float(mv):.6g}" else ".0"))
             for role in ("micro", "atm", "macro"):
                 if role not in ch[gid]:
                     continue
@@ -1419,6 +1580,41 @@ def parse_args():
                    help="정밀 램프에서 연속 몇 스텝 넘어야 확정하나. 기본 2")
 
     g = ap.add_argument_group("위치잡기·안정화")
+    g.add_argument("--prepos", choices=("servo", "bang", "ramp"), default="servo",
+                   help="목표압까지 몰아가는 방식.\n"
+                        "servo = 기존 데드존 표를 피드포워드로 쓰고 오차에 비례해 연다 (빠르다. "
+                        "표가 틀리면 처음부터 크래킹 위/아래로 어긋난다).\n"
+                        "bang  = 예전 방식(밸브 활짝 + 시간 쪼개기). 매 펄스가 전량 유량이라 "
+                        "작은 챔버에서는 압력이 레일까지 튄다.\n"
+                        "ramp  = 지령을 0 에서 --prepos-slew 로 천천히 올려 챔버가 "
+                        "--prepos-rate 로 움직이기 시작하면 멈춘다. **표를 안 쓰고** "
+                        "유량도 필요한 만큼만 낸다 — 표가 없거나 못 믿을 때, 챔버가 작을 때 쓴다.\n"
+                        "**측정 정확도와는 무관하다** — 데드존 확정은 밸브를 닫고 새로 "
+                        "훑어 올리며 하고, 표의 x 좌표도 실측 차압을 쓴다.")
+    g.add_argument("--prepos-slew", type=float, default=8.0,
+                   help="[--prepos ramp] 위치잡기 지령을 올리고 내리는 속도 [%%p/s]. "
+                        "낮출수록 부드럽지만 느리다. 8 이면 크래킹(≈55 %%p)까지 7 초")
+    g.add_argument("--prepos-slew-fast", type=float, default=60.0,
+                   help="[--prepos ramp] **아직 유량이 없을 때** 지령을 올리는 속도 "
+                        "[%%p/s]. 데드존 안에서는 아무 일도 안 일어나므로 빨리 지나간다. "
+                        "60 이면 크래킹(≈55 %%p)까지 1 초. 흐르기 시작하면 "
+                        "--prepos-slew 로 떨어진다")
+    g.add_argument("--prepos-mem-dp", type=float, default=12.0,
+                   help="[--prepos ramp] 학습값을 재사용할 차압 허용 범위 [kPa]. "
+                        "이보다 멀면 0 에서 다시 올린다 — 차압이 크게 다르면 크래킹도 "
+                        "달라 기억값이 오히려 크래킹 위가 된다")
+    g.add_argument("--prepos-backoff", type=float, default=5.0,
+                   help="[--prepos ramp] 같은 밸브를 다시 열 때, 직전에 유량이 나온 "
+                        "지령보다 이만큼 **아래**에서 램프를 시작한다 [%%p]. "
+                        "0 이면 학습을 끄고 항상 0 에서 올린다. 차압이 달라지면 "
+                        "크래킹도 조금 움직이므로 여유를 둔다")
+    g.add_argument("--prepos-rate", type=float, default=8.0,
+                   help="[--prepos ramp] 목표로 삼는 챔버 접근 속도 상한 [kPa/s]. "
+                        "실제가 이보다 느리면 지령을 올리고 빠르면 내린다. "
+                        "작게 잡을수록 유량이 적어 챔버가 안 튄다")
+    g.add_argument("--prepos-kp", type=float, default=0.8,
+                   help="servo 위치잡기의 비례 이득 [%%p per kPa]. 크래킹 위로 "
+                        "얼마나 더 여느냐다. 오버슛이 크면 내린다")
     g.add_argument("--drive-pct", type=float, default=70.0,
                    help="위치잡기에 쓰는 밸브 지령 [%%]")
     g.add_argument("--full-duty-kpa", type=float, default=6.0,
@@ -1533,7 +1729,10 @@ def wait_rails(rig: Rig, args, cfg) -> None:
 
 
 def main() -> int:
+    global DZ
     args = parse_args()
+    # 위치잡기에 쓸 기존 데드존 표. 없으면 예전 bang-bang 으로 내려간다.
+    DZ = DzLookup(args.yaml, N_AXES)
 
     if isinstance(args.table_range, str):
         lo, hi = (float(v) for v in args.table_range.replace(" ", "").split(","))

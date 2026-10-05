@@ -140,6 +140,9 @@ class Guard:
     enc_timeout: float
     osc_window: float
     osc_flips: int
+    # 액추에이터를 안 달고 도는 경우 (밸브·압력만 볼 때). 각도에서 나오는 감시를
+    # 전부 끄되 **압력 추종 감시는 남긴다** — 챔버가 안 잡히는 것은 여전히 위험하다.
+    use_angle: bool = True
 
     _bad_since: float | None = None
     _flips: list[float] = field(default_factory=list)
@@ -150,6 +153,32 @@ class Guard:
               ref_pos: float, ref_neg: float) -> None:
         now = time.monotonic()
 
+        if not self.use_angle:
+            # 각도 기반 감시(엔코더 갱신·범위·각속도·진동)를 건너뛰고
+            # 압력 추종만 본다. 아래 '추종' 블록으로 바로 간다.
+            pass
+        else:
+            self._check_angle(rig, ang, rate, now)
+
+        # 추종: 컨트롤러가 목표를 못 잡고 있으면 더 밀지 않는다.
+        bad = False
+        if p_pos is not None and abs(p_pos - ref_pos) > self.track_tol:
+            bad = True
+        if p_neg is not None and abs(p_neg - ref_neg) > self.track_tol:
+            bad = True
+        if bad:
+            if self._bad_since is None:
+                self._bad_since = now
+            elif now - self._bad_since > self.track_grace:
+                raise Abort(
+                    f"압력 추종 실패가 {self.track_grace:g} s 넘게 계속됐다 "
+                    f"(목표 {ref_pos:.1f}/{ref_neg:.1f}, "
+                    f"실측 {p_pos if p_pos is None else round(p_pos,1)}/"
+                    f"{p_neg if p_neg is None else round(p_neg,1)})")
+        else:
+            self._bad_since = None
+
+    def _check_angle(self, rig: "RigView", ang: float, rate: float, now: float) -> None:
         if rig.angle_age() > self.enc_timeout:
             raise Abort(f"엔코더 갱신이 {rig.angle_age():.1f} s 없다 "
                         f"(한계 {self.enc_timeout:g} s)")
@@ -172,24 +201,6 @@ class Guard:
         if len(self._flips) >= self.osc_flips:
             raise Abort(f"{self.osc_window:g} s 안에 각속도 부호가 "
                         f"{len(self._flips)} 번 뒤집혔다 — 진동으로 본다")
-
-        # 추종: 컨트롤러가 목표를 못 잡고 있으면 더 밀지 않는다.
-        bad = False
-        if p_pos is not None and abs(p_pos - ref_pos) > self.track_tol:
-            bad = True
-        if p_neg is not None and abs(p_neg - ref_neg) > self.track_tol:
-            bad = True
-        if bad:
-            if self._bad_since is None:
-                self._bad_since = now
-            elif now - self._bad_since > self.track_grace:
-                raise Abort(
-                    f"압력 추종 실패가 {self.track_grace:g} s 넘게 계속됐다 "
-                    f"(목표 {ref_pos:.1f}/{ref_neg:.1f}, "
-                    f"실측 {p_pos if p_pos is None else round(p_pos,1)}/"
-                    f"{p_neg if p_neg is None else round(p_neg,1)})")
-        else:
-            self._bad_since = None
 
 
 # ════════════════════════════════════════════════════════════════════════════

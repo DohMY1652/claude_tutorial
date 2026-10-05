@@ -75,6 +75,9 @@ class State:
         self.mode = "?"
         self.note = ""
         self.port = ""
+        # direct 모드에서 raw → 도 환산에 쓸 2점 보정. [ch] = (raw0, deg/count)
+        # 또는 None(미보정). ros 모드에서는 브리지가 이미 환산해 주므로 안 쓴다.
+        self.enc_cal = [None] * NCH
 
 
 def bridge_running() -> bool:
@@ -119,11 +122,15 @@ def run_ros(st: State, args) -> None:
                     st.kpa[bid] = _kpa(v, bid, cfg)
 
         def _cur(self, m):
+            # board/currents 는 **mV** 로 온다 (CanBridge: raw × 3300/4095).
+            # mA = mV / 10 이다 (pp_logger 와 같은 환산, 아래 직접 CAN 경로와도 같다).
+            # 예전에는 이 나눗셈이 빠져 mV 를 그대로 "I(mA)" 열에 찍었다 — 10 배로
+            # 부풀어 2000 mA 처럼 보였다. 실제 코일 상한은 I_MAX 250.5 mA 다.
             with st.lock:
                 for b in range(1, NUM_BOARDS + 1):
                     k = (b - 1) * 3
                     if k + 2 < len(m.data):
-                        st.cur[b] = list(m.data[k:k + 3])
+                        st.cur[b] = [v / 10.0 for v in m.data[k:k + 3]]
 
         def _ang(self, m):
             with st.lock:
@@ -172,6 +179,46 @@ def _load_calib():
         return ({}, {}, 101.325)
 
 
+def _load_enc_calib():
+    """Teensy 엔코더 2점 보정을 yaml 에서 읽는다 — **브리지와 같은 출처**여야 한다.
+
+    환산식은 CanBridge.cpp 와 같다:  deg = (raw − raw_0deg) × 90 / (raw_90deg − raw_0deg)
+    보정이 없거나 두 점이 같은 채널은 None 으로 둔다. 브리지는 그럴 때 각도를
+    0° 로 **고정**하는데, 모니터에서 그러면 "0° 에 있다" 는 거짓말이 되므로
+    여기서는 '미보정' 이라고 적는다.
+    """
+    cal = [None] * NCH
+    try:
+        import yaml
+        p = os.path.join(_HERE, "..", "config", "powerpack_config.yaml")
+        with open(p, encoding="utf-8") as fh:
+            ch = (yaml.safe_load(fh)["/pack2/can_bridge"]["ros__parameters"]
+                  ["TeensyEncoder"]["channels"])
+        for c in range(NCH):
+            e = ch.get(str(c)) or ch.get(c)
+            if not e:
+                continue
+            r0, r90 = float(e["raw_0deg"]), float(e["raw_90deg"])
+            if abs(r90 - r0) > 1e-6:
+                cal[c] = (r0, 90.0 / (r90 - r0))
+    except Exception:
+        pass
+    return cal
+
+
+def _enc_deg(raw: int, cal) -> float:
+    if cal is None:
+        return float("nan")
+    r0, scale = cal
+    return (float(raw) - r0) * scale
+
+
+def _p_mv(counts: int) -> float:
+    """압력 ADC counts → 원신호 mV. CanBridge.cpp 의 p_mv_raw 와 같은 식이어야 한다.
+    센서 1~5 V 가 반전 증폭으로 들어오므로 **빼는** 식이다 (곱이 아니다)."""
+    return min(5000.0, max(0.0, 5000.0 - counts * 4000.0 / 4095.0))
+
+
 def _kpa(raw, bid, cfg):
     offs, gains, atm = cfg
     if raw == 0 or bid not in offs:
@@ -186,6 +233,9 @@ def run_direct(st: State, args) -> None:
     st.mode = "direct"
     st.note = "브리지가 없어 CAN·시리얼을 직접 연다"
     cfg = _load_calib()
+    st.enc_cal = _load_enc_calib()
+    if all(c is None for c in st.enc_cal):
+        st.note += " | 엔코더 보정을 못 읽었다 — 각도 열이 빈다"
     stop = threading.Event()
     cnt = [0] * (NUM_BOARDS + 1)
     enc_cnt = [0]
@@ -248,8 +298,15 @@ def _can_thread(st: State, cfg, cnt, stop) -> None:
         cnt[bid] += 1
         raw = struct.unpack("<HHHH", bytes(msg.data[:8]))
         with st.lock:
+            # raw → mV(×TO_MV) → mA(÷10). 위 토픽 경로와 같은 단위여야 한다.
             st.cur[bid] = [raw[i] * TO_MV / 10.0 for i in range(3)]
-            st.kpa[bid] = _kpa(raw[3], bid, cfg)
+            # 압력은 **반전 증폭**이라 counts 를 그대로 쓰면 안 된다.
+            # CanBridge 와 같은 식으로 원신호 mV 를 복원한 뒤 _kpa 에 넣는다:
+            #     p_mv = 5000 − counts·4000/4095          (CanBridge.cpp)
+            # 예전에는 counts 를 mV 자리에 그대로 넣어 800 kPa 같은 값이 나왔다.
+            # board/sensors 토픽은 브리지가 이미 mV 로 바꿔 실어 주므로 토픽
+            # 경로(_sens)는 원래 맞았다 — 두 경로가 이제 같은 값을 낸다.
+            st.kpa[bid] = _kpa(_p_mv(raw[3]), bid, cfg)
     try:
         ch.busOff(); ch.close()
     except Exception:
@@ -307,6 +364,7 @@ def _serial_thread(st: State, enc_cnt, stop, args) -> None:
                 enc_cnt[0] += 1
                 with st.lock:
                     st.raw = list(chs)
+                    st.ang = [_enc_deg(r, st.enc_cal[k]) for k, r in enumerate(chs)]
                     st.enc_status = status
                     if prev_seq is not None:
                         st.enc_lost += (seq - prev_seq - 1) & 0xFFFF
@@ -327,6 +385,7 @@ def _draw(st: State, args) -> None:
     with st.lock:
         kpa = list(st.kpa); cur = {k: list(v) for k, v in st.cur.items()}
         hz = list(st.hz); ang = list(st.ang); raw = list(st.raw)
+        cal = list(st.enc_cal)
         ehz, elost, ecrc, estat = st.enc_hz, st.enc_lost, st.enc_crc, st.enc_status
         mode, note, port = st.mode, st.note, st.port
 
@@ -373,13 +432,36 @@ def _draw(st: State, args) -> None:
         o += "   ** status != 0 → ADS1115 I2C 오류다 (비트 = 칩 번호). 그 채널 값은 못 믿는다 **\n"
     o += "|  ch  |    raw   |   Angle(deg)  |\n"
     o += "|------|----------|---------------|\n"
+    warn_low = False
     for c in range(NCH):
         a = ang[c]
-        a_s = f"{a:10.2f}" if a == a else "         -"
-        o += f"|   {c}  | {raw[c]:8d} | {a_s}    |\n"
+        a_s = f"{a:10.2f}" if a == a else "     미보정"
+        # 기동 직후 Teensy 스트리밍 전에는 raw 가 1000 밑으로 떨어지는데, 그 값이
+        # 각도로는 121~129° 라는 **그럴듯한 숫자**로 나온다. 죽은 센서와 구별이
+        # 안 되므로 표에서 바로 보이게 한다.
+        low = cal[c] is not None and abs(raw[c]) < 1000
+        warn_low |= low
+        o += f"|   {c}  | {raw[c]:8d} | {a_s} {'!' if low else ' '}  |\n"
     o += SEP + "\n"
+    # 어느 보정으로 환산했는지 — 개체를 갈아 끼우면 여기가 바뀌어야 한다
+    # (docs/액추에이터_개체_대장.md). ros 모드에서는 브리지가 환산해 주므로,
+    # 브리지가 **먼저 뜬 뒤** yaml 을 고쳤다면 이 줄과 실제 각도가 어긋난다.
+    if any(c is not None for c in cal):
+        items = [f"ch{c}={r0:.0f}/{r0 + 90.0 / sc:.0f}"
+                 for c, v in enumerate(cal) if v for r0, sc in [v]]
+        o += " 2점 보정 (raw@0°/raw@90°, yaml 에서 읽음)\n"
+        for k in range(0, len(items), 3):          # 한 줄에 3 채널 — SEP 폭 안에 든다
+            o += "   " + "   ".join(items[k:k + 3]) + "\n"
+    if warn_low:
+        o += (" ** ! = raw 가 1000 미만이다. 각도로는 121~129° 라는 그럴듯한 값이 나오지만\n"
+              "      기동 직후(약 4초, Teensy 스트리밍 전)이거나 센서가 죽은 것이다 **\n")
     o += " raw 가 **전혀 안 떨리면** 그 채널은 죽은 것이다 (raw 0 도 각도로는 121~129° 로 보인다)\n"
     o += " Ctrl+C 로 종료\n"
+    # `\033[H` 는 커서를 홈으로 보낼 뿐 **지우지 않는다.** 그래서 이전 프레임보다
+    # 짧아진 줄은 뒷부분이 그대로 남는다. 조건부로 나타났다 사라지는 줄(경고,
+    # 보정 목록)이 생기면서 실제로 잔상이 보였다 — 각 줄 끝에서 줄의 나머지를,
+    # 마지막에 화면의 나머지를 지운다. 이러면 줄 길이에 신경 쓸 필요가 없다.
+    o = o.replace("\n", "\033[K\n") + "\033[J"
     sys.stdout.write(o)
     sys.stdout.flush()
 

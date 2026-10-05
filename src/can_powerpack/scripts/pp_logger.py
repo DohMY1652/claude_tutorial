@@ -32,7 +32,10 @@ VALVE_NAMES = ['v1micro', 'v2atm', 'v3macro']   # 보드 위 v1/v2/v3 순서
 # controller/channel_dbg 한 채널당 값 개수. Controller.hpp 의 CH_DBG_N 과 같아야 한다.
 CH_DBG_N = 12
 # controller/rail_dbg 길이. Controller.cpp 의 발행부와 같아야 한다.
-RAIL_DBG_N = 13
+# 20260918: 13 → 14 (rail_assist_kpa 추가). **여기를 안 고치고 헤더에만 이름을
+# 더하면 그 뒤 채널 열이 전부 한 칸씩 밀린다** — 실제로 그렇게 해서 20260918
+# 런의 gid 열 분석이 통째로 어긋났다. 헤더와 이 상수는 항상 같이 고친다.
+RAIL_DBG_N = 14
 # 라인 밸브 pwm 인덱스 (Controller.cpp 기본값)
 LINE_PWM_IDX = [('line_pos', 0), ('line_neg', 3), ('macro_sw', 9)]
 
@@ -198,7 +201,7 @@ class PpLogger(Node):
         header += ['rail_ref_pos', 'rail_ref_neg', 'rail_ff_vent', 'rail_ff_admit',
                    'rail_open_vent', 'rail_open_admit', 'rail_p_pos', 'rail_p_neg',
                    'rail_u_pos', 'rail_i_pos', 'rail_gs_pos',
-                   'rail_u_neg', 'rail_i_neg']
+                   'rail_u_neg', 'rail_i_neg', 'rail_assist_kpa']
         for g in range(12):
             header += [f'u_pid_pct_gid{g}', f'p_term_gid{g}', f'i_term_gid{g}',
                        f'd_term_gid{g}', f'ff_term_gid{g}', f'i_state_gid{g}',
@@ -327,6 +330,13 @@ class PpLogger(Node):
                 # 두 디버그 토픽이 없다. 축별 목표압은 controller/mpc_refs_kpa 가
                 # 단일 출처이므로 거기서 채운다 (채널 PID 가 추종하는 바로 그 값).
                 p_pos, p_neg = ref[POS_GIDS[a]], ref[NEG_GIDS[a]]
+                # 각도도 마찬가지다. 예전에는 폴백이 없어 **angle_deg_axisN 이
+                # 전 구간 0** 이었고, 진짜 각도는 board/analog 에서 와서
+                # enc_bd{17+a}_deg 라는 옛 CAN 시절 이름에만 들어갔다
+                # (20260915_182014: angle_deg_axis0 전 구간 0, enc_bd17_deg 는
+                #  19.7~108.6°). 분석할 때마다 "각도가 죽었다" 로 오해하게 된다.
+                if a < len(enc):
+                    angle = enc[a]
             pos_board_idx = POS_GIDS[a] + CHANNEL_BOARD_OFFSET - 1
             neg_board_idx = NEG_GIDS[a] + CHANNEL_BOARD_OFFSET - 1
             row += [
