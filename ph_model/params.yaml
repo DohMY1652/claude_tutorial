@@ -1,0 +1,22 @@
+# SI; main.tex eq:kin, eq:Am, eq:tau, eq:fric, tab:param.
+diameter_m: 0.05
+fold_length_m: 0.006
+folds: 14
+reel_radius_m: 0.025
+atmosphere_kpa: 101.325
+gravity_nm: 2.943
+# Not measured: point-mass estimate 2 * 0.15**2; sensitivity is mandatory.
+inertia_kg_m2: 0.045
+x1_zero_m: 0.084
+# Structurally unidentifiable with constant positive area. Placeholder, not fitted.
+x2_zero_m: 0.084
+alpha: 0.134
+damping_nm_s_rad: 0.1
+# main.tex explicitly marks epsilon 0.02 as TBD.
+epsilon_rad_s: 0.02
+# No independent zero-pressure elastic test: primary model keeps V_e = 0.
+elastic_k_nm_rad: 0.0
+elastic_bias_nm: 0.0
+q_min_rad: -0.08726646259971647
+q_max_rad: 1.53588974175501
+limit_k_nm_rad: 100.0
