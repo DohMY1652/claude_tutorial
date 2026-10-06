@@ -9,6 +9,10 @@ from ph_model.nominal import Parameters, area_minus, torque, friction, gradient,
 from ph_model.data import gauge_pressures, differentiate
 
 
+def test_yaml_and_api_defaults_agree():
+    assert Parameters.load()==Parameters()
+
+
 def test_original_paper_geometry_regression():
     p = dataclasses.replace(Parameters(), diameter_m=0.0545)
     phi = np.deg2rad([0, 10, 30, 45, 50])
@@ -95,3 +99,16 @@ def test_scalar_rollout_matches_nominal_rhs():
     direct=solve_ivp(lambda tt,z:rhs(z,pressure[0],p),[t[0],t[-1]],z0,t_eval=t,
                      rtol=1e-9,atol=1e-11,max_step=.005)
     np.testing.assert_allclose(predicted,direct.y.T,atol=1e-6)
+
+
+def test_batched_midpoint_matches_independent_adaptive_solver():
+    from ph_model.fit_nominal import simulate
+    from ph_model.refine_nominal import simulate_windows
+    p=dataclasses.replace(Parameters(),alpha=.2,damping_nm_s_rad=2)
+    t=np.linspace(0,10,101)
+    P=np.column_stack((-20000-3000*np.sin(t),10000+2000*np.sin(t)))
+    wins=[dict(t=t,pressure=P,z0=[.4,.01]),
+          dict(t=t,pressure=P*.1,z0=[.04,0])]
+    batched=simulate_windows(wins,p)
+    adaptive=simulate(t,P,wins[0]['z0'],p,rtol=1e-8,max_step=.005)
+    assert np.max(np.abs(batched[0]-adaptive[:,0]))<np.deg2rad(.02)

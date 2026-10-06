@@ -28,7 +28,7 @@ def load_run(path, cutoff=None, window_s=.31, dt=.01):
     meta = json.loads((path/'meta.json').read_text())
     raw = np.genfromtxt(path/'run.csv', delimiter=',', names=True, dtype=None, encoding='utf-8')
     t = raw['t_mono_s']
-    if np.any(np.diff(t) <= 0):
+    if not np.all(np.isfinite(t)) or np.any(np.diff(t) <= 0):
         raise ValueError(f'Non-monotonic timestamps: {path}')
     valid = (raw['sensor_valid'] == 1) & np.isfinite(raw['angle_deg']) & \
         np.isfinite(raw['p_pos_kpa']) & np.isfinite(raw['p_neg_kpa']) & \
@@ -83,7 +83,10 @@ def stationary_points(run):
             if not np.any(mask):
                 continue
             mask &= raw['t_mono_s'] >= np.max(raw['t_mono_s'][mask])-3
-            mask &= (raw['sensor_valid']==1) & (raw['p_pos_kpa']>=101.325) & (raw['p_neg_kpa']<=101.325)
+            mask &= (raw['sensor_valid']==1) & (raw['p_pos_kpa']>=101.325) & (raw['p_neg_kpa']<=101.325) & \
+                np.isfinite(raw['angle_deg']) & (raw['angle_deg']>=-5) & (raw['angle_deg']<=88) & \
+                (raw['angle_age_s']>=0) & (raw['angle_age_s']<.1) & \
+                (raw['pressure_age_s']>=0) & (raw['pressure_age_s']<.1)
             if mask.sum() < 200:
                 continue
             out.append(dict(q=np.deg2rad(np.mean(raw['angle_deg'][mask])),

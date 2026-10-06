@@ -7,6 +7,7 @@ import argparse
 import csv
 import dataclasses
 import json
+import hashlib
 import math
 import platform
 import subprocess
@@ -211,6 +212,9 @@ def main():
         run['role']=role
         if str(run['meta']['actuator'])!='4' or run['meta']['mount']!=2:
             raise ValueError('Actuator/mount mismatch')
+        enc=run['meta']['encoder']
+        if run['meta']['axis']!=1 or enc['raw_0deg']!=29890 or enc['raw_90deg']!=9600:
+            raise ValueError('Axis/encoder calibration mismatch in selected dataset')
         runs.append(run)
         print('Loaded',name,role,run['audit']['measurement_valid_rows'],flush=True)
     provenance=dict(paper_sha256=sha256('main.tex'),params_sha256=sha256('ph_model/params.yaml'),
@@ -220,7 +224,10 @@ def main():
         python=platform.python_version(),numpy=np.__version__,scipy=scipy.__version__,
         argv=vars(args)|{'data_root':str(args.data_root),'output':str(args.output)},
         split=[dict(path=r['path'],role=r['role'],profile=r['meta']['profile']['id'],
-                    seed=r['meta']['profile']['seed'],**r['audit']) for r in runs])
+                    seed=r['meta']['profile']['seed'],encoder=r['meta']['encoder'],
+                    profile_sha256=r['meta']['profile_sha256'],acquisition_commit=r['meta']['commit'],
+                    controller_parameters_sha256=hashlib.sha256(json.dumps(r['meta']['effective_parameters']['/pack2/pp_controller'],sort_keys=True).encode()).hexdigest(),
+                    **r['audit']) for r in runs])
     dump(out/'provenance.json',provenance)
     train=[r for r in runs if r['role']=='train']
     data,weight=pack(train)

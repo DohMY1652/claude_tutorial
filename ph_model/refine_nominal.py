@@ -13,7 +13,7 @@ from scipy.optimize import least_squares
 import yaml
 
 from .data import load_run, stationary_points, sha256
-from .nominal import Parameters, torque, gradient
+from .nominal import Parameters, torque, gradient, friction
 from .fit_nominal import RUNS, pack, fit_equation, spans, simulate, evaluate, plot_rollout, dump
 
 
@@ -35,6 +35,46 @@ def windows(runs):
     return result
 
 
+def simulate_windows(wins, p, dt=.02):
+    """Batched implicit midpoint for offline short-window fitting.
+
+    This is an optimizer acceleration only. Final reported free rollouts use
+    independently implemented adaptive LSODA; midpoint does not automatically
+    imply a discrete passivity inequality for nonlinear potentials.
+    """
+    grid=np.arange(0,10+dt/2,dt)
+    pressure=np.array([np.column_stack([np.interp(grid,w['t']-w['t'][0],w['pressure'][:,j]) for j in (0,1)]) for w in wins])
+    z=np.array([w['z0'] for w in wins],dtype=float)
+    answer=np.empty((len(wins),len(grid)))
+    answer[:,0]=z[:,0]
+    for k in range(len(grid)-1):
+        P=(pressure[:,k]+pressure[:,k+1])/2
+        q0,v0=z[:,0].copy(),z[:,1].copy()
+        vm=v0.copy();low=np.full(len(wins),-10.);high=-low
+        for _ in range(16):
+            qm=q0+dt/2*vm
+            tau=torque(qm,P,p)
+            tanh=np.tanh(vm/p.epsilon_rad_s)
+            f=(tau-gradient(qm,p)-friction(vm,tau,p))/p.inertia_kg_m2
+            F=2*(vm-v0)-dt*f
+            if np.max(np.abs(F))<1e-9:break
+            low=np.where(F<0,vm,low);high=np.where(F>=0,vm,high)
+            tauq=(torque(qm+1e-6,P,p)-torque(qm-1e-6,P,p))/2e-6
+            gq=p.gravity_nm*np.cos(qm)+p.elastic_k_nm_rad + p.limit_k_nm_rad*((qm<p.q_min_rad)|(qm>p.q_max_rad))
+            fq=(tauq*(1-p.alpha*np.sign(tau)*tanh)-gq)/p.inertia_kg_m2
+            fv=(-p.alpha*np.abs(tau)*(1-tanh*tanh)/p.epsilon_rad_s-p.damping_nm_s_rad)/p.inertia_kg_m2
+            derivative=2-dt*(dt/2*fq+fv)
+            proposal=vm-F/derivative
+            updated=np.where((proposal>low)&(proposal<high),proposal,(low+high)/2)
+            vm=np.where(np.abs(F)<1e-9,vm,updated)
+        else:
+            raise RuntimeError('Midpoint nonlinear solve failed; do not accept fit')
+        z[:,0]=q0+dt*vm;z[:,1]=2*vm-v0
+        answer[:,k+1]=z[:,0]
+    stride=int(round(.1/dt))
+    return answer[:,::stride]
+
+
 def fit_rollout(wins, base, elastic, starts=2):
     names=['x1_zero_m','alpha','damping_nm_s_rad'] + \
         (['elastic_k_nm_rad','elastic_bias_nm'] if elastic else ['gravity_nm'])
@@ -45,10 +85,9 @@ def fit_rollout(wins, base, elastic, starts=2):
     count=0
     def fun(z):
         nonlocal count
-        p=decode(z); errors=[]
-        for w in wins:
-            pred=simulate(w['t'],w['pressure'],w['z0'],p,rtol=1e-6,max_step=.05)
-            errors.extend((pred[:,0]-w['q'])/np.sqrt(len(w['q'])*len(wins)))
+        p=decode(z)
+        pred=simulate_windows(wins,p)
+        errors=((pred-np.array([w['q'] for w in wins]))/np.sqrt(pred.size)).ravel()
         count+=1
         if count%20==0:
             print('objective',count,'RMSE_deg',np.rad2deg(np.linalg.norm(errors)),flush=True)

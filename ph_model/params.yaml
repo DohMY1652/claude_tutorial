@@ -19,4 +19,5 @@ elastic_k_nm_rad: 0.0
 elastic_bias_nm: 0.0
 q_min_rad: -0.08726646259971647
 q_max_rad: 1.53588974175501
+# Numerical soft barrier from guide V_l, not a measured mechanical stop/stiffness.
 limit_k_nm_rad: 100.0
