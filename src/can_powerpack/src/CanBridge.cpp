@@ -947,6 +947,8 @@ void CanBridge::teensy_loop() {
   buf.reserve(4096);
   uint8_t chunk[1024];
   bool have_seq = false;
+  // 이번 포트 open 이후의 첫 유효 프레임 여부. 전역 seen/last 수신 시각과 분리한다.
+  bool received_since_open = false;
   uint16_t prev_seq = 0;
   auto last_open_try = std::chrono::steady_clock::now() - std::chrono::seconds(10);
   bool announced = false;
@@ -973,6 +975,7 @@ void CanBridge::teensy_loop() {
       buf.clear();
       have_seq = false;
       announced = false;
+      received_since_open = false;
     }
 
     // ── 읽기 ──────────────────────────────────────────────────────────────
@@ -1001,6 +1004,8 @@ void CanBridge::teensy_loop() {
       if (cerr) teensy_crc_err_.fetch_add(cerr, std::memory_order_relaxed);
       if (consumed) buf.erase(buf.begin(), buf.begin() + (long)consumed);
       if (!got) break;
+
+      received_since_open = true;
 
       for (int c = 0; c < TEENSY_NCH; ++c)
         teensy_raw_[c].store((int32_t)fr.ch[c], std::memory_order_relaxed);
@@ -1042,11 +1047,11 @@ void CanBridge::teensy_loop() {
           "해당 칩의 채널 값은 믿을 수 없다.", (unsigned)status);
     }
 
-    // ── 포트는 열렸는데 프레임이 한 번도 안 오는 경우 ─────────────────────
+    // ── 이번 포트 연결에서 프레임이 한 번도 안 오는 경우 ─────────────────
     // 펌웨어가 멈췄거나, 시작 명령('r')이 씹혔거나, 다른 프로세스가 바이트를
-    // 나눠 가져가는 상황이다. 아래 워치독은 **한 번이라도 받은 뒤**에만 도므로
-    // 이 경우를 못 잡는다 — 따로 재시도한다 (20260903 에 pty 로 재현해서 잡았다).
-    if (teensy_fd_ >= 0 && !teensy_seen_.load(std::memory_order_relaxed)) {
+    // 나눠 가져가는 상황이다. 첫 연결/재연결 모두 첫 프레임에 2초를 준다.
+    // 이미 발생한 두절의 failsafe 시계는 계속 돌며, 이 대기가 시한을 연장하지 않는다.
+    if (teensy_fd_ >= 0 && !received_since_open) {
       const auto open_age = std::chrono::steady_clock::now() - last_open_try;
       if (open_age > std::chrono::seconds(2)) {
         RCLCPP_ERROR_THROTTLE(get_logger(), *this->get_clock(), 5000,
@@ -1094,7 +1099,11 @@ void CanBridge::teensy_loop() {
         // 아래 read 분기가 "데이터 없음"으로 보고 그냥 기다린다. 20260903 에 pty 로
         // 재현해서 잡았다 — 뽑기는 감지했는데 다시 꽂아도 안 붙었다.
         // 조용히 멈춘 펌웨어(포트는 살아 있는데 프레임이 안 옴)도 이 경로로 복구된다.
-        if (teensy_fd_ >= 0) {
+        // 이전 연결의 last_ns는 이미 만료됐다. 재연결 직후에도 그것으로 포트를
+        // 닫으면 'r' 송신 약 1 ms 뒤 'x'를 보내는 재오픈 폭주가 된다 (20261006).
+        // 새 포트의 첫 프레임은 위의 2초 제한으로 기다린다. 그동안 stale/180°,
+        // 원래 failsafe 시한과 latch는 그대로 유지하며, 정상 수신으로 가장하지 않는다.
+        if (teensy_fd_ >= 0 && received_since_open) {
           RCLCPP_WARN(get_logger(), "Teensy 포트를 닫고 재연결을 시도한다.");
           teensy_close();
           buf.clear();
