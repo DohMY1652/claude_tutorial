@@ -1,0 +1,5 @@
+artifacts/
+# Original/derived measurements and generated outputs stay local; reproduce with ph_model.
+*.json
+*.png
+*.yaml
