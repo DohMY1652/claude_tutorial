@@ -1,0 +1,5 @@
+*.json
+*.npz
+*.png
+*.pt
+artifacts/
