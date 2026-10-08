@@ -39,6 +39,9 @@ def final():
     assert sha256(OLD/'residual/selected_model.json')==protocol['old_full_sha256']
     for item in protocol['files']:
         for name,h in item['hashes'].items():assert sha256(Path(item['path'])/name)==h
+    original=json.loads((OLD.parent/'ve0_baseline/provenance.json').read_text())
+    for item in original['files']:
+        for name,h in item['hashes'].items():assert sha256(Path(item['path'])/name)==h
     objects={label:json.loads((OUT/f'{label}_selected.json').read_text()) for label in ('nominal','full')}
     assert objects['nominal']['nominal']==objects['full']['nominal']
     audit={label:physics(obj) for label,obj in objects.items()}
