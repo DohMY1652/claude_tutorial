@@ -31,6 +31,7 @@ struct Net {
 double softplus(double x){return std::max(0.,x)+std::log1p(std::exp(-std::abs(x)));}
 struct Model {
     const double* p; const double* c; Net pot, diss;
+    bool use_potential=true, use_dissipation=true;
     bool force(double q,double v,const double* xi,double p1,double p2,double dt,double &F,double* A) const {
         // p: D,L,n,r,Mg,J,x10,alpha,b,epsilon,kel,bias,qmin,qmax,klim,qlo,qhi,scale1,scale2
         double s=(p[6]-p[3]*q)/(2*p[2]*p[1]);
@@ -43,9 +44,10 @@ struct Model {
         double z=2*(q-(p[15]+p[16])/2)/(p[16]-p[15]);
         double x[4]={-z,z,std::abs(p1)/p[17],std::abs(p2)/p[18]};
         double dx[4]={-2/(p[16]-p[15]),2/(p[16]-p[15]),0,0}, y[8],dy[8];
-        pot.eval(x,dx,y,dy); double t=std::tanh(y[0]/2),g=(1-t*t)*dy[0];
-        diss.eval(x,dx,y,dy);double d=0,mu=0;
-        for(int j=0;j<4;j++){d+=c[j]*softplus(y[j]);mu+=c[j+4]*softplus(y[j+4]);}
+        double g=0,d=0,mu=0;
+        if(use_potential){pot.eval(x,dx,y,dy);double t=std::tanh(y[0]/2);g=(1-t*t)*dy[0];}
+        if(use_dissipation){diss.eval(x,dx,y,dy);
+            for(int j=0;j<4;j++){d+=c[j]*softplus(y[j]);mu+=c[j+4]*softplus(y[j+4]);}}
         double fh=0;
         for(int j=0;j<2;j++){A[j]=dt/2*(c[10+j]+c[12+j]*std::abs(v))*c[8+j];fh+=c[8+j]*(q-xi[j])/(1+A[j]);}
         double grad=p[4]*std::sin(q)+p[10]*q+p[11]+p[14]*(std::max(q-p[13],0.)-std::max(p[12]-q,0.));
@@ -55,34 +57,37 @@ struct Model {
 };
 }
 
-extern "C" int rollout(int count,int substeps,const double* pressure,const double* initial,
+extern "C" int rollout(int count,int substeps,int euler,const double* pressure,const double* initial,
                        const double* params,const double* coefficients,const double* potential,
                        const double* dissipation,double* output) {
     Model m{params,coefficients,Net{potential,2,1},Net{dissipation,4,8}};
+    m.use_potential=std::any_of(potential+320,potential+337,[](double v){return v!=0.;});
+    m.use_dissipation=std::any_of(coefficients,coefficients+8,[](double v){return v!=0.;});
     double q=initial[0],v=initial[1],xi[2]={initial[2],initial[3]},dt=.1/substeps;
+    const double gamma=euler?1.:.5;
     output[0]=q;output[1]=v;output[2]=xi[0];output[3]=xi[1];
     for(int i=1;i<count;i++) {
         for(int sub=0;sub<substeps;sub++) {
-            double fraction=(sub+.5)/substeps;
+            double fraction=(sub+gamma)/substeps;
             double p1=pressure[2*(i-1)]*(1-fraction)+pressure[2*i]*fraction;
             double p2=pressure[2*(i-1)+1]*(1-fraction)+pressure[2*i+1]*fraction;
             double vm=v,lo=-10,hi=10,A[2],f=0;
             bool converged=false;
-            for(int iter=0;iter<50;iter++) {
-                if(!m.force(q+.5*dt*vm,vm,xi,p1,p2,dt,f,A))return 1;
-                double residual=2*(vm-v)-dt*f;
+            for(int iter=0;iter<80;iter++) {
+                if(!m.force(q+gamma*dt*vm,vm,xi,p1,p2,2*gamma*dt,f,A))return 1;
+                double residual=(vm-v)/gamma-dt*f;
                 if(std::abs(residual)<1e-10){converged=true;break;}
                 if(residual<0)lo=vm;else hi=vm;
-                double fp,fm,B[2],h=1e-5;
-                if(!m.force(q+.5*dt*(vm+h),vm+h,xi,p1,p2,dt,fp,B))return 1;
-                if(!m.force(q+.5*dt*(vm-h),vm-h,xi,p1,p2,dt,fm,B))return 1;
-                double der=2-dt*(fp-fm)/(2*h),next=vm-residual/der;
+                double fp,fm,B[2],h=std::min(1e-5,params[9]*.01);
+                if(!m.force(q+gamma*dt*(vm+h),vm+h,xi,p1,p2,2*gamma*dt,fp,B))return 1;
+                if(!m.force(q+gamma*dt*(vm-h),vm-h,xi,p1,p2,2*gamma*dt,fm,B))return 1;
+                double der=1/gamma-dt*(fp-fm)/(2*h),next=vm-residual/der;
                 vm=(next>lo&&next<hi&&std::isfinite(next))?next:(lo+hi)/2;
             }
             if(!converged)return 2;
-            double qm=q+.5*dt*vm;
-            for(int j=0;j<2;j++)xi[j]=2*(xi[j]+A[j]*qm)/(1+A[j])-xi[j];
-            q+=dt*vm;v=2*vm-v;
+            double qm=q+gamma*dt*vm;
+            for(int j=0;j<2;j++)xi[j]+=((xi[j]+A[j]*qm)/(1+A[j])-xi[j])/gamma;
+            q+=dt*vm;v+=(vm-v)/gamma;
         }
         output[4*i]=q;output[4*i+1]=v;output[4*i+2]=xi[0];output[4*i+3]=xi[1];
     }

@@ -19,12 +19,13 @@ def library():
         subprocess.run(['g++','-O3','-std=c++17','-shared','-fPIC',str(src),'-o',str(binary)],check=True)
         _LIB = ctypes.CDLL(str(binary))
         arr = np.ctypeslib.ndpointer(dtype=np.float64, flags='C_CONTIGUOUS')
-        _LIB.rollout.argtypes = [ctypes.c_int,ctypes.c_int]+[arr]*7
+        _LIB.rollout.argtypes = [ctypes.c_int,ctypes.c_int,ctypes.c_int]+[arr]*7
         _LIB.rollout.restype = ctypes.c_int
     return _LIB
 
 
-def simulate(b, obj, substeps=2):
+def simulate(b, obj, substeps=2, method='midpoint'):
+    if method not in ('midpoint','implicit_euler'):raise ValueError('Unknown offline integration method')
     if substeps<1 or int(substeps)!=substeps: raise ValueError('Positive integer substeps required')
     if obj['width']!=16: raise ValueError('Accelerator supports width 16 only')
     t = np.asarray(b['t'])
@@ -47,7 +48,7 @@ def simulate(b, obj, substeps=2):
     initial=np.array([b['qs'][0],b['v'][0],*b.get('xi0',[b['qs'][0]]*2)],dtype=np.float64)
     if initial.shape!=(4,) or not np.all(np.isfinite(initial)):raise ValueError('Invalid initial state')
     out=np.empty((len(t),4),dtype=np.float64)
-    code=library().rollout(len(t),substeps,P,initial,params,coeff,*nets,out)
-    if code:raise ValueError(f'Offline midpoint failed (geometry/nonfinite=1, solve=2): {code}')
+    code=library().rollout(len(t),substeps,int(method=='implicit_euler'),P,initial,params,coeff,*nets,out)
+    if code:raise ValueError(f'Offline {method} failed (geometry/nonfinite=1, solve=2): {code}')
     if not np.all(np.isfinite(out)):raise ValueError('Nonfinite solution')
     return out
