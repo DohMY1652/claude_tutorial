@@ -70,6 +70,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--csv', type=Path, default=DEFAULT)
     ap.add_argument('--output', type=Path)
+    ap.add_argument('--note', default='', help='Explicit comparison caveat printed on every page')
     args = ap.parse_args()
     out = args.output or args.csv.parent / 'graphs'
     out.mkdir(parents=True, exist_ok=True)
@@ -92,6 +93,8 @@ def main():
         labels.append(f'{profile} · {role}')
     with PdfPages(out / 'comparison_all_pages.pdf') as pdf:
         def save(fig, name):
+            if args.note:
+                fig.text(.01,.003,args.note,ha='left',va='bottom',fontsize=7,color='#555555')
             fig.savefig(out / (name + '.png'), dpi=180, facecolor='white')
             pdf.savefig(fig)
             plt.close(fig)
