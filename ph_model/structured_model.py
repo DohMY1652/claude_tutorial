@@ -1,6 +1,7 @@
 """Smooth, interpretable pH residual slots; pure offline float64 inference.
 
-Fixed tanh feature neurons have zero-initialized linear output heads. This is a
+Smooth tanh feature neurons have zero-initialized linear output heads; V7 can
+identify area-feature centers/widths and positive pressure-dependent rates. This is a
 single-actuator basis fit, NOT a learned multi-actuator shared representation.
 All actuator feature coordinates are chamber lengths. No pressure in energy.
 """
@@ -38,7 +39,12 @@ class Model:
         self.rho=np.asarray(obj['history_rho'],dtype=float)
         if self.area.shape!=(2,4) or self.c.shape!=(4,) or any(x.shape!=(2,) for x in (self.mu,self.k,self.tau,self.rho)):
             raise ValueError('Invalid structured coefficient shape')
-        values=np.r_[self.area.ravel(),self.c,self.mu,self.k,self.tau,self.rho]
+        self.area_scales=np.asarray(self.f.get('area_scales_m',[self.f['area_scale_m']]*2),dtype=float)
+        self.rate_coeff=np.asarray(obj.get('history_rate_coefficients',np.zeros((2,2))),dtype=float)
+        if self.area_scales.shape!=(2,) or self.rate_coeff.shape!=(2,2):raise ValueError('Invalid adaptive slot shapes')
+        if np.any(self.area_scales<=0) or np.any(np.abs(self.rate_coeff)>5):raise ValueError('Invalid adaptive slot bounds')
+        values=np.r_[self.area.ravel(),self.c,self.mu,self.k,self.tau,self.rho,self.area_scales,self.rate_coeff.ravel(),
+                     self.f['x1_center_m'],self.f['x2_center_m']]
         if not np.all(np.isfinite(values)) or np.any(np.r_[self.mu,self.k,self.rho]<0) or np.any(self.tau<=0):
             raise ValueError('Invalid passive coefficients')
         if np.any(np.sum(np.abs(self.area),axis=1)>=.95):
@@ -46,7 +52,7 @@ class Model:
 
     def area_features(self,q,P):
         x=np.array([self.p.x1_zero_m-self.p.reel_radius_m*q,self.p.x2_zero_m+self.p.reel_radius_m*q])
-        z=(x-np.array([self.f['x1_center_m'],self.f['x2_center_m']]))/self.f['area_scale_m']
+        z=(x-np.array([self.f['x1_center_m'],self.f['x2_center_m']]))/self.area_scales
         return np.column_stack((np.ones(2),np.tanh(z),np.tanh(2*z),np.tanh(np.abs(P)/50000.)))
 
     def port(self,q,P):
@@ -73,7 +79,8 @@ class Model:
         # Nominal friction remains tied to nominal tau_A, as in main.tex.
         extra_mu=self.mu@(np.logaddexp(0,np.abs(P)/50000.)-np.log(2.))
         f=float(friction(v,torque(q,P,self.p),self.p)+extra_mu*np.tanh(v/self.p.epsilon_rad_s))
-        rate=np.where(self.k>0,1/self.tau+self.rho*self.k*abs(v),0.)
+        multiplier=np.exp(self.rate_coeff@np.tanh(np.abs(P)/50000.))
+        rate=np.where(self.k>0,(1/self.tau+self.rho*self.k*abs(v))*multiplier,0.)
         return fh,f,rate
 
     def rhs(self,z,P):
@@ -112,8 +119,8 @@ def simulate(b,obj,substeps=5):
     params=np.array([getattr(p,k) for k in ('diameter_m','fold_length_m','folds','reel_radius_m','gravity_nm',
         'inertia_kg_m2','x1_zero_m','alpha','damping_nm_s_rad','epsilon_rad_s','elastic_k_nm_rad',
         'elastic_bias_nm','q_min_rad','q_max_rad','limit_k_nm_rad','x2_zero_m')]+
-        [m.f['x1_center_m'],m.f['x2_center_m'],m.f['area_scale_m'],*m.f['potential_centers_m'],m.f['potential_scale_m']],dtype=np.float64)
-    coeff=np.r_[m.area.ravel(),m.c,m.mu,m.k,m.tau,m.rho].astype(np.float64)
+        [m.f['x1_center_m'],m.f['x2_center_m'],m.f['area_scale_m'],*m.f['potential_centers_m'],m.f['potential_scale_m'],*m.area_scales],dtype=np.float64)
+    coeff=np.r_[m.area.ravel(),m.c,m.mu,m.k,m.tau,m.rho,m.rate_coeff.ravel()].astype(np.float64)
     initial=np.array([b['qs'][0],b['v'][0],*b.get('xi0',[b['qs'][0]]*2)],dtype=np.float64)
     out=np.empty((len(t),4),dtype=np.float64)
     code=_LIB.rollout(len(t),int(substeps),P,initial,params,coeff,out)

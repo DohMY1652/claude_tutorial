@@ -29,12 +29,12 @@ def prepare(bb):
     return bb
 
 
-def scores(bb,obj):
+def scores(bb,obj,substeps=5):
     rows=[]
     for run in dict.fromkeys(b['run'] for b in bb):
         group=[b for b in bb if b['run']==run];errors=[];changes={k:[] for k in ('hold','slow','large')};miss=[]
         for b in group:
-            pred=np.rad2deg(simulate(b,obj)[:,0]);actual=np.rad2deg(b['q']);e=pred-actual;errors.extend(e)
+            pred=np.rad2deg(simulate(b,obj,substeps=substeps)[:,0]);actual=np.rad2deg(b['q']);e=pred-actual;errors.extend(e)
             idx,kind=windows(actual)
             for i,k in zip(idx,kind):
                 changes[k].append(e[i+100]-e[i])

@@ -13,14 +13,17 @@ struct Model {
   double nominal=p[3]*(-am*p1+ap*p2),pres[2]={p1,p2},area[2]={am,ap};
   double x[2]={p[6]-p[3]*q,p[15]+p[3]*q};
   for(int i=0;i<2;i++){
-   double z=(x[i]-p[16+i])/p[18];
+   double z=(x[i]-p[16+i])/p[24+i];
    area[i]*=1+c[4*i]+c[4*i+1]*std::tanh(z)+c[4*i+2]*std::tanh(2*z)+c[4*i+3]*std::tanh(std::abs(pres[i])/50000.);
   }
   double tau=p[3]*(-area[0]*p1+area[1]*p2),g=0;
   for(int j=0;j<4;j++){double tt=std::tanh((x[1]-p[19+j])/p[23]);g+=c[8+j]*(1-tt*tt)*p[3]/p[23];}
   double mu=0;for(int j=0;j<2;j++)mu+=c[12+j]*(softplus(std::abs(pres[j])/50000.)-std::log(2.));
   double fh=0;
-  for(int j=0;j<2;j++){double k=c[14+j];A[j]=k>0?dt*(1/c[16+j]+c[18+j]*k*std::abs(v)):0.;fh+=k*(q-xi[j])/(1+A[j]);}
+  for(int j=0;j<2;j++){
+   double k=c[14+j],multiplier=std::exp(c[20+2*j]*std::tanh(std::abs(p1)/50000.)+c[21+2*j]*std::tanh(std::abs(p2)/50000.));
+   A[j]=k>0?dt*(1/c[16+j]+c[18+j]*k*std::abs(v))*multiplier:0.;fh+=k*(q-xi[j])/(1+A[j]);
+  }
   double grad=p[4]*std::sin(q)+p[10]*q+p[11]+p[14]*(std::max(q-p[13],0.)-std::max(p[12]-q,0.));
   F=(tau-grad-g-(p[7]*std::abs(nominal)+mu)*std::tanh(v/p[9])-p[8]*v-fh)/p[5];
   return std::isfinite(F);
