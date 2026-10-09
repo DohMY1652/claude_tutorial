@@ -1,0 +1,4 @@
+{
+  "source": "curve_start1",
+  "criterion": "training loss only; intermediate seed is not accepted final model"
+}

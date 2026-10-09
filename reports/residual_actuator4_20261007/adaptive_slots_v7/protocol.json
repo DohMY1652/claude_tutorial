@@ -1,0 +1,15 @@
+{
+  "baseline_sha256": "8dca111cc8a80c25646c1e02e1939bf9b6faab891711acd8e039b387d376e223",
+  "paper_sha256": "1c619eaf256187b8a0d61dc9d6701a1e0490453d00c60dddbf7d8a7f184c5cb6",
+  "sequence": "Area head+transition shape only, pressure-dependent passive history, joint refinement.",
+  "loss": "V6 loss + 30/120s measured stationary-window increment error (weight0.5) + training-only per-run regression penalty + pressure-rate coefficient L2.",
+  "long_window": "30s range<0.5deg; 120s range<0.75deg; starts every10s within each valid block.",
+  "physical": "Energy pressure-independent; R multiplied by exp(w*tanh(abs(P)/50kPa)); positive area maintained; unchanged nominal anchors and state reset policy.",
+  "shape_bounds": "Centers equivalent q=.15..1.2rad, widths .08..0.8rad, converted to chamber lengths. These are basis parameters, not physical measured dimensions.",
+  "rate_coeff_bounds": [
+    -1.5,
+    1.5
+  ],
+  "selection": "Train/development each RMSE <=max(1.08*V6,V6+.15deg); mean run RMSE improves; dev RMSE improves by >=.01deg; seed0..2 slow misses each <=V6+.03 and mean does not increase; dev hold-increment <=max(1.25*V6,V6+.05deg). Development score RMSE+0.4*slow increment RMSE+0.2*mean run RMSE.",
+  "historical": "Previously seen seed4 only evaluated after selection; not blind. No hardware, push or data calibration changes."
+}

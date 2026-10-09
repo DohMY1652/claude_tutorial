@@ -1,0 +1,8 @@
+{
+  "baseline_sha256": "8dca111cc8a80c25646c1e02e1939bf9b6faab891711acd8e039b387d376e223",
+  "baseline_csv_sha256": "a81caa3af4a4dc711070972006c4acadb30aa46ec2e6b6a9f7771d31eecef0cd",
+  "selected_sha256": "2f74b4c9e7d7d316cf321187574e70cc360324376ce98c3e4e873cd46f709aa7",
+  "paper_sha256": "1c619eaf256187b8a0d61dc9d6701a1e0490453d00c60dddbf7d8a7f184c5cb6",
+  "rows": 45474,
+  "note": "Exact measured/timing/nominal columns preserved from V6; updated full prediction only; 5ms export, unchanged state reset policy. Historical seed4 is not blind."
+}

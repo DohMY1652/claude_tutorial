@@ -1,0 +1,4 @@
+{
+  "source": "history_start0",
+  "criterion": "training loss only; intermediate seed is not accepted final model"
+}

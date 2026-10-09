@@ -13,7 +13,8 @@
 - `physics_audit.json`, `numerical_audit.json`: 에너지와 독립 적분 검증.
 - `postselection_ablations.json`: 재피팅 없는 항 제거/시정수 민감도 진단.
 
-CSV/체크포인트/그림은 로컬 산출물이며 기존 정책대로 git에서 제외된다.
+사용자의 2026-10-09 요청으로 이 V7 디렉터리의 파생 CSV/체크포인트/그래프를
+git에 함께 보존한다. 원본 `~/result/` 로그는 포함하지 않는다.
 `time_s`는 표시용으로 이어 붙인 시간이다. 실험 간 실제 시간 간격은 아니며,
 `run_id`, `block_id`, `t_mono_s`, `block_start`를 함께 보존했다.
 

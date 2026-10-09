@@ -1,0 +1,9 @@
+{
+  "source": "joint_start0",
+  "reason": "Joint initial optimizer stopped after 3 function evaluations; check numerical optimization sensitivity, no model/evaluation changes.",
+  "finite_difference_normalized_step": 1e-05,
+  "x_scale": 1.0,
+  "ftol": 1e-05,
+  "xtol": 1e-06,
+  "selection": "Same predeclared V6 gates; no historical data used."
+}

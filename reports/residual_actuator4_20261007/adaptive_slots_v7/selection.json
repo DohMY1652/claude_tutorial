@@ -1,0 +1,65 @@
+{
+  "candidates": [
+    {
+      "name": "curve_start0",
+      "eligible": true,
+      "failures": [],
+      "mean_run_rmse_deg": 1.1074355850077793,
+      "score": 1.188337824668288,
+      "slow_missed_fractions": [
+        0.12365591397849462,
+        0.2694063926940639,
+        0.21686746987951808
+      ]
+    },
+    {
+      "name": "curve_start1",
+      "eligible": true,
+      "failures": [],
+      "mean_run_rmse_deg": 1.1084348399020079,
+      "score": 1.1877429164757916,
+      "slow_missed_fractions": [
+        0.12365591397849462,
+        0.2694063926940639,
+        0.22289156626506024
+      ]
+    },
+    {
+      "name": "history_start0",
+      "eligible": true,
+      "failures": [],
+      "mean_run_rmse_deg": 0.9587786950913583,
+      "score": 1.0496430560427537,
+      "slow_missed_fractions": [
+        0.016129032258064516,
+        0.1141552511415525,
+        0.018072289156626505
+      ]
+    },
+    {
+      "name": "joint_start0",
+      "eligible": true,
+      "failures": [],
+      "mean_run_rmse_deg": 0.8823206818746011,
+      "score": 1.0512009060944585,
+      "slow_missed_fractions": [
+        0.016129032258064516,
+        0.1141552511415525,
+        0.012048192771084338
+      ]
+    },
+    {
+      "name": "joint_start1",
+      "eligible": true,
+      "failures": [],
+      "mean_run_rmse_deg": 0.7096188253751978,
+      "score": 1.0356944544107975,
+      "slow_missed_fractions": [
+        0.0,
+        0.0502283105022831,
+        0.0
+      ]
+    }
+  ],
+  "selected": "joint_start1"
+}

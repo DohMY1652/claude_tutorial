@@ -1,0 +1,120 @@
+{
+  "name": "curve_start1",
+  "loss": 1.9469938299840668,
+  "nfev": 11,
+  "success": true,
+  "training": [
+    {
+      "run": "20261006_134154_792847_R0",
+      "role": "train",
+      "rmse_deg": 0.9218990591140526,
+      "max_abs_deg": 2.540873209050986,
+      "hold_increment_rmse_deg": null,
+      "slow_increment_rmse_deg": null,
+      "large_increment_rmse_deg": 1.3319923819831565,
+      "slow_missed_fraction": null
+    },
+    {
+      "run": "20261006_134235_833624_S2",
+      "role": "train",
+      "rmse_deg": 0.8935823181730421,
+      "max_abs_deg": 2.346899289467167,
+      "hold_increment_rmse_deg": 0.19100545065465563,
+      "slow_increment_rmse_deg": 0.580008478171203,
+      "large_increment_rmse_deg": 0.8935301129625475,
+      "slow_missed_fraction": 0.13157894736842105
+    },
+    {
+      "run": "20261006_134834_301155_S1a",
+      "role": "train",
+      "rmse_deg": 2.1507306455094977,
+      "max_abs_deg": 7.040304959754252,
+      "hold_increment_rmse_deg": 0.1996148798302938,
+      "slow_increment_rmse_deg": 0.8532567749014794,
+      "large_increment_rmse_deg": 1.3233878634712293,
+      "slow_missed_fraction": 0.19444444444444445
+    },
+    {
+      "run": "20261006_135218_489972_S1b",
+      "role": "train",
+      "rmse_deg": 1.4912843818429657,
+      "max_abs_deg": 4.072223093259517,
+      "hold_increment_rmse_deg": 0.22890262338269143,
+      "slow_increment_rmse_deg": 0.4866983433335237,
+      "large_increment_rmse_deg": 1.5610591812079226,
+      "slow_missed_fraction": 0.11764705882352941
+    },
+    {
+      "run": "20261006_135507_219340_S3",
+      "role": "train",
+      "rmse_deg": 0.7607535242218065,
+      "max_abs_deg": 2.789878288443788,
+      "hold_increment_rmse_deg": 0.19724896551782858,
+      "slow_increment_rmse_deg": 0.5626720680901571,
+      "large_increment_rmse_deg": 1.0534779455566632,
+      "slow_missed_fraction": 0.15
+    },
+    {
+      "run": "20261006_135932_623541_S5",
+      "role": "train",
+      "rmse_deg": 0.7326357220399972,
+      "max_abs_deg": 1.8250067395809886,
+      "hold_increment_rmse_deg": 0.15442841465721954,
+      "slow_increment_rmse_deg": 0.4920918665935059,
+      "large_increment_rmse_deg": 0.7748748402567216,
+      "slow_missed_fraction": 0.34615384615384615
+    },
+    {
+      "run": "20261006_140127_158356_S4",
+      "role": "train",
+      "rmse_deg": 0.7796407090359376,
+      "max_abs_deg": 1.9584508629668953,
+      "hold_increment_rmse_deg": 0.09022579663551647,
+      "slow_increment_rmse_deg": 0.4822133824472045,
+      "large_increment_rmse_deg": 0.9386177211225625,
+      "slow_missed_fraction": 0.08695652173913043
+    },
+    {
+      "run": "20261006_141418_972450_S6",
+      "role": "train",
+      "rmse_deg": 1.2970319247293638,
+      "max_abs_deg": 2.7578168717075613,
+      "hold_increment_rmse_deg": 0.12155380879618359,
+      "slow_increment_rmse_deg": 0.4472883366563172,
+      "large_increment_rmse_deg": 0.9444304478037353,
+      "slow_missed_fraction": 0.12365591397849462
+    },
+    {
+      "run": "20261006_142450_704718_S6",
+      "role": "train",
+      "rmse_deg": 1.0229138382919256,
+      "max_abs_deg": 2.826677301454275,
+      "hold_increment_rmse_deg": 0.14309073939958147,
+      "slow_increment_rmse_deg": 0.6216759281010166,
+      "large_increment_rmse_deg": 0.8734663556858421,
+      "slow_missed_fraction": 0.2694063926940639
+    },
+    {
+      "run": "20261006_143524_612945_S6",
+      "role": "train",
+      "rmse_deg": 1.3781030640221141,
+      "max_abs_deg": 2.321932324287836,
+      "hold_increment_rmse_deg": 0.19772055037461428,
+      "slow_increment_rmse_deg": 0.6029143829375813,
+      "large_increment_rmse_deg": 1.0712986760764471,
+      "slow_missed_fraction": 0.22289156626506024
+    }
+  ],
+  "development": [
+    {
+      "run": "20261006_150506_052414_S6",
+      "role": "development",
+      "rmse_deg": 0.7642080519413813,
+      "max_abs_deg": 1.9234299733085436,
+      "hold_increment_rmse_deg": 0.10963854882389099,
+      "slow_increment_rmse_deg": 0.5046197413850217,
+      "large_increment_rmse_deg": 0.779645518418807,
+      "slow_missed_fraction": 0.17391304347826086
+    }
+  ]
+}

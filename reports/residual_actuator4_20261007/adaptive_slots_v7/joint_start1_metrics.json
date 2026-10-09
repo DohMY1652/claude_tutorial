@@ -1,0 +1,123 @@
+{
+  "name": "joint_start1",
+  "loss": 1.2053388327984835,
+  "nfev": 26,
+  "success": true,
+  "optimizer_message": "`xtol` termination condition is satisfied.",
+  "optimality": 69676111.79447356,
+  "polish": true,
+  "training": [
+    {
+      "run": "20261006_134154_792847_R0",
+      "role": "train",
+      "rmse_deg": 0.787646079422784,
+      "max_abs_deg": 1.7337683781545454,
+      "hold_increment_rmse_deg": null,
+      "slow_increment_rmse_deg": null,
+      "large_increment_rmse_deg": 0.7573061713498859,
+      "slow_missed_fraction": null
+    },
+    {
+      "run": "20261006_134235_833624_S2",
+      "role": "train",
+      "rmse_deg": 0.5992839172412364,
+      "max_abs_deg": 2.3549297555149735,
+      "hold_increment_rmse_deg": 0.10075079915013521,
+      "slow_increment_rmse_deg": 0.2747359314002471,
+      "large_increment_rmse_deg": 0.8192732412516328,
+      "slow_missed_fraction": 0.0
+    },
+    {
+      "run": "20261006_134834_301155_S1a",
+      "role": "train",
+      "rmse_deg": 1.2898109107839728,
+      "max_abs_deg": 3.517553138960544,
+      "hold_increment_rmse_deg": 0.16325508010911954,
+      "slow_increment_rmse_deg": 0.43324839646917446,
+      "large_increment_rmse_deg": 0.9718273026361552,
+      "slow_missed_fraction": 0.027777777777777776
+    },
+    {
+      "run": "20261006_135218_489972_S1b",
+      "role": "train",
+      "rmse_deg": 0.7073418655259179,
+      "max_abs_deg": 2.1207527051909274,
+      "hold_increment_rmse_deg": 0.13926599172623236,
+      "slow_increment_rmse_deg": 0.3761755467622661,
+      "large_increment_rmse_deg": 0.7865658663201476,
+      "slow_missed_fraction": 0.0
+    },
+    {
+      "run": "20261006_135507_219340_S3",
+      "role": "train",
+      "rmse_deg": 0.45213999827674506,
+      "max_abs_deg": 1.5570625910333504,
+      "hold_increment_rmse_deg": 0.131929316916855,
+      "slow_increment_rmse_deg": 0.2334441262113891,
+      "large_increment_rmse_deg": 0.6050439946961705,
+      "slow_missed_fraction": 0.0
+    },
+    {
+      "run": "20261006_135932_623541_S5",
+      "role": "train",
+      "rmse_deg": 0.2965803013998841,
+      "max_abs_deg": 0.6450863120674697,
+      "hold_increment_rmse_deg": 0.062484916682833055,
+      "slow_increment_rmse_deg": 0.2552151961153376,
+      "large_increment_rmse_deg": 0.361079680610403,
+      "slow_missed_fraction": 0.0
+    },
+    {
+      "run": "20261006_140127_158356_S4",
+      "role": "train",
+      "rmse_deg": 0.4433146370955654,
+      "max_abs_deg": 0.899418810259764,
+      "hold_increment_rmse_deg": 0.03515879191647688,
+      "slow_increment_rmse_deg": 0.2587598846267568,
+      "large_increment_rmse_deg": 0.32911199990600226,
+      "slow_missed_fraction": 0.0
+    },
+    {
+      "run": "20261006_141418_972450_S6",
+      "role": "train",
+      "rmse_deg": 0.8592421562577629,
+      "max_abs_deg": 1.5392166855279186,
+      "hold_increment_rmse_deg": 0.1210359247495008,
+      "slow_increment_rmse_deg": 0.3038692143478566,
+      "large_increment_rmse_deg": 0.6713863801420493,
+      "slow_missed_fraction": 0.0
+    },
+    {
+      "run": "20261006_142450_704718_S6",
+      "role": "train",
+      "rmse_deg": 0.7794824904529768,
+      "max_abs_deg": 2.19676898090605,
+      "hold_increment_rmse_deg": 0.09790305379017122,
+      "slow_increment_rmse_deg": 0.5101408789744931,
+      "large_increment_rmse_deg": 0.5373419630823504,
+      "slow_missed_fraction": 0.0502283105022831
+    },
+    {
+      "run": "20261006_143524_612945_S6",
+      "role": "train",
+      "rmse_deg": 0.8812146805452945,
+      "max_abs_deg": 1.4450728938208925,
+      "hold_increment_rmse_deg": 0.1654667497157699,
+      "slow_increment_rmse_deg": 0.41434178095226776,
+      "large_increment_rmse_deg": 0.6954806414620449,
+      "slow_missed_fraction": 0.0
+    }
+  ],
+  "development": [
+    {
+      "run": "20261006_150506_052414_S6",
+      "role": "development",
+      "rmse_deg": 0.7097500421250348,
+      "max_abs_deg": 1.5224615230382703,
+      "hold_increment_rmse_deg": 0.1188338718580617,
+      "slow_increment_rmse_deg": 0.46005161802680805,
+      "large_increment_rmse_deg": 0.5205406875984072,
+      "slow_missed_fraction": 0.0
+    }
+  ]
+}
