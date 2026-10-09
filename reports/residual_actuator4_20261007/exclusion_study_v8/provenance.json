@@ -1,0 +1,17 @@
+{
+  "baseline_model_sha256": "2f74b4c9e7d7d316cf321187574e70cc360324376ce98c3e4e873cd46f709aa7",
+  "baseline_csv_sha256": "11652c8fe5e222ceb5261ceb13e627194c80d79b2ebc11a735e66f57f85b689f",
+  "paper_sha256": "1c619eaf256187b8a0d61dc9d6701a1e0490453d00c60dddbf7d8a7f184c5cb6",
+  "models": {
+    "control": "eea82daef010e9f0cdf766a9bf2492834b516355f0ab9f105d9da3580940fdff",
+    "excluded": "3344ae92020d6bd929e739e20dac6751be8e0e0469b73289ddf5df36481d9957"
+  },
+  "solver_sha256": "325dd3adcc24a67f0e0b72b792fd9878d34aada85b522fb05bd4b594350a4127",
+  "rows": 45474,
+  "raw_quality_sources": {
+    "20261006_141418_972450_S6": "c735c29da805540f093cb3e956c4efcd638d5896be74c8f097609dc8aa90e10f",
+    "20261006_142450_704718_S6": "e734434d766dfbc964892730e054e950c4e2d2010fa7600ce644728dc221bf13",
+    "20261006_143524_612945_S6": "47c895f0d05ae14625924d5dcad23612b17eb074b86fbf8d1a17be9b5ae9e590"
+  },
+  "note": "All baseline columns preserved; only added mask/control/excluded predictions. No state reset at mask boundaries. V7 remains accepted."
+}

@@ -1,0 +1,7 @@
+{
+  "nfev": 4,
+  "success": true,
+  "message": "`xtol` termination condition is satisfied.",
+  "optimality": 33876527.12334362,
+  "loss": 1.1202386030222644
+}

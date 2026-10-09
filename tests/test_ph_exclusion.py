@@ -30,3 +30,10 @@ def test_robust_solver_preserves_simple_trajectory():
     obj=zero_model();t=np.arange(0,2.01,.1)
     b=dict(t=t,P=np.tile([-20000.,20000.],(len(t),1)),qs=[.5],v=[0.])
     np.testing.assert_allclose(simulate(b,obj,substeps=20,robust=True),simulate(b,obj,substeps=20),atol=1e-7,rtol=0)
+
+
+def test_parallel_jacobian_is_identical_to_serial():
+    from ph_model.exclusion_study import finite_jac
+    fn=lambda z:np.array([z[0]**2+z[1],np.sin(z[1])])
+    x=np.array([.2,.999999])
+    np.testing.assert_array_equal(finite_jac(fn,x,1),finite_jac(fn,x,4))

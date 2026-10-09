@@ -1,0 +1,22 @@
+{
+  "baseline_comparison": [
+    {
+      "run": "20261006_134154_792847_R0",
+      "block": 0,
+      "baseline_max_angle_difference_deg": 5.4887325123991536e-08
+    },
+    {
+      "run": "20261006_134834_301155_S1a",
+      "block": 0,
+      "baseline_max_angle_difference_deg": 7.597994000779508e-08
+    },
+    {
+      "run": "20261006_134834_301155_S1a",
+      "block": 1,
+      "baseline_max_angle_difference_deg": 5.725133918263761e-08
+    }
+  ],
+  "neighbor_failures": [],
+  "parameter_directions": 32,
+  "blocks": 3
+}

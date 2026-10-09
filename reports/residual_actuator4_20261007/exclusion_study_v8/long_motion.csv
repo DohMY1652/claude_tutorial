@@ -1,0 +1,16 @@
+model,role,window_s,windows,increment_rmse_deg
+accepted_v7,train,30.0,117,0.20836884919903143
+accepted_v7,train,120.0,18,0.15552112135818108
+accepted_v7,development,30.0,34,0.2582186778991277
+accepted_v7,development,120.0,19,0.9955677093526036
+accepted_v7,historical_diagnostic_prefix,30.0,8,0.38034265919823723
+control,train,30.0,117,0.20756146754674817
+control,train,120.0,18,0.15878010214219687
+control,development,30.0,34,0.25335496659938117
+control,development,120.0,19,0.9833134732633658
+control,historical_diagnostic_prefix,30.0,8,0.37075812877691616
+excluded,train,30.0,117,0.25500655825428475
+excluded,train,120.0,18,0.1783532112241881
+excluded,development,30.0,34,0.2627485716516556
+excluded,development,120.0,19,1.0618776462221189
+excluded,historical_diagnostic_prefix,30.0,8,0.37711094016488933

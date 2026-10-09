@@ -1,0 +1,16 @@
+model,role,subset,samples,rmse_deg
+accepted_v7,train,all,36094,0.7521522082235497
+accepted_v7,train,retained,29878,0.6410334327188525
+accepted_v7,train,excluded,6216,1.144483561947269
+accepted_v7,development,all,6005,0.7143516335843682
+accepted_v7,historical_diagnostic_prefix,all,3375,0.4019295359272304
+control,train,all,36094,0.7465178719659794
+control,train,retained,29878,0.634811134361105
+control,train,excluded,6216,1.1397235191531
+control,development,all,6005,0.7079945192071551
+control,historical_diagnostic_prefix,all,3375,0.3999396677751376
+excluded,train,all,36094,0.8443661990222839
+excluded,train,retained,29878,0.6339834319370623
+excluded,train,excluded,6216,1.4859031949218593
+excluded,development,all,6005,0.7526287422949114
+excluded,historical_diagnostic_prefix,all,3375,0.41796669632443745

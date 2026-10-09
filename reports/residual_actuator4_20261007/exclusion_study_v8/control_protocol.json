@@ -1,0 +1,36 @@
+{
+  "intervals": {
+    "20261006_141418_972450_S6": [
+      [
+        80.0,
+        280.0
+      ]
+    ],
+    "20261006_142450_704718_S6": [
+      [
+        520.0,
+        650.0
+      ]
+    ],
+    "20261006_143524_612945_S6": [
+      [
+        60.0,
+        160.0
+      ],
+      [
+        320.0,
+        540.0
+      ]
+    ]
+  },
+  "baseline_sha256": "2f74b4c9e7d7d316cf321187574e70cc360324376ce98c3e4e873cd46f709aa7",
+  "initialization": "Identical V7 warm start; excluded labels already informed V7, not independent held-out validation.",
+  "rollout": "All measured pressures and original block initial states retained, no resets at exclusion boundaries.",
+  "loss": "V7 form at fixed 5ms; same original weights, remove masked angle terms and any intersecting motion window; regression references evaluated on each fitted subset.",
+  "comparison": "Paired full-data control and excluded fit; fixed budget, no development-based selection.",
+  "integration_ms": 5,
+  "nfev": 25,
+  "finite_difference_step": 1e-05,
+  "solver": "Safeguarded Newton with bisection every fourth iteration, 200 iterations, velocity residual tolerance 1e-9. Original V7 solver remains default.",
+  "untouched": "V7 accepted snapshot, hardware configuration, raw logs, paper"
+}

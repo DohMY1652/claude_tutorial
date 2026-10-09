@@ -1,0 +1,7 @@
+{
+  "nfev": 12,
+  "success": true,
+  "message": "`ftol` termination condition is satisfied.",
+  "optimality": 0.006511398009860355,
+  "loss": 1.1978702299375277
+}

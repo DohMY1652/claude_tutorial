@@ -1,0 +1,29 @@
+{
+  "states": 5000,
+  "max_power_error": 1.7763568394002505e-15,
+  "max_balance_error": 1.8189894035458565e-12,
+  "minimum_dissipation": 0.044458218829722125,
+  "violations": 0,
+  "energy_residual_global_lower_bound_j": -0.26149480124471697,
+  "area_multiplier_global_lower_bounds": [
+    0.20000000001973595,
+    0.46814674220377483
+  ],
+  "history_k": [
+    9.998810541924001,
+    9.06160487875819
+  ],
+  "history_tau_s": [
+    1.0000000051515174,
+    599.9999999962658
+  ],
+  "history_rho": [
+    21.263622462238043,
+    14.09902618206924
+  ],
+  "history_rv": [
+    0.10001189548052578,
+    0.00018392621273787438
+  ],
+  "unforced_energy_max_increase_j": -6.714160072363029e-08
+}
