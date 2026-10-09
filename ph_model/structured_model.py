@@ -103,7 +103,7 @@ class Model:
 _LIB=None
 
 
-def simulate(b,obj,substeps=5):
+def simulate(b,obj,substeps=5,robust=False):
     global _LIB
     m=Model(obj)
     if int(substeps)!=substeps or substeps<1:raise ValueError('Invalid substeps')
@@ -115,6 +115,7 @@ def simulate(b,obj,substeps=5):
         subprocess.run(['g++','-O3','-std=c++17','-shared','-fPIC',str(src),'-o',str(binary)],check=True)
         _LIB=ctypes.CDLL(str(binary));arr=np.ctypeslib.ndpointer(dtype=np.float64,flags='C_CONTIGUOUS')
         _LIB.rollout.argtypes=[ctypes.c_int,ctypes.c_int]+[arr]*5;_LIB.rollout.restype=ctypes.c_int
+        _LIB.rollout_robust.argtypes=_LIB.rollout.argtypes;_LIB.rollout_robust.restype=ctypes.c_int
     p=m.p
     params=np.array([getattr(p,k) for k in ('diameter_m','fold_length_m','folds','reel_radius_m','gravity_nm',
         'inertia_kg_m2','x1_zero_m','alpha','damping_nm_s_rad','epsilon_rad_s','elastic_k_nm_rad',
@@ -123,6 +124,7 @@ def simulate(b,obj,substeps=5):
     coeff=np.r_[m.area.ravel(),m.c,m.mu,m.k,m.tau,m.rho,m.rate_coeff.ravel()].astype(np.float64)
     initial=np.array([b['qs'][0],b['v'][0],*b.get('xi0',[b['qs'][0]]*2)],dtype=np.float64)
     out=np.empty((len(t),4),dtype=np.float64)
-    code=_LIB.rollout(len(t),int(substeps),P,initial,params,coeff,out)
+    solver=_LIB.rollout_robust if robust else _LIB.rollout
+    code=solver(len(t),int(substeps),P,initial,params,coeff,out)
     if code or not np.all(np.isfinite(out)):raise ValueError(f'Structured offline solver failed: {code}')
     return out

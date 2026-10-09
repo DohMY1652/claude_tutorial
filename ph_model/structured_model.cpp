@@ -30,21 +30,21 @@ struct Model {
  }
 };
 }
-extern "C" int rollout(int n,int substeps,const double* P,const double* initial,const double* p,const double* c,double* output){
+int rollout_impl(int n,int substeps,const double* P,const double* initial,const double* p,const double* c,double* output,bool robust){
  Model m{p,c};double q=initial[0],v=initial[1],xi[2]={initial[2],initial[3]},dt=.1/substeps;
  for(int j=0;j<4;j++)output[j]=initial[j];
  for(int i=1;i<n;i++){
   for(int sub=0;sub<substeps;sub++){
    double f=(sub+1.)/substeps,p1=P[2*i-2]*(1-f)+P[2*i]*f,p2=P[2*i-1]*(1-f)+P[2*i+1]*f;
    double vm=v,lo=-10,hi=10,A[2],acc;bool converged=false;
-   for(int iter=0;iter<80;iter++){
+   for(int iter=0;iter<(robust?200:80);iter++){
     if(!m.force(q+dt*vm,vm,xi,p1,p2,dt,acc,A))return 1;
-    double res=vm-v-dt*acc;if(std::abs(res)<1e-10){converged=true;break;}
+    double res=vm-v-dt*acc;if(std::abs(res)<(robust?1e-9:1e-10)){converged=true;break;}
     if(res<0)lo=vm;else hi=vm;
     double fp,fm,B[2],h=std::min(1e-5,p[9]*.01);
     if(!m.force(q+dt*(vm+h),vm+h,xi,p1,p2,dt,fp,B)||!m.force(q+dt*(vm-h),vm-h,xi,p1,p2,dt,fm,B))return 1;
     double der=1-dt*(fp-fm)/(2*h),next=vm-res/der;
-    vm=(next>lo&&next<hi&&std::isfinite(next))?next:(lo+hi)/2;
+    vm=(next>lo&&next<hi&&std::isfinite(next)&&!(robust&&iter%4==3))?next:(lo+hi)/2;
    }
    if(!converged)return 2;
    q+=dt*vm;v=vm;for(int j=0;j<2;j++)xi[j]=(xi[j]+A[j]*q)/(1+A[j]);
@@ -52,4 +52,10 @@ extern "C" int rollout(int n,int substeps,const double* P,const double* initial,
   output[4*i]=q;output[4*i+1]=v;output[4*i+2]=xi[0];output[4*i+3]=xi[1];
  }
  return 0;
+}
+extern "C" int rollout(int n,int substeps,const double* P,const double* initial,const double* p,const double* c,double* output){
+ return rollout_impl(n,substeps,P,initial,p,c,output,false);
+}
+extern "C" int rollout_robust(int n,int substeps,const double* P,const double* initial,const double* p,const double* c,double* output){
+ return rollout_impl(n,substeps,P,initial,p,c,output,true);
 }

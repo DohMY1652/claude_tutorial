@@ -1,0 +1,5 @@
+# Derived diagnostic artifacts approved for publication; no raw experiment logs.
+!*.json
+!*.csv
+!*.png
+!*.pdf
